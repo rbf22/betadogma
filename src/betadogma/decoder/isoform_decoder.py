@@ -12,7 +12,7 @@ The process follows these steps:
 3.  **IsoformScorer**: Scores each candidate isoform based on a combination of
     the structural head logits and other priors (e.g., ORF validity).
 """
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -115,13 +115,14 @@ class SpliceGraphBuilder:
             first_exons = self._get_exons(tss_indices, donor_indices, tss_scores, donor_scores)
             last_exons = self._get_exons(acceptor_indices, polya_indices, acceptor_scores, polya_scores)
             single_exons = self._get_exons(tss_indices, polya_indices, tss_scores, polya_scores)
-        else: # strand == '-'
+        else:  # strand == '-'
             # On the minus strand, the 5'->3' direction is from higher to lower coordinates.
-            # We maintain start < end, so the pairs are swapped.
+            # An exon is defined by (start, end) where start < end.
+            # The biological role (e.g., donor, acceptor) of its boundaries determines its type.
             internal_exons = self._get_exons(donor_indices, acceptor_indices, donor_scores, acceptor_scores)
-            first_exons = self._get_exons(donor_indices, tss_indices, donor_scores, tss_scores) # donor -> tss
-            last_exons = self._get_exons(polya_indices, acceptor_indices, polya_scores, acceptor_scores) # polya -> acceptor
-            single_exons = self._get_exons(polya_indices, tss_indices, polya_scores, tss_scores) # polya -> tss
+            first_exons = self._get_exons(donor_indices, tss_indices, donor_scores, tss_scores)
+            last_exons = self._get_exons(polya_indices, acceptor_indices, polya_scores, acceptor_scores)
+            single_exons = self._get_exons(polya_indices, tss_indices, polya_scores, tss_scores)
 
         # 3. Combine exons based on anchoring policy
         if self.allow_unanchored:
@@ -137,7 +138,13 @@ class SpliceGraphBuilder:
             if key not in unique_exons_dict or exon.score > unique_exons_dict[key].score:
                 unique_exons_dict[key] = exon
 
-        final_exons = sorted(list(unique_exons_dict.values()), key=lambda e: e.start)
+        # Sort exons by transcript order for more efficient junction finding.
+        exons_list = list(unique_exons_dict.values())
+        if strand == '+':
+            final_exons = sorted(exons_list, key=lambda e: e.start)
+        else:  # strand == '-'
+            final_exons = sorted(exons_list, key=lambda e: e.start, reverse=True)
+
         graph = SpliceGraph()
         for exon in final_exons:
             graph.add_exon(exon)
@@ -146,31 +153,30 @@ class SpliceGraphBuilder:
         donor_set = set(donor_indices.tolist())
         acceptor_set = set(acceptor_indices.tolist())
 
-        for exon1 in final_exons:
-            for exon2 in final_exons:
-                if exon1 == exon2:
-                    continue
+        for i, exon1 in enumerate(final_exons):
+            # Only check subsequent exons, respecting transcript order
+            for j in range(i + 1, len(final_exons)):
+                exon2 = final_exons[j]
 
                 if strand == '+':
-                    # Upstream exon1, downstream exon2
-                    if exon1.start < exon2.start:
-                        # Junction from donor at exon1.end to acceptor at exon2.start
-                        if exon1.end in donor_set and exon2.start in acceptor_set:
-                            intron_len = exon2.start - exon1.end
-                            if 0 < intron_len <= self.max_intron_len:
-                                junction_score = (graph.graph.nodes[(exon1.start, exon1.end)]['score'] +
-                                                  graph.graph.nodes[(exon2.start, exon2.end)]['score']) / 2.0
-                                graph.add_junction(exon1, exon2, score=junction_score)
-                else: # strand == '-'
-                    # Upstream exon1 (higher coord), downstream exon2 (lower coord)
-                    if exon1.start > exon2.start:
-                        # Junction from donor at exon1.start to acceptor at exon2.end
-                        if exon1.start in donor_set and exon2.end in acceptor_set:
-                            intron_len = exon1.start - exon2.end
-                            if 0 < intron_len <= self.max_intron_len:
-                                junction_score = (graph.graph.nodes[(exon1.start, exon1.end)]['score'] +
-                                                  graph.graph.nodes[(exon2.start, exon2.end)]['score']) / 2.0
-                                graph.add_junction(exon1, exon2, score=junction_score)
+                    # Upstream exon1, downstream exon2 (by coordinate and list order)
+                    # Junction from donor at exon1.end to acceptor at exon2.start
+                    if exon1.end in donor_set and exon2.start in acceptor_set:
+                        intron_len = exon2.start - exon1.end
+                        if 0 < intron_len <= self.max_intron_len:
+                            junction_score = (graph.graph.nodes[(exon1.start, exon1.end)]['score'] +
+                                              graph.graph.nodes[(exon2.start, exon2.end)]['score']) / 2.0
+                            graph.add_junction(exon1, exon2, score=junction_score)
+                else:  # strand == '-'
+                    # Upstream exon1 (higher coord), downstream exon2 (lower coord).
+                    # A junction connects the donor at the upstream exon's start
+                    # to the acceptor at the downstream exon's end.
+                    if exon1.start in donor_set and exon2.end in acceptor_set:
+                        intron_len = exon1.start - exon2.end
+                        if 0 < intron_len <= self.max_intron_len:
+                            junction_score = (graph.graph.nodes[(exon1.start, exon1.end)]['score'] +
+                                              graph.graph.nodes[(exon2.start, exon2.end)]['score']) / 2.0
+                            graph.add_junction(exon1, exon2, score=junction_score)
 
         return graph
 
@@ -265,22 +271,126 @@ def _get_peak_log_prob(logits: torch.Tensor, index: int, window: int) -> torch.T
     return torch.max(_log_sigmoid(logits[start:end]))
 
 
-def _score_orf(isoform: Isoform, head_outputs: Dict[str, torch.Tensor], scoring_config: Dict) -> torch.Tensor:
-    """Scores the validity of the open reading frame."""
-    # Placeholder implementation, assuming boolean flags for now
-    # A more advanced version would scan the sequence
-    has_valid_start_stop = True # Replace with real check
-    has_frame_continuity = True # Replace with real check
-    has_premature_stop = False # Replace with real check
+def _get_spliced_cDNA(isoform: Isoform, input_ids: torch.Tensor, token_map: Dict[int, str]) -> Tuple[str, List[str]]:
+    """
+    Constructs the spliced cDNA sequence for an isoform from input token IDs.
+    Handles reverse complement for the negative strand.
+    Returns the cDNA sequence and a list of the exon sequences.
+    """
+    sequence_str = "".join([token_map.get(token_id, "N") for token_id in input_ids.tolist()])
+    exon_seqs = [sequence_str[exon.start:exon.end] for exon in isoform.exons]
+    spliced_seq = "".join(exon_seqs)
 
-    score = 0.0
-    if has_valid_start_stop:
-        score += scoring_config.get("orf_alpha", 0.5)
-    if has_frame_continuity:
-        score += scoring_config.get("orf_beta", 0.25)
-    if has_premature_stop:
-        score -= scoring_config.get("orf_gamma", 0.6)
-    return torch.tensor(score)
+    if isoform.strand == '-':
+        complement = {"A": "T", "T": "A", "C": "G", "G": "C", "N": "N"}
+        rev_comp = "".join(complement[base] for base in reversed(spliced_seq))
+        return rev_comp, exon_seqs
+
+    return spliced_seq, exon_seqs
+
+
+def _score_orf(
+    isoform: Isoform,
+    head_outputs: Dict[str, torch.Tensor],
+    scoring_config: Dict,
+    input_ids: Optional[torch.Tensor] = None,
+    use_sequence_fallback: bool = False
+) -> torch.Tensor:
+    """
+    Scores the validity of the open reading frame using either head outputs or a sequence scan.
+    """
+    # Tier B: Sequence-based fallback using codon scanning
+    if use_sequence_fallback:
+        if input_ids is None:
+            return torch.tensor(0.0)
+
+        token_map = {0: "A", 1: "C", 2: "G", 3: "T", 4: "N"}
+        cDNA, exon_seqs = _get_spliced_cDNA(isoform, input_ids.squeeze(), token_map)
+
+        best_score = -1.0
+
+        def is_strong_kozak(seq, pos):
+            if pos < 3 or pos + 4 >= len(seq): return False
+            return seq[pos-3] in "AG" and seq[pos+3] == "G"
+
+        for i in range(len(cDNA) - 2):
+            if cDNA[i:i+3] == "ATG":
+                for j in range(i, len(cDNA) - 2, 3):
+                    if cDNA[j:j+3] in {"TAA", "TAG", "TGA"}:
+                        cds_len_aa = (j - i) // 3
+                        score = 0.5
+                        if scoring_config.get("min_cds_len_aa", 50) <= cds_len_aa <= scoring_config.get("max_cds_len_aa", 10000):
+                            score += 0.3
+                        if is_strong_kozak(cDNA, i):
+                            score += scoring_config.get("kozak_bonus", 0.2)
+
+                        if len(exon_seqs) > 1:
+                            last_junction_pos = sum(len(s) for s in exon_seqs[:-1])
+                            if j < last_junction_pos - 55:
+                                score -= scoring_config.get("orf_gamma", 0.6)
+
+                        if score > best_score:
+                            best_score = score
+                        break
+        return torch.tensor(max(0.0, best_score))
+
+    # Tier A: Head-driven scoring
+    start_logits = head_outputs["orf"]["start"].squeeze()
+    stop_logits = head_outputs["orf"]["stop"].squeeze()
+    frame_logits = head_outputs["orf"]["frame"].squeeze()
+    frame_probs = torch.softmax(frame_logits, dim=-1)
+    stop_probs = torch.sigmoid(stop_logits)
+
+    if not isoform.exons:
+        return torch.tensor(0.0)
+
+    tx_to_gen_map = [p for exon in isoform.exons for p in range(exon.start, exon.end)]
+    if not tx_to_gen_map:
+        return torch.tensor(0.0)
+
+    exonic_indices = torch.tensor(tx_to_gen_map, device=start_logits.device)
+    exonic_start_logits = start_logits[exonic_indices]
+    top_k = min(scoring_config.get("max_start_candidates", 5), len(exonic_indices))
+
+    if top_k == 0: return torch.tensor(0.0)
+
+    candidate_start_probs, relative_indices = torch.topk(torch.sigmoid(exonic_start_logits), k=top_k)
+
+    best_overall_score = torch.tensor(-1.0, device=start_logits.device)
+
+    for s_prob, s_rel_idx in zip(candidate_start_probs, relative_indices):
+        s_tx_idx = s_rel_idx.item()
+
+        for frame in range(3):
+            cds_frame_probs = []
+
+            for tx_pos in range(s_tx_idx, len(tx_to_gen_map), 3):
+                gen_pos = tx_to_gen_map[tx_pos]
+                cds_frame_probs.append(frame_probs[gen_pos, frame])
+
+                if stop_probs[gen_pos] > 0.5:
+                    stop_prob = stop_probs[gen_pos]
+                    mean_frame_prob = torch.mean(torch.stack(cds_frame_probs))
+
+                    score = (scoring_config["orf_alpha"] * s_prob +
+                             scoring_config["orf_beta"] * mean_frame_prob +
+                             scoring_config["orf_alpha"] * stop_prob)
+
+                    if len(isoform.exons) > 1:
+                        last_junction_donor = isoform.exons[-2].start if isoform.strand == '-' else isoform.exons[-2].end
+                        if (isoform.strand == '+' and gen_pos < last_junction_donor - 55) or \
+                           (isoform.strand == '-' and gen_pos > last_junction_donor + 55):
+                            score -= scoring_config["orf_gamma"]
+
+                    if score > best_overall_score:
+                        best_overall_score = score
+                    break
+            else:
+                score = (scoring_config["orf_alpha"] * s_prob) - scoring_config["orf_gamma"]
+                if score > best_overall_score:
+                    best_overall_score = score
+
+    return torch.max(torch.tensor(0.0, device=best_overall_score.device), best_overall_score)
 
 
 def _score_length(isoform: Isoform, priors: Dict) -> torch.Tensor:
@@ -311,7 +421,7 @@ class IsoformScorer(nn.Module):
         self.w_orf = nn.Parameter(torch.tensor(self.scoring_config.get("w_orf", 0.8)))
         self.w_len = nn.Parameter(torch.tensor(self.scoring_config.get("w_len", 0.1)))
 
-    def forward(self, isoform: Isoform, head_outputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, isoform: Isoform, head_outputs: Dict[str, torch.Tensor], input_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Calculates a score for a given isoform.
         """
@@ -323,8 +433,12 @@ class IsoformScorer(nn.Module):
 
         s_spl = 0
         if isoform.exons and len(isoform.exons) > 1:
-            donor_indices = [exon.end for exon in isoform.exons[:-1]]
-            acceptor_indices = [exon.start for exon in isoform.exons[1:]]
+            if isoform.strand == '+':
+                donor_indices = [exon.end for exon in isoform.exons[:-1]]
+                acceptor_indices = [exon.start for exon in isoform.exons[1:]]
+            else: # strand == '-'
+                donor_indices = [exon.start for exon in isoform.exons[:-1]]
+                acceptor_indices = [exon.end for exon in isoform.exons[1:]]
 
             donor_log_probs = _log_sigmoid(donor_logits[donor_indices])
             acceptor_log_probs = _log_sigmoid(acceptor_logits[acceptor_indices])
@@ -352,7 +466,14 @@ class IsoformScorer(nn.Module):
             s_pa = torch.tensor(0.0)
 
         # 4. ORF Score
-        s_orf = _score_orf(isoform, head_outputs, self.scoring_config)
+        use_fallback = self.scoring_config.get("use_orf_head", True) is False
+        s_orf = _score_orf(
+            isoform,
+            head_outputs,
+            self.scoring_config,
+            input_ids=input_ids,
+            use_sequence_fallback=use_fallback
+        )
 
         # 5. Length Score
         s_len = _score_length(isoform, self.priors)
@@ -381,20 +502,21 @@ class IsoformDecoder(nn.Module):
         self.enumerator = IsoformEnumerator(config)
         self.scorer = IsoformScorer(config)
 
-    def forward(self, head_outputs: Dict[str, torch.Tensor], strand: str = '+') -> List[Isoform]:
+    def forward(self, head_outputs: Dict[str, torch.Tensor], strand: str = '+', input_ids: Optional[torch.Tensor] = None) -> List[Isoform]:
         """
         Performs end-to-end isoform decoding.
         This is an alias for the `decode` method for nn.Module compatibility.
         """
-        return self.decode(head_outputs, strand)
+        return self.decode(head_outputs, strand=strand, input_ids=input_ids)
 
-    def decode(self, head_outputs: Dict[str, torch.Tensor], strand: str = '+') -> List[Isoform]:
+    def decode(self, head_outputs: Dict[str, torch.Tensor], strand: str = '+', input_ids: Optional[torch.Tensor] = None) -> List[Isoform]:
         """
         Performs end-to-end isoform decoding.
 
         Args:
             head_outputs: The dictionary of outputs from the model's structural heads.
             strand: The genomic strand.
+            input_ids: Optional tensor of input token IDs for sequence-based scoring.
 
         Returns:
             A list of decoded Isoform objects, ranked by score.
@@ -406,7 +528,7 @@ class IsoformDecoder(nn.Module):
 
         # Re-score the final candidates with the learnable scorer.
         for isoform in candidates:
-            isoform.score = self.scorer(isoform, head_outputs).item()
+            isoform.score = self.scorer(isoform, head_outputs, input_ids=input_ids).item()
 
         # Sort candidates by score in descending order
         candidates.sort(key=lambda iso: iso.score, reverse=True)
