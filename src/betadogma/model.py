@@ -26,20 +26,25 @@ class Prediction:
 
 class BetaDogmaModel(nn.Module):
     """
-    Coordinates the backbone encoder, per-base heads, isoform decoder, and NMD predictor.
+    Coordinates the backbone encoder, per-base heads, and isoform decoder.
+    This model is instantiated with a configuration dictionary that defines the
+    architecture of all its components.
     """
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
         self.config = config
 
-        # Encoder
-        self.encoder = BetaDogmaEncoder(model_name=self.config["encoder"]["model_name"])
+        # --- 1. Encoder ---
+        # This wrapper uses the enformer-pytorch library to load the Enformer model,
+        # which serves as the sequence backbone.
+        encoder_config = self.config["encoder"]
+        self.encoder = BetaDogmaEncoder(model_name=encoder_config["model_name"])
 
-        # Heads
-        d_in = self.config["encoder"]["hidden_size"]
+        # --- 2. Prediction Heads ---
+        # These modules process the encoder embeddings to make per-base predictions.
+        d_in = encoder_config["hidden_size"]
         head_config = self.config["heads"]
-
         self.splice_head = SpliceHead(
             d_in=d_in,
             d_hidden=head_config["hidden"],
@@ -65,92 +70,37 @@ class BetaDogmaModel(nn.Module):
             use_conv=head_config["use_conv"],
         )
 
-        # Decoder
-        self.isoform_decoder = IsoformDecoder(config=self.config)
+        # --- 3. Isoform Decoder ---
+        # This component assembles predictions into transcript structures.
+        self.isoform_decoder = IsoformDecoder(config=self.config.get("decoder", {}))
 
 
     def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """
         Runs the encoder and all prediction heads.
+        This is the main forward pass for training, returning logits from each head.
         """
+        # Get base embeddings from the encoder
         embeddings = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
 
+        # Pass embeddings through each prediction head
         outputs = {
             "splice": self.splice_head(embeddings),
             "tss": self.tss_head(embeddings),
             "polya": self.polya_head(embeddings),
             "orf": self.orf_head(embeddings),
             "embeddings": embeddings,
-            "input_ids": input_ids,
+            "input_ids": input_ids, # Pass through for downstream use (e.g., sequence-based ORF scoring)
         }
         return outputs
 
     @classmethod
-    def from_pretrained(cls, tag: str, config: Optional[Dict[str, Any]] = None):
-        """Load a pretrained BetaDogma model (weights + config). Placeholder."""
-        # In a real scenario, this would load a config from the hub if not provided
-        # and also load weights.
-        if config is None:
-            # Placeholder config
-            config = {
-                "encoder": {
-                    "model_name": "EleutherAI/enformer-official-rough",
-                    "hidden_size": 3072,
-                },
-                "heads": {
-                    "hidden": 768,
-                    "dropout": 0.1,
-                    "use_conv": True,
-                },
-                "tag": tag,
-            }
+    def from_config_file(cls, config_path: str):
+        """Load model from a YAML config file."""
+        import yaml
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
         return cls(config=config)
-
-    @torch.no_grad()
-    def predict(self, sequence: str, variant: Optional[Dict[str, Any]] = None, strand: str = '+') -> Prediction:
-        """
-        Run end-to-end inference.
-        Args:
-            sequence: DNA bases A/C/G/T/N for a genomic window.
-            variant: optional structured variant encoding dict.
-            strand: The genomic strand ('+' or '-').
-        Returns:
-            Prediction: dominant isoform, ψ distribution, P(NMD), and aux head outputs.
-        """
-        # 1. Preprocess sequence into token IDs (placeholder)
-        # This would involve a tokenizer specific to the genomic model.
-        # For now, creating a dummy input tensor.
-        dummy_input_ids = torch.randint(0, 5, (1, 1000))  # Batch size 1, sequence length 1000
-
-        # 2. Run the model's forward pass
-        head_outputs = self.forward(dummy_input_ids)
-
-        # 3. Decode head outputs into biological structures
-        isoforms = self.isoform_decoder.decode(head_outputs, strand=strand, input_ids=dummy_input_ids)
-
-        dominant_isoform = isoforms[0] if isoforms else None
-
-        # 4. Estimate abundance (psi) - baseline implementation
-        # Proportional to isoform scores, normalized via softmax
-        if isoforms:
-            scores = torch.tensor([iso.score for iso in isoforms])
-            psi_probs = torch.softmax(scores, dim=0)
-            psi = {f"isoform_{i}": prob.item() for i, prob in enumerate(psi_probs)}
-        else:
-            psi = {}
-
-        p_nmd = 0.0  # from NMD model (stub)
-
-        # 5. Package for output
-        aux = {
-            "splice_logits": head_outputs["splice"],
-            "tss_logits": head_outputs["tss"],
-            "polya_logits": head_outputs["polya"],
-            "orf_logits": head_outputs["orf"],
-            "all_isoforms": isoforms,
-        }
-
-        return Prediction(dominant_isoform, psi, p_nmd, aux)
 
 def preprocess_sequence(chrom: str, start: int, end: int) -> str:
     """

@@ -107,18 +107,16 @@ class SpliceGraphBuilder:
         tss_indices, tss_scores = _find_peaks(tss_logits, self.thresholds.get("tss", 0.5), top_k=self.max_starts)
         polya_indices, polya_scores = _find_peaks(polya_logits, self.thresholds.get("polya", 0.5), top_k=self.max_ends)
 
-        # 2. Create candidate exons of different types
+        # 2. Create candidate exons based on strand-aware roles
         candidate_exons = []
         if strand == '+':
-            # Internal, TSS-anchored, polyA-anchored, and single-exon transcripts
             internal_exons = self._get_exons(acceptor_indices, donor_indices, acceptor_scores, donor_scores)
             first_exons = self._get_exons(tss_indices, donor_indices, tss_scores, donor_scores)
             last_exons = self._get_exons(acceptor_indices, polya_indices, acceptor_scores, polya_scores)
             single_exons = self._get_exons(tss_indices, polya_indices, tss_scores, polya_scores)
         else:  # strand == '-'
-            # On the minus strand, the 5'->3' direction is from higher to lower coordinates.
-            # An exon is defined by (start, end) where start < end.
-            # The biological role (e.g., donor, acceptor) of its boundaries determines its type.
+            # On the minus strand, an exon (in genomic coordinates) starts at a donor and ends at an acceptor.
+            # A "first" exon (5'-most) starts at a donor and ends at a TSS (higher coordinate).
             internal_exons = self._get_exons(donor_indices, acceptor_indices, donor_scores, acceptor_scores)
             first_exons = self._get_exons(donor_indices, tss_indices, donor_scores, tss_scores)
             last_exons = self._get_exons(polya_indices, acceptor_indices, polya_scores, acceptor_scores)
@@ -132,52 +130,42 @@ class SpliceGraphBuilder:
         candidate_exons.extend(single_exons)
 
         # 4. De-duplicate exons and add to graph
-        unique_exons_dict = {}
-        for exon in candidate_exons:
-            key = (exon.start, exon.end)
-            if key not in unique_exons_dict or exon.score > unique_exons_dict[key].score:
-                unique_exons_dict[key] = exon
-
-        # Sort exons by transcript order for more efficient junction finding.
-        exons_list = list(unique_exons_dict.values())
-        if strand == '+':
-            final_exons = sorted(exons_list, key=lambda e: e.start)
-        else:  # strand == '-'
-            final_exons = sorted(exons_list, key=lambda e: e.start, reverse=True)
+        unique_exons = { (e.start, e.end): e for e in sorted(candidate_exons, key=lambda x: x.score) }
+        exons_list = list(unique_exons.values())
 
         graph = SpliceGraph()
-        for exon in final_exons:
+        for exon in exons_list:
             graph.add_exon(exon)
 
         # 5. Add valid junctions between exons
         donor_set = set(donor_indices.tolist())
         acceptor_set = set(acceptor_indices.tolist())
 
-        for i, exon1 in enumerate(final_exons):
-            # Only check subsequent exons, respecting transcript order
-            for j in range(i + 1, len(final_exons)):
-                exon2 = final_exons[j]
+        # Sort exons by transcriptional order to find junctions
+        if strand == '+':
+            sorted_for_junctions = sorted(exons_list, key=lambda e: e.start)
+        else:  # strand == '-'
+            sorted_for_junctions = sorted(exons_list, key=lambda e: e.start, reverse=True)
 
+        for i, up_exon in enumerate(sorted_for_junctions):
+            for j in range(i + 1, len(sorted_for_junctions)):
+                down_exon = sorted_for_junctions[j]
+
+                # Check for valid junction based on strand
                 if strand == '+':
-                    # Upstream exon1, downstream exon2 (by coordinate and list order)
-                    # Junction from donor at exon1.end to acceptor at exon2.start
-                    if exon1.end in donor_set and exon2.start in acceptor_set:
-                        intron_len = exon2.start - exon1.end
-                        if 0 < intron_len <= self.max_intron_len:
-                            junction_score = (graph.graph.nodes[(exon1.start, exon1.end)]['score'] +
-                                              graph.graph.nodes[(exon2.start, exon2.end)]['score']) / 2.0
-                            graph.add_junction(exon1, exon2, score=junction_score)
+                    # Junction: up_exon.end (donor) -> down_exon.start (acceptor)
+                    intron_len = down_exon.start - up_exon.end
+                    if 0 < intron_len <= self.max_intron_len:
+                        if up_exon.end in donor_set and down_exon.start in acceptor_set:
+                            score = (up_exon.score + down_exon.score) / 2.0
+                            graph.add_junction(up_exon, down_exon, score=score)
                 else:  # strand == '-'
-                    # Upstream exon1 (higher coord), downstream exon2 (lower coord).
-                    # A junction connects the donor at the upstream exon's start
-                    # to the acceptor at the downstream exon's end.
-                    if exon1.start in donor_set and exon2.end in acceptor_set:
-                        intron_len = exon1.start - exon2.end
-                        if 0 < intron_len <= self.max_intron_len:
-                            junction_score = (graph.graph.nodes[(exon1.start, exon1.end)]['score'] +
-                                              graph.graph.nodes[(exon2.start, exon2.end)]['score']) / 2.0
-                            graph.add_junction(exon1, exon2, score=junction_score)
-
+                    # Junction: up_exon.start (donor) -> down_exon.end (acceptor)
+                    intron_len = up_exon.start - down_exon.end
+                    if 0 < intron_len <= self.max_intron_len:
+                        if up_exon.start in donor_set and down_exon.end in acceptor_set:
+                            score = (up_exon.score + down_exon.score) / 2.0
+                            graph.add_junction(up_exon, down_exon, score=score)
         return graph
 
 
@@ -277,13 +265,18 @@ def _get_spliced_cDNA(isoform: Isoform, input_ids: torch.Tensor, token_map: Dict
     Handles reverse complement for the negative strand.
     Returns the cDNA sequence and a list of the exon sequences.
     """
-    sequence_str = "".join([token_map.get(token_id, "N") for token_id in input_ids.tolist()])
-    exon_seqs = [sequence_str[exon.start:exon.end] for exon in isoform.exons]
+    # Squeeze to handle batch dimension of 1
+    sequence_str = "".join([token_map.get(token_id, "N") for token_id in input_ids.squeeze().tolist()])
+
+    # Sort exons by genomic coordinate to correctly assemble cDNA
+    sorted_exons = sorted(isoform.exons, key=lambda e: e.start)
+    exon_seqs = [sequence_str[exon.start:exon.end] for exon in sorted_exons]
     spliced_seq = "".join(exon_seqs)
 
     if isoform.strand == '-':
+        # For negative strand, the transcript is read from the reverse complement
         complement = {"A": "T", "T": "A", "C": "G", "G": "C", "N": "N"}
-        rev_comp = "".join(complement[base] for base in reversed(spliced_seq))
+        rev_comp = "".join(complement.get(base, "N") for base in reversed(spliced_seq))
         return rev_comp, exon_seqs
 
     return spliced_seq, exon_seqs
@@ -293,19 +286,82 @@ def _score_orf(
     isoform: Isoform,
     head_outputs: Dict[str, torch.Tensor],
     scoring_config: Dict,
-    input_ids: Optional[torch.Tensor] = None,
-    use_sequence_fallback: bool = False
+    input_ids: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """
     Scores the validity of the open reading frame using either head outputs or a sequence scan.
+    This function implements a two-tier scoring system as requested.
     """
-    # Tier B: Sequence-based fallback using codon scanning
-    if use_sequence_fallback:
+    use_head = scoring_config.get("use_orf_head", True)
+    device = head_outputs["splice"]["donor"].device
+
+    # --- Tier A: Head-driven scoring (default) ---
+    if use_head:
+        start_logits = head_outputs["orf"]["start"].squeeze()
+        stop_logits = head_outputs["orf"]["stop"].squeeze()
+        frame_logits = head_outputs["orf"]["frame"].squeeze()
+        frame_probs = torch.softmax(frame_logits, dim=-1)
+        stop_probs = torch.sigmoid(stop_logits)
+
+        if not isoform.exons:
+            return torch.tensor(0.0, device=device)
+
+        tx_to_gen_map = [p for exon in sorted(isoform.exons, key=lambda e: e.start) for p in range(exon.start, exon.end)]
+        if not tx_to_gen_map:
+            return torch.tensor(0.0, device=device)
+
+        exonic_indices = torch.tensor(tx_to_gen_map, device=device)
+        exonic_start_logits = start_logits[exonic_indices]
+        top_k = min(scoring_config.get("max_start_candidates", 5), len(exonic_indices))
+
+        if top_k == 0: return torch.tensor(0.0, device=device)
+
+        candidate_start_probs, relative_indices = torch.topk(torch.sigmoid(exonic_start_logits), k=top_k)
+        best_overall_score = torch.tensor(-1.0, device=device)
+
+        for s_prob, s_rel_idx in zip(candidate_start_probs, relative_indices):
+            s_tx_idx = s_rel_idx.item()
+            # Iterate through all three possible reading frames for the given start
+            for frame_offset in range(3):
+                cds_frame_probs = []
+                # Scan downstream from start codon
+                for tx_pos in range(s_tx_idx + frame_offset, len(tx_to_gen_map), 3):
+                    gen_pos = tx_to_gen_map[tx_pos]
+                    current_frame = (tx_pos - s_tx_idx) % 3
+                    cds_frame_probs.append(frame_probs[gen_pos, current_frame])
+
+                    # Check for stop codon
+                    if stop_probs[gen_pos] > 0.5:
+                        stop_prob = stop_probs[gen_pos]
+                        mean_frame_prob = torch.mean(torch.stack(cds_frame_probs))
+                        score = (scoring_config["orf_alpha"] * s_prob +
+                                 scoring_config["orf_beta"] * mean_frame_prob +
+                                 scoring_config["orf_alpha"] * stop_prob)
+
+                        # Apply PTC penalty if stop is premature
+                        if len(isoform.exons) > 1:
+                            exon_lengths = [e.end - e.start for e in sorted(isoform.exons, key=lambda e: e.start)[:-1]]
+                            last_junction_pos = sum(exon_lengths)
+                            if tx_pos < last_junction_pos - 55:
+                                score -= scoring_config["orf_gamma"]
+
+                        if score > best_overall_score:
+                            best_overall_score = score
+                        break # Found a stop, end this frame scan
+                else: # No stop found
+                    score = (scoring_config["orf_alpha"] * s_prob) - scoring_config["orf_gamma"]
+                    if score > best_overall_score:
+                        best_overall_score = score
+
+        return torch.max(torch.tensor(0.0, device=device), best_overall_score)
+
+    # --- Tier B: Sequence-based fallback ---
+    else:
         if input_ids is None:
-            return torch.tensor(0.0)
+            return torch.tensor(0.0, device=device)
 
         token_map = {0: "A", 1: "C", 2: "G", 3: "T", 4: "N"}
-        cDNA, exon_seqs = _get_spliced_cDNA(isoform, input_ids.squeeze(), token_map)
+        cDNA, exon_seqs = _get_spliced_cDNA(isoform, input_ids, token_map)
 
         best_score = -1.0
 
@@ -314,9 +370,9 @@ def _score_orf(
             return seq[pos-3] in "AG" and seq[pos+3] == "G"
 
         for i in range(len(cDNA) - 2):
-            if cDNA[i:i+3] == "ATG":
+            if cDNA[i:i+3] == "ATG": # Found a start codon
                 for j in range(i, len(cDNA) - 2, 3):
-                    if cDNA[j:j+3] in {"TAA", "TAG", "TGA"}:
+                    if cDNA[j:j+3] in {"TAA", "TAG", "TGA"}: # Found a stop codon
                         cds_len_aa = (j - i) // 3
                         score = 0.5
                         if scoring_config.get("min_cds_len_aa", 50) <= cds_len_aa <= scoring_config.get("max_cds_len_aa", 10000):
@@ -324,6 +380,7 @@ def _score_orf(
                         if is_strong_kozak(cDNA, i):
                             score += scoring_config.get("kozak_bonus", 0.2)
 
+                        # PTC penalty
                         if len(exon_seqs) > 1:
                             last_junction_pos = sum(len(s) for s in exon_seqs[:-1])
                             if j < last_junction_pos - 55:
@@ -331,66 +388,8 @@ def _score_orf(
 
                         if score > best_score:
                             best_score = score
-                        break
-        return torch.tensor(max(0.0, best_score))
-
-    # Tier A: Head-driven scoring
-    start_logits = head_outputs["orf"]["start"].squeeze()
-    stop_logits = head_outputs["orf"]["stop"].squeeze()
-    frame_logits = head_outputs["orf"]["frame"].squeeze()
-    frame_probs = torch.softmax(frame_logits, dim=-1)
-    stop_probs = torch.sigmoid(stop_logits)
-
-    if not isoform.exons:
-        return torch.tensor(0.0)
-
-    tx_to_gen_map = [p for exon in isoform.exons for p in range(exon.start, exon.end)]
-    if not tx_to_gen_map:
-        return torch.tensor(0.0)
-
-    exonic_indices = torch.tensor(tx_to_gen_map, device=start_logits.device)
-    exonic_start_logits = start_logits[exonic_indices]
-    top_k = min(scoring_config.get("max_start_candidates", 5), len(exonic_indices))
-
-    if top_k == 0: return torch.tensor(0.0)
-
-    candidate_start_probs, relative_indices = torch.topk(torch.sigmoid(exonic_start_logits), k=top_k)
-
-    best_overall_score = torch.tensor(-1.0, device=start_logits.device)
-
-    for s_prob, s_rel_idx in zip(candidate_start_probs, relative_indices):
-        s_tx_idx = s_rel_idx.item()
-
-        for frame in range(3):
-            cds_frame_probs = []
-
-            for tx_pos in range(s_tx_idx, len(tx_to_gen_map), 3):
-                gen_pos = tx_to_gen_map[tx_pos]
-                cds_frame_probs.append(frame_probs[gen_pos, frame])
-
-                if stop_probs[gen_pos] > 0.5:
-                    stop_prob = stop_probs[gen_pos]
-                    mean_frame_prob = torch.mean(torch.stack(cds_frame_probs))
-
-                    score = (scoring_config["orf_alpha"] * s_prob +
-                             scoring_config["orf_beta"] * mean_frame_prob +
-                             scoring_config["orf_alpha"] * stop_prob)
-
-                    if len(isoform.exons) > 1:
-                        last_junction_donor = isoform.exons[-2].start if isoform.strand == '-' else isoform.exons[-2].end
-                        if (isoform.strand == '+' and gen_pos < last_junction_donor - 55) or \
-                           (isoform.strand == '-' and gen_pos > last_junction_donor + 55):
-                            score -= scoring_config["orf_gamma"]
-
-                    if score > best_overall_score:
-                        best_overall_score = score
-                    break
-            else:
-                score = (scoring_config["orf_alpha"] * s_prob) - scoring_config["orf_gamma"]
-                if score > best_overall_score:
-                    best_overall_score = score
-
-    return torch.max(torch.tensor(0.0, device=best_overall_score.device), best_overall_score)
+                        break # Stop scanning for this ORF
+        return torch.tensor(max(0.0, best_score), device=device)
 
 
 def _score_length(isoform: Isoform, priors: Dict) -> torch.Tensor:
@@ -466,13 +465,11 @@ class IsoformScorer(nn.Module):
             s_pa = torch.tensor(0.0)
 
         # 4. ORF Score
-        use_fallback = self.scoring_config.get("use_orf_head", True) is False
         s_orf = _score_orf(
             isoform,
             head_outputs,
             self.scoring_config,
-            input_ids=input_ids,
-            use_sequence_fallback=use_fallback
+            input_ids=input_ids
         )
 
         # 5. Length Score

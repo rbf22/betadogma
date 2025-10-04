@@ -23,7 +23,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
-from transformers import AutoTokenizer
 
 from betadogma.model import BetaDogmaModel
 
@@ -64,15 +63,29 @@ def collate(batch):
 
     return {"seqs": seqs, "donor": donor, "acceptor": acceptor, "tss": tss, "polya": polya}
 
+
+# --------------- Tokenization ----------------
+
+def tokenize_dna(seqs: List[str]) -> torch.Tensor:
+    """Converts a list of DNA sequences to a tensor of token indices."""
+    token_map = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4}
+    batch_tokens = []
+    for seq in seqs:
+        # upper() handles 'acgt' and 'N'
+        tokens = [token_map.get(char, token_map['N']) for char in seq.upper()]
+        batch_tokens.append(tokens)
+    return torch.tensor(batch_tokens, dtype=torch.long)
+
+
 # --------------- Training ----------------
 
 def train(cfg: Dict):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # --- Initialize Model, Tokenizer, and Data ---
-    model_config = {"encoder": cfg["encoder"], "heads": cfg["heads"]}
-    model = BetaDogmaModel(config=model_config).to(device)
-    tokenizer = AutoTokenizer.from_pretrained(cfg['encoder']['model_name'], trust_remote_code=True)
+    # --- Initialize Model and Data ---
+    # The model is now instantiated with the full config, ensuring all components
+    # (encoder, heads, decoder) are correctly configured.
+    model = BetaDogmaModel(config=cfg).to(device)
 
     shards_glob = os.path.join(cfg["data"]["out_cache"], "*.parquet")
     paths = glob(shards_glob)
@@ -93,17 +106,13 @@ def train(cfg: Dict):
         for batch in dl:
             opt.zero_grad()
 
-            # Tokenize sequences
-            inputs = tokenizer(
-                batch["seqs"],
-                padding="longest",
-                truncation=True,
-                max_length=cfg['encoder']['max_length'],
-                return_tensors="pt"
-            ).to(device)
+            # Tokenize sequences using our simple DNA tokenizer
+            # The sequences are expected to be of fixed length from the data prep script.
+            input_ids = tokenize_dna(batch["seqs"]).to(device)
 
             # Forward pass through the unified model
-            outputs = model(input_ids=inputs.input_ids, attention_mask=inputs.attention_mask)
+            # The BetaDogmaEncoder does not use an attention mask.
+            outputs = model(input_ids=input_ids)
 
             # --- Calculate Multi-Task Loss ---
             # Splice loss

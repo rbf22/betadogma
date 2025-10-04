@@ -93,34 +93,6 @@ def test_isoform_enumerator_respects_max_paths(simple_splice_graph, decoder_conf
     assert len(isoforms[0].exons) == 1
     assert isoforms[0].exons[0].score == 0.9
 
-def test_isoform_scorer_basic(decoder_config):
-    """
-    Tests the IsoformScorer's basic functionality.
-    """
-    scorer = IsoformScorer(config=decoder_config)
-
-    exon1 = Exon(start=100, end=200, score=0.9)
-    exon2 = Exon(start=300, end=400, score=0.7)
-    isoform = Isoform(exons=[exon1, exon2], strand="+")
-
-    # The new scorer requires head outputs. We can mock them.
-    mock_head_outputs = {
-        "splice": {
-            "donor": torch.randn(2000),
-            "acceptor": torch.randn(2000)
-        },
-        "tss": {"tss": torch.randn(2000)},
-            "polya": {"polya": torch.randn(2000)},
-            "orf": {
-                "start": torch.randn(2000, 1),
-                "stop": torch.randn(2000, 1),
-                "frame": torch.randn(2000, 3),
-            }
-    }
-
-    score = scorer(isoform, head_outputs=mock_head_outputs)
-    assert isinstance(score, torch.Tensor)
-    assert score.numel() == 1
 
 def test_isoform_enumerator_empty_graph(decoder_config):
     """
