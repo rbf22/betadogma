@@ -1,37 +1,34 @@
-# Default training config (placeholder)
 seed: 42
-device: auto
-optimizer:
-  name: adamw
-  lr: 2.0e-4
-  weight_decay: 0.01
-trainer:
-  epochs: 10
-  batch_size: 1
 
 encoder:
-  model_name: arm-genomics/enformer-finetuned-human-128k
-  hidden_size: 1536
-  bin_size: 128
+  model_name: "arm-genomics/enformer-finetuned-human-128k"
+  hidden_size: 1536   # enformer-finetuned-human-128k default channel size
+  bin_size: 128       # encoder output resolution (bp per bin)
+  max_length: 131072
 
 heads:
   hidden: 768
-  dropout: 0.1
   use_conv: true
+  dropout: 0.1
 
-backbone:
-  name: generator
-  tag: generator-base
-tasks:
-  splice: true
-  tss: true
-  polya: true
-  orf: true
-  isoform: true
-  nmd: true
-  variant: true
+optimizer:
+  lr: 2.0e-4
+  weight_decay: 0.01
+
+trainer:
+  epochs: 5
+  batch_size: 2
+  grad_clip: 1.0
+  max_shards: 4               # raise as you scale
+  ckpt_dir: checkpoints/structural
+
+loss:
+  pos_weight: 25.0            # class imbalance for sparse positives
+  w_splice: 1.0
+  w_tss: 0.5
+  w_polya: 0.5
+
 data:
-  fasta: /path/to/GRCh38.fa
-  gencode: /path/to/gencode.gtf
-  gtex: /path/to/gtex/
-  out_cache: data/cache/
+  fasta: /abs/path/GRCh38.primary_assembly.genome.fa
+  gencode: /abs/path/gencode.v44.annotation.gtf
+  out_cache: data/cache/gencode_v44_structural
