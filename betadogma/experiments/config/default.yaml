@@ -1,0 +1,26 @@
+# Default training config (placeholder)
+seed: 42
+device: auto
+optimizer:
+  name: adamw
+  lr: 2.0e-4
+  weight_decay: 0.01
+trainer:
+  epochs: 10
+  batch_size: 1
+backbone:
+  name: generator
+  tag: generator-base
+tasks:
+  splice: true
+  tss: true
+  polya: true
+  orf: true
+  isoform: true
+  nmd: true
+  variant: true
+data:
+  fasta: /path/to/GRCh38.fa
+  gencode: /path/to/gencode.gtf
+  gtex: /path/to/gtex/
+  out_cache: data/cache/
