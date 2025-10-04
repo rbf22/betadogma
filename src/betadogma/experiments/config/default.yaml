@@ -32,3 +32,29 @@ data:
   fasta: /abs/path/GRCh38.primary_assembly.genome.fa
   gencode: /abs/path/gencode.v44.annotation.gtf
   out_cache: data/cache/gencode_v44_structural
+
+decoder:
+  max_candidates: 64
+  beam_size: 16
+  thresholds:
+    donor: 0.6
+    acceptor: 0.6
+    tss: 0.5
+    polya: 0.5
+  priors:
+    min_exon_len: 25
+    max_intron_len: 500000
+  scoring:
+    w_spl: 1.0
+    w_tss: 0.3
+    w_pa: 0.3
+    w_len: 0.1
+    w_orf: 0.5
+
+abundance:
+  enabled: false
+  hidden: 256
+  loss: kl
+  em_iters: 3
+  temp: 1.0
+  smoothing: 1e-3
