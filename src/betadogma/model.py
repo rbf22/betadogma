@@ -13,6 +13,7 @@ import torch.nn as nn
 
 from .core.encoder import BetaDogmaEncoder
 from .core.heads import SpliceHead, TSSHead, PolyAHead, ORFHead
+from .decoder.isoform_decoder import IsoformDecoder
 
 
 @dataclass
@@ -64,6 +65,10 @@ class BetaDogmaModel(nn.Module):
             use_conv=head_config["use_conv"],
         )
 
+        # Decoder
+        self.isoform_decoder = IsoformDecoder(config=self.config)
+
+
     def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """
         Runs the encoder and all prediction heads.
@@ -101,12 +106,13 @@ class BetaDogmaModel(nn.Module):
         return cls(config=config)
 
     @torch.no_grad()
-    def predict(self, sequence: str, variant: Optional[Dict[str, Any]] = None) -> Prediction:
+    def predict(self, sequence: str, variant: Optional[Dict[str, Any]] = None, strand: str = '+') -> Prediction:
         """
         Run end-to-end inference.
         Args:
             sequence: DNA bases A/C/G/T/N for a genomic window.
             variant: optional structured variant encoding dict.
+            strand: The genomic strand ('+' or '-').
         Returns:
             Prediction: dominant isoform, ψ distribution, P(NMD), and aux head outputs.
         """
@@ -118,19 +124,29 @@ class BetaDogmaModel(nn.Module):
         # 2. Run the model's forward pass
         head_outputs = self.forward(dummy_input_ids)
 
-        # 3. Decode head outputs into biological structures (placeholder)
-        # This is where the isoform decoder and NMD model would run.
-        dominant_isoform = {"exons": [], "cds": None, "note": "decoded from model output (stub)"}
-        psi = {"note": "decoded psi (stub)"}
+        # 3. Decode head outputs into biological structures
+        isoforms = self.isoform_decoder.decode(head_outputs, strand=strand)
+
+        dominant_isoform = isoforms[0] if isoforms else None
+
+        # 4. Estimate abundance (psi) - baseline implementation
+        # Proportional to isoform scores, normalized via softmax
+        if isoforms:
+            scores = torch.tensor([iso.score for iso in isoforms])
+            psi_probs = torch.softmax(scores, dim=0)
+            psi = {f"isoform_{i}": prob.item() for i, prob in enumerate(psi_probs)}
+        else:
+            psi = {}
+
         p_nmd = 0.0  # from NMD model (stub)
 
-        # 4. Package for output
-        # Aux contains the raw head logits for inspection
+        # 5. Package for output
         aux = {
             "splice_logits": head_outputs["splice"],
             "tss_logits": head_outputs["tss"],
             "polya_logits": head_outputs["polya"],
             "orf_logits": head_outputs["orf"],
+            "all_isoforms": isoforms,
         }
 
         return Prediction(dominant_isoform, psi, p_nmd, aux)
