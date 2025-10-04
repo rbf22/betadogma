@@ -153,15 +153,83 @@ def test_splice_graph_builder_negative_strand(decoder_config):
     # Last (polya->acceptor): (5,20), (5,40) -> 2
     # Single (polya->tss): (5,50) -> 1
     # Total = 8
-    assert graph.graph.number_of_nodes() == 8
+    assert graph.graph.number_of_nodes() == 8, "Should find 8 unique exons"
     nodes = set(graph.graph.nodes)
     expected_nodes = {(10, 20), (10, 40), (30, 40), (10, 50), (30, 50), (5, 20), (5, 40), (5, 50)}
     assert nodes == expected_nodes
 
     # Expected junctions on negative strand (from upstream exon to downstream exon)
     # e.g. from (30,40) to (10,20). Intron len = 30-20 = 10.
-    assert graph.graph.has_edge((30, 40), (10, 20))
-    assert graph.graph.has_edge((30, 50), (10, 20))
-    assert graph.graph.has_edge((30, 50), (5, 20))
-    # etc... check a few valid connections
-    assert graph.graph.number_of_edges() > 0
+    assert graph.graph.has_edge((30, 40), (10, 20)), "Junction from (30,40) to (10,20) missing"
+    assert graph.graph.has_edge((30, 50), (10, 20)), "Junction from (30,50) to (10,20) missing"
+    assert graph.graph.has_edge((30, 50), (5, 20)), "Junction from (30,50) to (5,20) missing"
+    assert graph.graph.number_of_edges() > 0, "No junctions were found"
+
+
+def test_splice_graph_builder_negative_strand_regression(decoder_config):
+    """
+    A specific regression test for the negative strand logic fix.
+    It checks a simple two-exon case where sorting and junction-finding
+    are critical.
+    """
+    # Locus (negative strand):
+    # high coord <--- TSS at 150
+    #              [Exon 1: 100-120] -> donor=100, acceptor=120
+    #                 intron (len=30)
+    #              [Exon 2: 50-70]   -> donor=50, acceptor=70
+    # low coord  <--- polyA at 20
+    #
+    # Expected transcript order: Exon 1 (100,120) -> Exon 2 (50,70)
+    # Expected junction: from donor at 100 to acceptor at 70.
+
+    seq_len = 200
+    donor_logits = torch.full((1, seq_len, 1), -10.0)
+    acceptor_logits = torch.full((1, seq_len, 1), -10.0)
+    tss_logits = torch.full((1, seq_len, 1), -10.0)
+    polya_logits = torch.full((1, seq_len, 1), -10.0)
+
+    # For negative strand, a donor is at a lower coordinate than an acceptor for an internal exon.
+    # The builder pairs (donor, acceptor) where donor < acceptor.
+    donor_logits[0, 100, 0] = 5.0
+    donor_logits[0, 50, 0] = 5.0
+    acceptor_logits[0, 120, 0] = 5.0
+    acceptor_logits[0, 70, 0] = 5.0
+    tss_logits[0, 150, 0] = 5.0
+    polya_logits[0, 20, 0] = 5.0
+
+    head_outputs = {
+        "splice": {"donor": donor_logits, "acceptor": acceptor_logits},
+        "tss": {"tss": tss_logits},
+        "polya": {"polya": polya_logits},
+    }
+
+    builder = SpliceGraphBuilder(config=decoder_config)
+    graph = builder.build(head_outputs, strand='-')
+
+    # Expected exons on negative strand:
+    # type              start           end
+    # ----------------------------------------
+    # internal          (donor, acc) -> (100, 120), (50, 120), (50, 70)
+    # first (5')        (donor, tss) -> (100, 150), (50, 150)
+    # last (3')         (polya, acc) -> (20, 120), (20, 70)
+    # single            (polya, tss) -> (20, 150)
+    # Total unique exons = 8
+    assert graph.graph.number_of_nodes() == 8, "Incorrect number of unique exons found"
+
+    # Critical check: the junction must connect the upstream exon to the downstream one.
+    # Upstream exon is (100, 120). Downstream exon is (50, 70).
+    # Junction is from donor of upstream (at its start, 100) to acceptor of downstream (at its end, 70).
+    assert graph.graph.has_edge((100, 120), (50, 70)), "Junction from internal to internal exon not found."
+
+    # Check that there is NOT a reverse edge.
+    assert not graph.graph.has_edge((50, 70), (100, 120)), "Incorrect reverse junction found."
+
+    # Check first-exon to internal-exon junction
+    # Upstream: (100, 150) [first exon], Downstream: (50, 70) [internal exon]
+    # Donor at 100, acceptor at 70.
+    assert graph.graph.has_edge((100, 150), (50, 70)), "Junction from first-exon to internal-exon not found."
+
+    # Check internal-exon to last-exon junction
+    # Upstream: (100, 120) [internal], Downstream: (20, 70) [last exon]
+    # Donor at 100, acceptor at 70.
+    assert graph.graph.has_edge((100, 120), (20, 70)), "Junction from internal-exon to last-exon not found."

@@ -56,6 +56,10 @@ def get_mock_batch(device: torch.device) -> Dict[str, Any]:
     acceptor_logits = torch.full((1, 1, seq_len), -10.0, device=device)
     tss_logits = torch.full((1, 1, seq_len), -10.0, device=device)
     polya_logits = torch.full((1, 1, seq_len), -10.0, device=device)
+    orf_start_logits = torch.full((1, 1, seq_len), -10.0, device=device)
+    orf_stop_logits = torch.full((1, 1, seq_len), -10.0, device=device)
+    orf_frame_logits = torch.randn(1, 1, seq_len, 3, device=device)
+
 
     # Define sites for a true isoform and some distractors
     # True isoform path: [Exon(50, 200), Exon(300, 500)]
@@ -73,12 +77,20 @@ def get_mock_batch(device: torch.device) -> Dict[str, Any]:
         "splice": {"donor": donor_logits.transpose(1, 2), "acceptor": acceptor_logits.transpose(1, 2)},
         "tss": {"tss": tss_logits.transpose(1, 2)},
         "polya": {"polya": polya_logits.transpose(1, 2)},
+        "orf": {
+            "start": orf_start_logits.transpose(1, 2),
+            "stop": orf_stop_logits.transpose(1, 2),
+            "frame": orf_frame_logits.squeeze(0), # Remove channel dim
+        }
     }
 
     # A "true" isoform for ranking against
     true_isoform = Isoform(exons=[Exon(50, 200), Exon(300, 500)], strand='+')
 
-    return {"head_outputs": head_outputs, "true_isoform": true_isoform, "strand": "+"}
+    # Mock input_ids for sequence-based scoring fallback
+    mock_input_ids = torch.randint(0, 5, (1, seq_len), device=device)
+
+    return {"head_outputs": head_outputs, "true_isoform": true_isoform, "strand": "+", "input_ids": mock_input_ids}
 
 def select_candidates(candidates: List[Isoform], true_isoform: Isoform) -> (List[Isoform], List[Isoform]):
     """Separates candidate isoforms into positive (matching ground truth) and negative."""
@@ -105,9 +117,10 @@ def train_one_epoch(
 
     for batch in mock_loader:
         head_outputs = {k: {k2: v2.to(device) for k2, v2 in v.items()} for k, v in batch['head_outputs'].items()}
+        input_ids = batch['input_ids'].to(device)
 
         # The decoder is used as a utility here, not trained directly.
-        candidates = model.isoform_decoder.decode(head_outputs, strand=batch['strand'])
+        candidates = model.isoform_decoder.decode(head_outputs, strand=batch['strand'], input_ids=input_ids)
 
         pos_cands, neg_cands = select_candidates(candidates, batch['true_isoform'])
 
@@ -116,9 +129,9 @@ def train_one_epoch(
 
         # Score candidates using the learnable scorer
         scorer = model.isoform_decoder.scorer
-        pos_scores = torch.stack([scorer(iso, head_outputs) for iso in pos_cands])
+        pos_scores = torch.stack([scorer(iso, head_outputs, input_ids=input_ids) for iso in pos_cands])
         # For simplicity, we only use one negative example per positive
-        neg_scores = torch.stack([scorer(iso, head_outputs) for iso in neg_cands[:len(pos_cands)]])
+        neg_scores = torch.stack([scorer(iso, head_outputs, input_ids=input_ids) for iso in neg_cands[:len(pos_cands)]])
 
         loss = loss_fn(pos_scores, neg_scores)
 

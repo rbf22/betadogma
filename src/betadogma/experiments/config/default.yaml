@@ -46,14 +46,20 @@ decoder:
   max_ends: 8
   allow_unanchored: false
   scoring:
+    use_orf_head: true          # if false, use codon-scan fallback
     w_spl: 1.0
     w_tss: 0.4
     w_pa: 0.4
     w_orf: 0.8
     w_len: 0.1
-    orf_alpha: 0.5
-    orf_beta: 0.25
-    orf_gamma: 0.6
+    # ORF scoring parameters
+    orf_alpha: 0.5              # weight for start/stop logits
+    orf_beta: 0.3               # weight for frame consistency
+    orf_gamma: 0.6              # penalty for premature stop codons
+    max_start_candidates: 5
+    min_cds_len_aa: 50
+    max_cds_len_aa: 10000
+    kozak_bonus: 0.2
   priors:
     min_exon_len: 25
     max_intron_len: 500000

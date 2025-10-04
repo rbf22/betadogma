@@ -81,6 +81,7 @@ class BetaDogmaModel(nn.Module):
             "polya": self.polya_head(embeddings),
             "orf": self.orf_head(embeddings),
             "embeddings": embeddings,
+            "input_ids": input_ids,
         }
         return outputs
 
@@ -125,7 +126,7 @@ class BetaDogmaModel(nn.Module):
         head_outputs = self.forward(dummy_input_ids)
 
         # 3. Decode head outputs into biological structures
-        isoforms = self.isoform_decoder.decode(head_outputs, strand=strand)
+        isoforms = self.isoform_decoder.decode(head_outputs, strand=strand, input_ids=dummy_input_ids)
 
         dominant_isoform = isoforms[0] if isoforms else None
 

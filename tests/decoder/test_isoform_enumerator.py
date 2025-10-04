@@ -46,6 +46,10 @@ def decoder_config():
             "max_candidates": 10,
             "scoring": {
                 "w_spl": 1.0,
+                "orf_alpha": 0.5,
+                "orf_beta": 0.3,
+                "orf_gamma": 0.6,
+                "max_start_candidates": 5,
             }
         }
     }
@@ -106,7 +110,12 @@ def test_isoform_scorer_basic(decoder_config):
             "acceptor": torch.randn(2000)
         },
         "tss": {"tss": torch.randn(2000)},
-        "polya": {"polya": torch.randn(2000)}
+            "polya": {"polya": torch.randn(2000)},
+            "orf": {
+                "start": torch.randn(2000, 1),
+                "stop": torch.randn(2000, 1),
+                "frame": torch.randn(2000, 3),
+            }
     }
 
     score = scorer(isoform, head_outputs=mock_head_outputs)
