@@ -136,4 +136,4 @@ print("ΔNMD =", out_alt.P_NMD - out_ref.P_NMD)
 
 ## 📜 License
 
-Apache-2.0
+MIT
