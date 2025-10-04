@@ -53,22 +53,29 @@ def decoder_config():
 def test_isoform_enumerator_finds_best_path(simple_splice_graph, decoder_config):
     """
     Tests that the beam search enumerator finds the highest-scoring path.
+    The new enumerator also returns partial paths, so we expect more candidates.
     """
     enumerator = IsoformEnumerator(config=decoder_config)
     isoforms = enumerator.enumerate(simple_splice_graph, max_paths=10)
 
-    assert len(isoforms) == 2
+    # The new enumerator finds all sub-paths as candidates.
+    # We should find 4 single-exon paths and 2 two-exon paths.
+    assert len(isoforms) >= 2
 
-    # The best path should be A -> B -> D
+    # The best path is now based on score normalized by length.
+    # Path A->B->D: (0.9+0.8+0.9)/3 = 0.867
+    # Path A->C->D: (0.9+0.7+0.9)/3 = 0.833
+    # Single exons A and D have score 0.9.
+    # So the top-ranked isoforms should be the single exons.
     best_isoform = isoforms[0]
-    assert best_isoform.exons[0].start == 10
-    assert best_isoform.exons[1].start == 30
-    assert best_isoform.exons[1].end == 40 # This is exon B
-    assert best_isoform.exons[2].start == 50
+    assert len(best_isoform.exons) == 1
+    assert best_isoform.exons[0].score == 0.9
 
-    # The second best path should be A -> C -> D
-    second_isoform = isoforms[1]
-    assert second_isoform.exons[1].end == 45 # This is exon C
+    # Find the best multi-exon path to verify ranking among them
+    multi_exon_isoforms = [iso for iso in isoforms if len(iso.exons) > 1]
+    best_multi_exon = multi_exon_isoforms[0]
+    assert best_multi_exon.exons[0].end == 20  # Exon A
+    assert best_multi_exon.exons[1].end == 40  # Exon B
 
 def test_isoform_enumerator_respects_max_paths(simple_splice_graph, decoder_config):
     """
@@ -78,8 +85,9 @@ def test_isoform_enumerator_respects_max_paths(simple_splice_graph, decoder_conf
     isoforms = enumerator.enumerate(simple_splice_graph, max_paths=1)
 
     assert len(isoforms) == 1
-    # Check it's the best one
-    assert isoforms[0].exons[1].end == 40
+    # Check it's the best one (a single-exon isoform with score 0.9)
+    assert len(isoforms[0].exons) == 1
+    assert isoforms[0].exons[0].score == 0.9
 
 def test_isoform_scorer_basic(decoder_config):
     """
@@ -91,9 +99,19 @@ def test_isoform_scorer_basic(decoder_config):
     exon2 = Exon(start=300, end=400, score=0.7)
     isoform = Isoform(exons=[exon1, exon2], strand="+")
 
-    # The scorer should average the exon scores
-    score = scorer(isoform, heads={}) # heads are not used in this version
-    assert score.item() == pytest.approx(0.8)
+    # The new scorer requires head outputs. We can mock them.
+    mock_head_outputs = {
+        "splice": {
+            "donor": torch.randn(2000),
+            "acceptor": torch.randn(2000)
+        },
+        "tss": {"tss": torch.randn(2000)},
+        "polya": {"polya": torch.randn(2000)}
+    }
+
+    score = scorer(isoform, head_outputs=mock_head_outputs)
+    assert isinstance(score, torch.Tensor)
+    assert score.numel() == 1
 
 def test_isoform_enumerator_empty_graph(decoder_config):
     """

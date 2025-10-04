@@ -27,7 +27,11 @@ def _find_peaks(logits: torch.Tensor, threshold: float, top_k: int = None) -> Tu
     peak_indices = (probs > threshold).nonzero(as_tuple=False).squeeze()
 
     if peak_indices.numel() == 0:
-        return torch.tensor([]), torch.tensor([])
+        return torch.tensor([], device=logits.device), torch.tensor([], device=logits.device)
+
+    # Ensure peak_indices is always iterable (1-D)
+    if peak_indices.dim() == 0:
+        peak_indices = peak_indices.unsqueeze(0)
 
     if top_k and peak_indices.numel() > top_k:
         # If there are too many peaks, keep the ones with the highest probability
@@ -35,7 +39,9 @@ def _find_peaks(logits: torch.Tensor, threshold: float, top_k: int = None) -> Tu
         top_k_indices = torch.topk(peak_probs, k=top_k).indices
         peak_indices = peak_indices[top_k_indices]
 
-    return peak_indices, probs[peak_indices]
+    peak_probs = probs[peak_indices]
+
+    return peak_indices, peak_probs
 
 
 class SpliceGraph:
@@ -64,70 +70,107 @@ class SpliceGraph:
 class SpliceGraphBuilder:
     """
     Builds a splice graph from the outputs of the structural heads.
+    This version anchors the graph to high-confidence TSS and polyA sites.
     """
     def __init__(self, config: Dict):
         self.config = config.get("decoder", {})
         self.thresholds = self.config.get("thresholds", {})
         self.priors = self.config.get("priors", {})
+        self.max_starts = self.config.get("max_starts", 8)
+        self.max_ends = self.config.get("max_ends", 8)
+        self.allow_unanchored = self.config.get("allow_unanchored", False)
+        self.min_exon_len = self.priors.get("min_exon_len", 25)
+        self.max_intron_len = self.priors.get("max_intron_len", 500000)
+
+    def _get_exons(self, starts: List, ends: List, start_scores: List, end_scores: List) -> List[Exon]:
+        """Helper to generate exons from paired start/end coordinates."""
+        exons = []
+        for i, s_idx in enumerate(starts):
+            for j, e_idx in enumerate(ends):
+                if s_idx < e_idx:
+                    exon_len = e_idx - s_idx
+                    if exon_len >= self.min_exon_len:
+                        score = (start_scores[i] + end_scores[j]) / 2.0
+                        exons.append(Exon(start=int(s_idx), end=int(e_idx), score=float(score)))
+        return exons
 
     def build(self, head_outputs: Dict[str, torch.Tensor], strand: str = '+') -> SpliceGraph:
-        """
-        Takes raw head outputs and constructs a splice graph.
-        Assumes a single batch element for now.
+        """Takes raw head outputs and constructs a splice graph."""
+        # 1. Find all peaks for relevant signals
+        donor_logits = head_outputs["splice"]["donor"].squeeze()
+        acceptor_logits = head_outputs["splice"]["acceptor"].squeeze()
+        tss_logits = head_outputs.get("tss", {}).get("tss", torch.tensor([])).squeeze()
+        polya_logits = head_outputs.get("polya", {}).get("polya", torch.tensor([])).squeeze()
 
-        Args:
-            head_outputs: A dictionary containing tensors for 'donor',
-                          'acceptor', 'tss', and 'polya' logits.
-            strand: The strand of the sequence ('+' or '-').
+        donor_indices, donor_scores = _find_peaks(donor_logits, self.thresholds.get("donor", 0.6))
+        acceptor_indices, acceptor_scores = _find_peaks(acceptor_logits, self.thresholds.get("acceptor", 0.6))
+        tss_indices, tss_scores = _find_peaks(tss_logits, self.thresholds.get("tss", 0.5), top_k=self.max_starts)
+        polya_indices, polya_scores = _find_peaks(polya_logits, self.thresholds.get("polya", 0.5), top_k=self.max_ends)
 
-        Returns:
-            A SpliceGraph object representing possible exon connections.
-        """
-        donor_logits = head_outputs["splice"]["donor"].squeeze(0).squeeze(-1)
-        acceptor_logits = head_outputs["splice"]["acceptor"].squeeze(0).squeeze(-1)
-
-        donor_indices, donor_scores = _find_peaks(donor_logits, self.thresholds.get("donor", 0.5))
-        acceptor_indices, acceptor_scores = _find_peaks(acceptor_logits, self.thresholds.get("acceptor", 0.5))
-
-        graph = SpliceGraph()
+        # 2. Create candidate exons of different types
         candidate_exons = []
-
-        # 2. Define candidate exons based on strand
         if strand == '+':
-            # Positive strand: pair acceptor -> donor (acc_coord < don_coord)
-            for i, acc_idx in enumerate(acceptor_indices):
-                for j, don_idx in enumerate(donor_indices):
-                    if acc_idx < don_idx:
-                        exon_len = don_idx - acc_idx
-                        if self.priors.get("min_exon_len", 0) <= exon_len:
-                            score = (acceptor_scores[i] + donor_scores[j]) / 2.0
-                            exon = Exon(start=int(acc_idx), end=int(don_idx), score=float(score))
-                            graph.add_exon(exon)
-                            candidate_exons.append(exon)
+            # Internal, TSS-anchored, polyA-anchored, and single-exon transcripts
+            internal_exons = self._get_exons(acceptor_indices, donor_indices, acceptor_scores, donor_scores)
+            first_exons = self._get_exons(tss_indices, donor_indices, tss_scores, donor_scores)
+            last_exons = self._get_exons(acceptor_indices, polya_indices, acceptor_scores, polya_scores)
+            single_exons = self._get_exons(tss_indices, polya_indices, tss_scores, polya_scores)
         else: # strand == '-'
-            # Negative strand: pair donor -> acceptor (don_coord < acc_coord)
-            for i, don_idx in enumerate(donor_indices):
-                for j, acc_idx in enumerate(acceptor_indices):
-                    if don_idx < acc_idx:
-                        exon_len = acc_idx - don_idx
-                        if self.priors.get("min_exon_len", 0) <= exon_len:
-                            score = (donor_scores[i] + acceptor_scores[j]) / 2.0
-                            exon = Exon(start=int(don_idx), end=int(acc_idx), score=float(score))
-                            graph.add_exon(exon)
-                            candidate_exons.append(exon)
+            # On the minus strand, the 5'->3' direction is from higher to lower coordinates.
+            # We maintain start < end, so the pairs are swapped.
+            internal_exons = self._get_exons(donor_indices, acceptor_indices, donor_scores, acceptor_scores)
+            first_exons = self._get_exons(donor_indices, tss_indices, donor_scores, tss_scores) # donor -> tss
+            last_exons = self._get_exons(polya_indices, acceptor_indices, polya_scores, acceptor_scores) # polya -> acceptor
+            single_exons = self._get_exons(polya_indices, tss_indices, polya_scores, tss_scores) # polya -> tss
 
-        # 3. Add junctions (edges) between exons
-        candidate_exons.sort(key=lambda e: e.start)
-        for i in range(len(candidate_exons)):
-            for j in range(i + 1, len(candidate_exons)):
-                exon1 = candidate_exons[i]
-                exon2 = candidate_exons[j]
+        # 3. Combine exons based on anchoring policy
+        if self.allow_unanchored:
+            candidate_exons.extend(internal_exons)
+        candidate_exons.extend(first_exons)
+        candidate_exons.extend(last_exons)
+        candidate_exons.extend(single_exons)
 
-                # Junctions are strand-independent here (always exon1.end -> exon2.start)
-                intron_len = exon2.start - exon1.end
-                if 0 < intron_len <= self.priors.get("max_intron_len", 500000):
-                    junction_score = (exon1.score + exon2.score) / 2 # simplified
-                    graph.add_junction(exon1, exon2, score=junction_score)
+        # 4. De-duplicate exons and add to graph
+        unique_exons_dict = {}
+        for exon in candidate_exons:
+            key = (exon.start, exon.end)
+            if key not in unique_exons_dict or exon.score > unique_exons_dict[key].score:
+                unique_exons_dict[key] = exon
+
+        final_exons = sorted(list(unique_exons_dict.values()), key=lambda e: e.start)
+        graph = SpliceGraph()
+        for exon in final_exons:
+            graph.add_exon(exon)
+
+        # 5. Add valid junctions between exons
+        donor_set = set(donor_indices.tolist())
+        acceptor_set = set(acceptor_indices.tolist())
+
+        for exon1 in final_exons:
+            for exon2 in final_exons:
+                if exon1 == exon2:
+                    continue
+
+                if strand == '+':
+                    # Upstream exon1, downstream exon2
+                    if exon1.start < exon2.start:
+                        # Junction from donor at exon1.end to acceptor at exon2.start
+                        if exon1.end in donor_set and exon2.start in acceptor_set:
+                            intron_len = exon2.start - exon1.end
+                            if 0 < intron_len <= self.max_intron_len:
+                                junction_score = (graph.graph.nodes[(exon1.start, exon1.end)]['score'] +
+                                                  graph.graph.nodes[(exon2.start, exon2.end)]['score']) / 2.0
+                                graph.add_junction(exon1, exon2, score=junction_score)
+                else: # strand == '-'
+                    # Upstream exon1 (higher coord), downstream exon2 (lower coord)
+                    if exon1.start > exon2.start:
+                        # Junction from donor at exon1.start to acceptor at exon2.end
+                        if exon1.start in donor_set and exon2.end in acceptor_set:
+                            intron_len = exon1.start - exon2.end
+                            if 0 < intron_len <= self.max_intron_len:
+                                junction_score = (graph.graph.nodes[(exon1.start, exon1.end)]['score'] +
+                                                  graph.graph.nodes[(exon2.start, exon2.end)]['score']) / 2.0
+                                graph.add_junction(exon1, exon2, score=junction_score)
 
         return graph
 
@@ -135,6 +178,7 @@ class SpliceGraphBuilder:
 class IsoformEnumerator:
     """
     Enumerates candidate isoforms from a splice graph using beam search.
+    Considers all visited paths as potential candidates.
     """
     def __init__(self, config: Dict):
         self.config = config.get("decoder", {})
@@ -143,70 +187,110 @@ class IsoformEnumerator:
     def enumerate(self, graph: SpliceGraph, max_paths: int, strand: str = '+') -> List[Isoform]:
         """
         Finds the top-K paths through the splice graph using beam search.
-
-        Args:
-            graph: The SpliceGraph to search.
-            max_paths: The maximum number of isoform candidates to return.
-            strand: The strand, used to create the final Isoform object.
-
-        Returns:
-            A list of the most likely Isoform objects.
         """
         if not graph.graph or graph.graph.number_of_nodes() == 0:
             return []
 
         source_nodes = [n for n, d in graph.graph.in_degree() if d == 0]
+        if not source_nodes:
+            return []
 
-        # A beam is a list of (score, path) tuples
-        # Initialize the beam with the source nodes
-        beam = [(-graph.graph.nodes[n]['score'], [n]) for n in source_nodes]
-        beam.sort(key=lambda x: x[0]) # Sort by score (negative log prob)
+        # A beam is a list of (cumulative_score, path) tuples
+        beam = [(graph.graph.nodes[n]['score'], [n]) for n in source_nodes]
+        beam.sort(key=lambda x: x[0], reverse=True)
 
-        completed_paths = []
+        all_candidate_paths = []
 
         while beam:
+            # Add all paths in the current beam to our list of candidates
+            all_candidate_paths.extend(beam)
             new_beam = []
+
             for score, path in beam:
                 last_node = path[-1]
 
-                # If it's a terminal node, add to completed paths
-                if graph.graph.out_degree(last_node) == 0:
-                    completed_paths.append((score, path))
-                    continue
-
                 # Expand to neighbors
                 for neighbor in graph.graph.neighbors(last_node):
-                    edge_score = graph.graph.edges[last_node, neighbor].get('score', 0)
+                    # Path score is the sum of its exon scores
                     node_score = graph.graph.nodes[neighbor]['score']
-                    new_score = score - (edge_score + node_score) # Additive log probs
+                    new_score = score + node_score
                     new_path = path + [neighbor]
                     new_beam.append((new_score, new_path))
 
             # Prune the new beam to keep only the top-k paths
-            new_beam.sort(key=lambda x: x[0])
+            new_beam.sort(key=lambda x: x[0], reverse=True)
             beam = new_beam[:self.beam_size]
 
-            # Break if beam is empty to prevent infinite loops
             if not beam:
                 break
 
-        # Sort completed paths by score and take the top `max_paths`
-        completed_paths.sort(key=lambda x: x[0])
+        # De-duplicate paths, keeping the one with the highest score
+        unique_paths = {}
+        for score, path in all_candidate_paths:
+            path_tuple = tuple(path)
+            if path_tuple not in unique_paths or score > unique_paths[path_tuple]:
+                unique_paths[path_tuple] = score
 
-        # Convert paths to Isoform objects
+        # Sort final candidates by normalized score
+        sorted_paths = sorted(unique_paths.items(), key=lambda item: item[1] / len(item[0]), reverse=True)
+
+        # Convert top paths to Isoform objects
         isoforms = []
-        for score, path in completed_paths[:max_paths]:
+        for path_tuple, score in sorted_paths[:max_paths]:
             exons = []
-            for node_key in path:
+            for node_key in path_tuple:
                 node_data = graph.graph.nodes[node_key]
                 start, end = node_key
                 exons.append(Exon(start=start, end=end, score=node_data['score']))
 
-            # Final score is the average log-likelihood
-            isoform_score = -score / len(path) if path else 0
-            isoforms.append(Isoform(exons=exons, strand=strand, score=isoform_score))
+            normalized_score = score / len(path_tuple) if path_tuple else 0
+            isoforms.append(Isoform(exons=exons, strand=strand, score=normalized_score))
 
         return isoforms
+
+
+def _log_sigmoid(x: torch.Tensor) -> torch.Tensor:
+    """Numerically stable log(sigmoid(x))"""
+    return torch.log(torch.sigmoid(x) + 1e-9)
+
+
+def _get_peak_log_prob(logits: torch.Tensor, index: int, window: int) -> torch.Tensor:
+    """Gets the max log probability in a window around a specified index."""
+    if logits is None or index is None:
+        return torch.tensor(0.0)
+    start = max(0, index - window)
+    end = min(len(logits), index + window + 1)
+    if start >= end:
+        return torch.tensor(0.0)
+    return torch.max(_log_sigmoid(logits[start:end]))
+
+
+def _score_orf(isoform: Isoform, head_outputs: Dict[str, torch.Tensor], scoring_config: Dict) -> torch.Tensor:
+    """Scores the validity of the open reading frame."""
+    # Placeholder implementation, assuming boolean flags for now
+    # A more advanced version would scan the sequence
+    has_valid_start_stop = True # Replace with real check
+    has_frame_continuity = True # Replace with real check
+    has_premature_stop = False # Replace with real check
+
+    score = 0.0
+    if has_valid_start_stop:
+        score += scoring_config.get("orf_alpha", 0.5)
+    if has_frame_continuity:
+        score += scoring_config.get("orf_beta", 0.25)
+    if has_premature_stop:
+        score -= scoring_config.get("orf_gamma", 0.6)
+    return torch.tensor(score)
+
+
+def _score_length(isoform: Isoform, priors: Dict) -> torch.Tensor:
+    """Applies a soft penalty for extreme lengths."""
+    # Placeholder for a more sophisticated prior
+    # For now, just a small penalty for having very few or many exons
+    num_exons = len(isoform.exons)
+    if num_exons < 2 or num_exons > 20:
+        return torch.tensor(-0.5)
+    return torch.tensor(0.0)
 
 
 class IsoformScorer(nn.Module):
@@ -217,38 +301,70 @@ class IsoformScorer(nn.Module):
     def __init__(self, config: Dict):
         super().__init__()
         self.config = config.get("decoder", {})
-        scoring_config = self.config.get("scoring", {})
+        self.scoring_config = self.config.get("scoring", {})
+        self.priors = self.config.get("priors", {})
 
         # Define learnable weights for different components of the score
-        self.w_spl = nn.Parameter(torch.tensor(scoring_config.get("w_spl", 1.0)))
-        self.w_tss = nn.Parameter(torch.tensor(scoring_config.get("w_tss", 0.3)))
-        self.w_pa = nn.Parameter(torch.tensor(scoring_config.get("w_pa", 0.3)))
-        self.w_len = nn.Parameter(torch.tensor(scoring_config.get("w_len", 0.1)))
-        self.w_orf = nn.Parameter(torch.tensor(scoring_config.get("w_orf", 0.5)))
+        self.w_spl = nn.Parameter(torch.tensor(self.scoring_config.get("w_spl", 1.0)))
+        self.w_tss = nn.Parameter(torch.tensor(self.scoring_config.get("w_tss", 0.4)))
+        self.w_pa = nn.Parameter(torch.tensor(self.scoring_config.get("w_pa", 0.4)))
+        self.w_orf = nn.Parameter(torch.tensor(self.scoring_config.get("w_orf", 0.8)))
+        self.w_len = nn.Parameter(torch.tensor(self.scoring_config.get("w_len", 0.1)))
 
-    def forward(self, isoform: Isoform, heads: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, isoform: Isoform, head_outputs: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         Calculates a score for a given isoform.
         """
-        # 1. Splice Score (from graph construction)
-        splice_score = 0
-        if isoform.exons:
-            splice_score = torch.tensor(sum(exon.score for exon in isoform.exons) / len(isoform.exons))
+        device = self.w_spl.device
 
-        # 2. Other scores (placeholders for now)
-        tss_score = torch.tensor(0.0)
-        polya_score = torch.tensor(0.0)
-        len_score = torch.tensor(0.0)
-        orf_score = torch.tensor(0.0)
+        # 1. Splice Score
+        donor_logits = head_outputs["splice"]["donor"].squeeze()
+        acceptor_logits = head_outputs["splice"]["acceptor"].squeeze()
+
+        s_spl = 0
+        if isoform.exons and len(isoform.exons) > 1:
+            donor_indices = [exon.end for exon in isoform.exons[:-1]]
+            acceptor_indices = [exon.start for exon in isoform.exons[1:]]
+
+            donor_log_probs = _log_sigmoid(donor_logits[donor_indices])
+            acceptor_log_probs = _log_sigmoid(acceptor_logits[acceptor_indices])
+
+            s_spl = (torch.sum(donor_log_probs) + torch.sum(acceptor_log_probs)) / (len(donor_indices) + len(acceptor_indices))
+        else:
+            s_spl = torch.tensor(0.0) # No junctions for single-exon transcripts
+
+        # 2. TSS Score
+        tss_logits = head_outputs.get("tss", {}).get("tss", None)
+        if tss_logits is not None:
+            tss_logits = tss_logits.squeeze()
+            start_bin = isoform.exons[0].start if isoform.exons else None
+            s_tss = _get_peak_log_prob(tss_logits, start_bin, self.config.get("tss_pa_window", 1))
+        else:
+            s_tss = torch.tensor(0.0)
+
+        # 3. PolyA Score
+        polya_logits = head_outputs.get("polya", {}).get("polya", None)
+        if polya_logits is not None:
+            polya_logits = polya_logits.squeeze()
+            end_bin = isoform.exons[-1].end if isoform.exons else None
+            s_pa = _get_peak_log_prob(polya_logits, end_bin, self.config.get("tss_pa_window", 1))
+        else:
+            s_pa = torch.tensor(0.0)
+
+        # 4. ORF Score
+        s_orf = _score_orf(isoform, head_outputs, self.scoring_config)
+
+        # 5. Length Score
+        s_len = _score_length(isoform, self.priors)
 
         # Weighted sum of scores
         total_score = (
-            self.w_spl * splice_score +
-            self.w_tss * tss_score +
-            self.w_pa * polya_score +
-            self.w_len * len_score +
-            self.w_orf * orf_score
-        )
+            self.w_spl * s_spl +
+            self.w_tss * s_tss +
+            self.w_pa * s_pa +
+            self.w_orf * s_orf +
+            self.w_len * s_len
+        ).to(device)
 
         return total_score
 
