@@ -8,6 +8,17 @@ optimizer:
 trainer:
   epochs: 10
   batch_size: 1
+
+encoder:
+  model_name: arm-genomics/enformer-finetuned-human-128k
+  hidden_size: 1536
+  bin_size: 128
+
+heads:
+  hidden: 768
+  dropout: 0.1
+  use_conv: true
+
 backbone:
   name: generator
   tag: generator-base
