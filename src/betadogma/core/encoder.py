@@ -1,24 +1,20 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModel
+from enformer_pytorch import from_pretrained, seq_indices_to_one_hot
 
 class BetaDogmaEncoder(nn.Module):
     """
-    A wrapper for a pre-trained genomic foundation model.
-
-    This module loads a specified transformer model from the Hugging Face Hub
-    and serves as the primary feature encoder for the BetaDogma framework.
-    It is designed to be fine-tuned on downstream tasks.
-
-    Args:
-        model_name (str): The name of the pre-trained model to load from
-                          the Hugging Face Hub (e.g., 'arm-genomics/enformer-finetuned-human-128k').
+    Wrapper for the Enformer model, loaded using the enformer-pytorch library.
+    This serves as the primary feature encoder for the BetaDogma framework.
     """
-    def __init__(self, model_name: str = "arm-genomics/enformer-finetuned-human-128k"):
+    def __init__(self, model_name: str = "EleutherAI/enformer-official-rough"):
         super().__init__()
         self.model_name = model_name
         try:
-            self.transformer = AutoModel.from_pretrained(self.model_name, trust_remote_code=True)
+            # Load the model using the custom loader from enformer-pytorch
+            # use_tf_gamma=False is needed for compatibility with the ported weights.
+            self.transformer = from_pretrained(self.model_name, use_tf_gamma=False)
+            self.transformer.eval()  # Set to evaluation mode
         except Exception as e:
             print(f"Error loading model {self.model_name}: {e}")
             print("Please ensure you are connected to the internet and the model name is correct.")
@@ -26,22 +22,21 @@ class BetaDogmaEncoder(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
         """
-        Performs a forward pass through the transformer model.
+        Performs a forward pass through the Enformer model to get embeddings.
+        The enformer-pytorch model expects one-hot encoded sequences.
 
         Args:
-            input_ids (torch.Tensor): A tensor of token IDs of shape
+            input_ids (torch.Tensor): A tensor of token indices of shape
                                       (batch_size, sequence_length).
-            attention_mask (torch.Tensor, optional): A tensor indicating which
-                                                     tokens to attend to.
-                                                     Defaults to None.
+            attention_mask (torch.Tensor, optional): This argument is ignored
+                                                     but kept for API consistency.
 
         Returns:
-            torch.Tensor: The last hidden state from the transformer model.
+            torch.Tensor: The embeddings from the Enformer model.
         """
-        outputs = self.transformer(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
-        # Return the last hidden state
-        return outputs.last_hidden_state
+        # Convert token indices to one-hot encoding
+        one_hot_input = seq_indices_to_one_hot(input_ids)
+
+        # The model returns (predictions, embeddings) when return_embeddings=True
+        _, embeddings = self.transformer(one_hot_input, return_embeddings=True)
+        return embeddings
