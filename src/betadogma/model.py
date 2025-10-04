@@ -88,8 +88,8 @@ class BetaDogmaModel(nn.Module):
             # Placeholder config
             config = {
                 "encoder": {
-                    "model_name": "arm-genomics/enformer-finetuned-human-128k",
-                    "hidden_size": 1536,
+                    "model_name": "EleutherAI/enformer-official-rough",
+                    "hidden_size": 3072,
                 },
                 "heads": {
                     "hidden": 768,

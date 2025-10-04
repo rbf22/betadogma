@@ -24,6 +24,7 @@ datasets = ">=2.20"
 einops = ">=0.8"
 networkx = ">=3.2"
 numba = ">=0.59"
+enformer-pytorch = ">=0.8.0"
 
 [tool.poetry.group.test.dependencies]
 pytest = ">=8.0"
