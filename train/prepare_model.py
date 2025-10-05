@@ -1,24 +1,50 @@
 import torch
+from pathlib import Path
 from betadogma.model import BetaDogmaModel
+from betadogma.core.encoder_nt import NTEncoder
 
 print("--- Verifying Full Model Workflow ---")
-print("Loading BetaDogmaModel with Enformer backend...")
 
-# This will now instantiate the full model, including the corrected encoder
-# and the prediction heads that now expect the correct embedding size.
-model = BetaDogmaModel(d_in=1536, config=config)
+# Define the path to the configuration file
+config_path = str(Path(__file__).parent.parent / "src/betadogma/experiments/config/default.yaml")
+
+# --- 1. Instantiate BetaDogmaModel from config ---
+print("Loading BetaDogmaModel with NT backend...")
+# Use the classmethod to load from config, which correctly sets d_in and attaches config
+model = BetaDogmaModel.from_config_file(config_path)
 model.eval()
 
-print("Model loaded successfully. Performing a forward pass...")
+# --- 2. Instantiate Encoder from config ---
+print("Loading NTEncoder...")
+encoder_config = model.config['encoder']
+encoder = NTEncoder(model_id=encoder_config['model_id'])
 
-# Create a dummy input tensor representing tokenized DNA
-# (Batch size=1, Sequence length=196,608, as expected by Enformer)
-dummy_input_ids = torch.randint(0, 5, (1, 196_608))
+# Verify that the embedding dimensions match
+# The input dimension is stored in the LayerNorm layer of the head's projection module
+head_d_in = model.splice_head.proj.norm.normalized_shape[0]
+assert head_d_in == encoder.hidden_size, \
+    f"Model d_in ({head_d_in}) does not match encoder hidden_size ({encoder.hidden_size})"
 
-# Perform a forward pass through the entire model
+print("Model and encoder loaded successfully. Performing a forward pass...")
+
+# --- 3. Create Dummy Data and Generate Embeddings ---
+# The NT model has a max sequence length (e.g., 6k for some variants).
+# Using a shorter sequence for this verification script is safer and faster.
+dummy_sequence = "N" * 4096
+print(f"Created a dummy sequence of length {len(dummy_sequence)}")
+
+# Generate embeddings using the encoder. The NTEncoder expects a list of strings.
+print("Generating embeddings from sequence...")
+embeddings = encoder.forward([dummy_sequence])
+print(f"Embeddings generated with shape: {embeddings.shape}")
+
+
+# --- 4. Perform Forward Pass through BetaDogmaModel ---
+# Perform a forward pass through the main model with the embeddings
 with torch.no_grad():
-    outputs = model(dummy_input_ids)
+    outputs = model(embeddings)
 
+# --- 5. Verify Outputs ---
 # Print the shapes of the outputs from each head to verify
 print("\n--- Verification Complete ---")
 print("Output shapes from prediction heads:")
