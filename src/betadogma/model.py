@@ -89,7 +89,12 @@ class BetaDogmaModel(nn.Module):
         import yaml
         with open(config_path, "r") as f:
             config = yaml.safe_load(f)
-        return cls(config=config)
+
+        d_in = config.get("encoder", {}).get("hidden_size")
+        if d_in is None:
+            raise ValueError("`encoder.hidden_size` must be specified in the config.")
+
+        return cls(d_in=d_in, config=config)
 
 def preprocess_sequence(chrom: str, start: int, end: int) -> str:
     """
