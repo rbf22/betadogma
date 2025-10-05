@@ -5,13 +5,6 @@ Phase 1: Structural fine-tuning for splice/TSS/polyA heads.
 Usage:
   python -m betadogma.experiments.train --config betadogma/experiments/config/default.yaml
 """
-# betadogma/experiments/train.py
-"""
-Phase 1: Structural fine-tuning for splice/TSS/polyA heads.
-
-Usage:
-  python -m betadogma.experiments.train --config betadogma/experiments/config/default.yaml
-"""
 from __future__ import annotations
 import argparse
 import os
@@ -23,7 +16,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
+from tqdm import tqdm
 
+from betadogma.core.encoder_nt import NTEncoder
 from betadogma.model import BetaDogmaModel
 
 # ---------------- Data ----------------
@@ -64,28 +59,25 @@ def collate(batch):
     return {"seqs": seqs, "donor": donor, "acceptor": acceptor, "tss": tss, "polya": polya}
 
 
-# --------------- Tokenization ----------------
-
-def tokenize_dna(seqs: List[str]) -> torch.Tensor:
-    """Converts a list of DNA sequences to a tensor of token indices."""
-    token_map = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4}
-    batch_tokens = []
-    for seq in seqs:
-        # upper() handles 'acgt' and 'N'
-        tokens = [token_map.get(char, token_map['N']) for char in seq.upper()]
-        batch_tokens.append(tokens)
-    return torch.tensor(batch_tokens, dtype=torch.long)
-
-
 # --------------- Training ----------------
 
 def train(cfg: Dict):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # --- Initialize Encoder ---
+    enc_type = cfg["encoder"].get("type", "nt")
+    if enc_type == "nt":
+        encoder = NTEncoder(
+            model_id=cfg["encoder"].get("model_id") or "InstaDeepAI/nucleotide-transformer-500m-human-ref"
+        )
+    else:
+        raise ValueError(f"Unsupported encoder type: {enc_type}")
+
+    d_model = encoder.hidden_size
+    bin_size = encoder.bin_size # pylint: disable=unused-variable
+
     # --- Initialize Model and Data ---
-    # The model is now instantiated with the full config, ensuring all components
-    # (encoder, heads, decoder) are correctly configured.
-    model = BetaDogmaModel(config=cfg).to(device)
+    model = BetaDogmaModel(d_in=d_model, config=cfg).to(device)
 
     shards_glob = os.path.join(cfg["data"]["out_cache"], "*.parquet")
     paths = glob(shards_glob)
@@ -103,16 +95,16 @@ def train(cfg: Dict):
     model.train()
     for epoch in range(cfg["trainer"]["epochs"]):
         total_loss = 0.0
-        for batch in dl:
+        pbar = tqdm(dl, desc=f"Epoch {epoch+1}/{cfg['trainer']['epochs']}")
+        for batch in pbar:
             opt.zero_grad()
 
-            # Tokenize sequences using our simple DNA tokenizer
-            # The sequences are expected to be of fixed length from the data prep script.
-            input_ids = tokenize_dna(batch["seqs"]).to(device)
+            # --- Encoder Forward Pass ---
+            # The NTEncoder handles tokenization and embedding internally.
+            embeddings = encoder.forward(batch["seqs"]) # [B, L, D]
 
-            # Forward pass through the unified model
-            # The BetaDogmaEncoder does not use an attention mask.
-            outputs = model(input_ids=input_ids)
+            # --- Model Forward Pass ---
+            outputs = model(embeddings=embeddings)
 
             # --- Calculate Multi-Task Loss ---
             # Splice loss
@@ -145,9 +137,10 @@ def train(cfg: Dict):
             opt.step()
 
             total_loss += loss.item()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         avg_loss = total_loss / max(1, len(dl))
-        print(f"epoch {epoch+1}/{cfg['trainer']['epochs']}  loss={avg_loss:.4f}")
+        print(f"Epoch {epoch+1}/{cfg['trainer']['epochs']} average loss: {avg_loss:.4f}")
 
     # --- Save Checkpoint ---
     ckpt_dir = cfg["trainer"]["ckpt_dir"]

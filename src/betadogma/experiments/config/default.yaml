@@ -1,73 +1,47 @@
 seed: 42
-
 encoder:
-  model_name: "arm-genomics/enformer-finetuned-human-128k"
-  hidden_size: 1536   # enformer-finetuned-human-128k default channel size
-  bin_size: 128       # encoder output resolution (bp per bin)
-  max_length: 131072
-
+  type: nt
+  model_id: InstaDeepAI/nucleotide-transformer-500m-human-ref
+  hidden_size: 640     # will be overwritten by runtime, kept for docs
+  bin_size: 1
 heads:
-  hidden: 768
+  hidden: 512
   use_conv: true
   dropout: 0.1
-
 optimizer:
   lr: 2.0e-4
   weight_decay: 0.01
-
 trainer:
-  epochs: 5
+  epochs: 2
   batch_size: 2
   grad_clip: 1.0
-  max_shards: 4               # raise as you scale
+  max_shards: 2
   ckpt_dir: checkpoints/structural
-
 loss:
-  pos_weight: 25.0            # class imbalance for sparse positives
+  pos_weight: 25.0
   w_splice: 1.0
   w_tss: 0.5
   w_polya: 0.5
-
 data:
   fasta: /abs/path/GRCh38.primary_assembly.genome.fa
   gencode: /abs/path/gencode.v44.annotation.gtf
-  out_cache: data/cache/gencode_v44_structural
-
+  out_cache: data/cache/gencode_v44_structural_base
 decoder:
-  beam_size: 16
-  max_candidates: 64
-  thresholds:
-    donor: 0.6
-    acceptor: 0.6
-    tss: 0.5
-    polya: 0.5
+  thresholds: { donor: 0.6, acceptor: 0.6, tss: 0.5, polya: 0.5 }
   tss_pa_window: 1
-  max_starts: 8
-  max_ends: 8
+  beam_size: 8
+  max_starts: 4
+  max_ends: 4
   allow_unanchored: false
+  priors: { min_exon_len: 25, max_intron_len: 500000 }
   scoring:
-    use_orf_head: true          # if false, use codon-scan fallback
+    use_orf_head: true
     w_spl: 1.0
     w_tss: 0.4
     w_pa: 0.4
     w_orf: 0.8
     w_len: 0.1
-    # ORF scoring parameters
-    orf_alpha: 0.5              # weight for start/stop logits
-    orf_beta: 0.3               # weight for frame consistency
-    orf_gamma: 0.6              # penalty for premature stop codons
+    orf_alpha: 0.5
+    orf_beta: 0.3
+    orf_gamma: 0.6
     max_start_candidates: 5
-    min_cds_len_aa: 50
-    max_cds_len_aa: 10000
-    kozak_bonus: 0.2
-  priors:
-    min_exon_len: 25
-    max_intron_len: 500000
-
-abundance:
-  enabled: false
-  hidden: 256
-  loss: kl
-  em_iters: 3
-  temp: 1.0
-  smoothing: 1e-3

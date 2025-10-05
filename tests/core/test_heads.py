@@ -56,37 +56,24 @@ def test_head_architectures(dummy_embeddings, use_conv):
     output = head(dummy_embeddings)
     assert output["donor"].shape == (BATCH_SIZE, BINNED_SEQ_LEN, 1)
 
-def test_betadogma_model_forward_pass_shapes(monkeypatch):
-    """Tests the end-to-end forward pass of the BetaDogmaModel with a mocked Enformer backend."""
+def test_betadogma_model_forward_pass_shapes():
+    """Tests the end-to-end forward pass of the BetaDogmaModel with mock embeddings."""
 
-    # 1. Mock the enformer-pytorch model loading to avoid network calls
-    class MockEnformer(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.dummy_layer = torch.nn.Linear(1, 1)
-
-        def forward(self, one_hot_input, return_embeddings=False):
-            batch_size, _, _ = one_hot_input.shape
-            dummy_preds = {"human": torch.randn(batch_size, BINNED_SEQ_LEN, 5313)}
-            embeddings = torch.randn(batch_size, BINNED_SEQ_LEN, D_IN)
-
-            if return_embeddings:
-                return dummy_preds, embeddings
-            return dummy_preds
-
-    # The encoder now calls `from_pretrained` from `enformer_pytorch`, imported into the encoder's namespace.
-    monkeypatch.setattr("betadogma.core.encoder.from_pretrained", lambda *args, **kwargs: MockEnformer())
-
-    # 2. Create model with a test config that matches the mocked encoder
+    # 1. Instantiate the model using a dummy config.
+    # The model is now decoupled from the encoder.
     config = {
-        "encoder": {"model_name": "mock_enformer", "hidden_size": D_IN},
         "heads": {"hidden": D_HIDDEN, "dropout": 0.1, "use_conv": False},
+        "decoder": {}  # Not used in forward pass
     }
-    model = BetaDogmaModel(config)
+    model = BetaDogmaModel(d_in=D_IN, config=config)
+    model.eval()
 
-    # 3. Create dummy input and run forward pass
-    dummy_input_ids = torch.randint(0, 4, (BATCH_SIZE, INPUT_SEQ_LEN))
-    output = model.forward(dummy_input_ids)
+    # 2. Create dummy embeddings. The model is agnostic to sequence length.
+    dummy_embeddings = torch.randn(BATCH_SIZE, BINNED_SEQ_LEN, D_IN)
+
+    # 3. Run forward pass
+    with torch.no_grad():
+        output = model(embeddings=dummy_embeddings)
 
     # 4. Assert output shapes
     assert "splice" in output
@@ -95,7 +82,7 @@ def test_betadogma_model_forward_pass_shapes(monkeypatch):
     assert "orf" in output
     assert "embeddings" in output
 
-    assert output["embeddings"].shape == (BATCH_SIZE, BINNED_SEQ_LEN, D_IN)
+    assert torch.equal(output["embeddings"], dummy_embeddings)
     assert output["splice"]["donor"].shape == (BATCH_SIZE, BINNED_SEQ_LEN, 1)
     assert output["splice"]["acceptor"].shape == (BATCH_SIZE, BINNED_SEQ_LEN, 1)
     assert output["tss"]["tss"].shape == (BATCH_SIZE, BINNED_SEQ_LEN, 1)
