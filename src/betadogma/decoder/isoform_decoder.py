@@ -81,25 +81,31 @@ class SpliceGraphBuilder:
     This version anchors the graph to high-confidence TSS and polyA sites.
     """
     def __init__(self, config: Dict):
+        if "decoder" in config:
+            config = config["decoder"]
+
         self.config = config
         self.thresholds = self.config.get("thresholds", {})
         self.priors = self.config.get("priors", {})
         self.max_starts = self.config.get("max_starts", 8)
         self.max_ends = self.config.get("max_ends", 8)
         self.allow_unanchored = self.config.get("allow_unanchored", False)
-        self.min_exon_len = self.priors.get("min_exon_len", 25)
+        self.min_exon_len = self.priors.get("min_exon_len", 1)
         self.max_intron_len = self.priors.get("max_intron_len", 500000)
 
-    def _get_exons(self, starts: List, ends: List, start_scores: List, end_scores: List) -> List[Exon]:
-        """Helper to generate exons from paired start/end coordinates."""
+    def _get_exons(self, starts: List, ends: List, start_scores: List, end_scores: List, strand: str) -> List[Exon]:
+        """Helper to generate exons from paired start/end coordinates. Strand-aware."""
         exons = []
+        is_fwd = strand == '+'
         for i, s_idx in enumerate(starts):
             for j, e_idx in enumerate(ends):
-                if s_idx < e_idx:
-                    exon_len = e_idx - s_idx
+                # On fwd strand, start < end. On rev strand, start > end.
+                if (is_fwd and s_idx < e_idx) or (not is_fwd and s_idx > e_idx):
+                    start_coord, end_coord = (int(s_idx), int(e_idx)) if is_fwd else (int(e_idx), int(s_idx))
+                    exon_len = end_coord - start_coord
                     if exon_len >= self.min_exon_len:
                         score = (start_scores[i] + end_scores[j]) / 2.0
-                        exons.append(Exon(start=int(s_idx), end=int(e_idx), score=float(score)))
+                        exons.append(Exon(start=start_coord, end=end_coord, score=float(score)))
         return exons
 
     def build(self, head_outputs: Dict[str, torch.Tensor], strand: str = '+') -> SpliceGraph:
@@ -115,21 +121,17 @@ class SpliceGraphBuilder:
         tss_indices, tss_scores = _find_peaks(tss_logits, self.thresholds.get("tss", 0.5), top_k=self.max_starts)
         polya_indices, polya_scores = _find_peaks(polya_logits, self.thresholds.get("polya", 0.5), top_k=self.max_ends)
 
-        # 2. Create candidate exons based on strand-aware roles
-        candidate_exons = []
-        if strand == '+':
-            internal_exons = self._get_exons(acceptor_indices, donor_indices, acceptor_scores, donor_scores)
-            first_exons = self._get_exons(tss_indices, donor_indices, tss_scores, donor_scores)
-            last_exons = self._get_exons(acceptor_indices, polya_indices, acceptor_scores, polya_scores)
-            single_exons = self._get_exons(tss_indices, polya_indices, tss_scores, polya_scores)
-        else:  # strand == '-'
-            # On the minus strand, exons are defined between (acceptor, donor), (donor, TSS), etc.
-            internal_exons = self._get_exons(donor_indices, acceptor_indices, donor_scores, acceptor_scores)
-            first_exons = self._get_exons(donor_indices, tss_indices, donor_scores, tss_scores)
-            last_exons = self._get_exons(polya_indices, acceptor_indices, polya_scores, acceptor_scores)
-            single_exons = self._get_exons(polya_indices, tss_indices, polya_scores, tss_scores)
+        # 2. Create candidate exons based on strand-aware roles.
+        # Transcriptional start sites: Acceptor, TSS
+        # Transcriptional end sites:   Donor, PolyA
+
+        internal_exons = self._get_exons(acceptor_indices, donor_indices, acceptor_scores, donor_scores, strand)
+        first_exons = self._get_exons(tss_indices, donor_indices, tss_scores, donor_scores, strand)
+        last_exons = self._get_exons(acceptor_indices, polya_indices, acceptor_scores, polya_scores, strand)
+        single_exons = self._get_exons(tss_indices, polya_indices, tss_scores, polya_scores, strand)
 
         # 3. Combine exons based on anchoring policy
+        candidate_exons = []
         if self.allow_unanchored:
             candidate_exons.extend(internal_exons)
         candidate_exons.extend(first_exons)
@@ -137,7 +139,7 @@ class SpliceGraphBuilder:
         candidate_exons.extend(single_exons)
 
         # 4. De-duplicate exons and add to graph
-        unique_exons = { (e.start, e.end): e for e in sorted(candidate_exons, key=lambda x: x.score) }
+        unique_exons = { (e.start, e.end): e for e in sorted(candidate_exons, key=lambda x: x.score, reverse=True) }
         exons_list = list(unique_exons.values())
 
         graph = SpliceGraph()
@@ -305,10 +307,19 @@ def _score_orf(
     This function implements a two-tier scoring system as requested.
     """
     use_head = scoring_config.get("use_orf_head", True)
-    device = head_outputs["splice"]["donor"].device
+    if "splice" not in head_outputs or "donor" not in head_outputs["splice"]:
+        device = torch.device("cpu") # Fallback device
+    else:
+        device = head_outputs["splice"]["donor"].device
 
     # --- Tier A: Head-driven scoring (default) ---
     if use_head:
+        if "orf" not in head_outputs:
+            return torch.tensor(0.0, device=device)
+        alpha = scoring_config.get("orf_alpha", 0.5)
+        beta = scoring_config.get("orf_beta", 0.3)
+        gamma = scoring_config.get("orf_gamma", 0.6)
+
         start_logits = head_outputs["orf"]["start"].squeeze()
         stop_logits = head_outputs["orf"]["stop"].squeeze()
         frame_logits = head_outputs["orf"]["frame"].squeeze()
@@ -347,9 +358,7 @@ def _score_orf(
                     if stop_probs[gen_pos] > 0.5:
                         stop_prob = stop_probs[gen_pos]
                         mean_frame_prob = torch.mean(torch.stack(cds_frame_probs))
-                        score = (scoring_config["orf_alpha"] * s_prob +
-                                 scoring_config["orf_beta"] * mean_frame_prob +
-                                 scoring_config["orf_alpha"] * stop_prob)
+                        score = (alpha * s_prob + beta * mean_frame_prob + alpha * stop_prob)
 
                         # Apply PTC penalty if stop is premature
                         if len(isoform.exons) > 1:
@@ -357,13 +366,13 @@ def _score_orf(
                             exon_lengths = [e.end - e.start for e in isoform.exons[:-1]]
                             last_junction_pos = sum(exon_lengths)
                             if tx_pos < last_junction_pos - 55:
-                                score -= scoring_config["orf_gamma"]
+                                score -= gamma
 
                         if score > best_overall_score:
                             best_overall_score = score
                         break # Found a stop, end this frame scan
                 else: # No stop found
-                    score = (scoring_config["orf_alpha"] * s_prob) - scoring_config["orf_gamma"]
+                    score = (alpha * s_prob) - gamma
                     if score > best_overall_score:
                         best_overall_score = score
 
@@ -514,10 +523,16 @@ class IsoformDecoder(nn.Module):
     """
     def __init__(self, config: Dict):
         super().__init__()
-        self.config = config
-        self.graph_builder = SpliceGraphBuilder(config)
-        self.enumerator = IsoformEnumerator(config)
-        self.scorer = IsoformScorer(config)
+        # Handle both full config and sub-config for backward compatibility in tests
+        if "decoder" in config:
+            decoder_config = config["decoder"]
+        else:
+            decoder_config = config
+
+        self.config = {"decoder": decoder_config} # Store consistently
+        self.graph_builder = SpliceGraphBuilder(decoder_config)
+        self.enumerator = IsoformEnumerator(decoder_config)
+        self.scorer = IsoformScorer(decoder_config)
 
     def forward(self, head_outputs: Dict[str, torch.Tensor], strand: str = '+', input_ids: Optional[torch.Tensor] = None) -> List[Isoform]:
         """

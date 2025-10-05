@@ -2,7 +2,7 @@ seed: 42
 encoder:
   type: nt
   model_id: InstaDeepAI/nucleotide-transformer-500m-human-ref
-  hidden_size: 640     # will be overwritten by runtime, kept for docs
+  hidden_size: 1280
   bin_size: 1
 heads:
   hidden: 512

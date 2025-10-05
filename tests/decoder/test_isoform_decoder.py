@@ -46,19 +46,19 @@ def test_isoform_creation():
 
 def test_splice_graph_builder_init(decoder_config):
     """Tests that SpliceGraphBuilder can be instantiated."""
-    builder = SpliceGraphBuilder(config=decoder_config)
+    builder = SpliceGraphBuilder(config=decoder_config["decoder"])
     assert builder is not None
     assert builder.config == decoder_config["decoder"]
 
 def test_isoform_enumerator_init(decoder_config):
     """Tests that IsoformEnumerator can be instantiated."""
-    enumerator = IsoformEnumerator(config=decoder_config)
+    enumerator = IsoformEnumerator(config=decoder_config["decoder"])
     assert enumerator is not None
     assert enumerator.config == decoder_config["decoder"]
 
 def test_isoform_scorer_init(decoder_config):
     """Tests that IsoformScorer can be instantiated."""
-    scorer = IsoformScorer(config=decoder_config)
+    scorer = IsoformScorer(config=decoder_config["decoder"])
     assert scorer is not None
     assert scorer.config == decoder_config["decoder"]
 

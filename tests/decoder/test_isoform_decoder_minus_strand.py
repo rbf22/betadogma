@@ -38,6 +38,11 @@ def mock_head_outputs(device="cpu"):
         },
         "tss": {"tss": torch.full((seq_len,), -10.0, device=device)},
         "polya": {"polya": torch.full((seq_len,), -10.0, device=device)},
+        "orf": {
+            "start": torch.full((seq_len,), -10.0, device=device),
+            "stop": torch.full((seq_len,), -10.0, device=device),
+            "frame": torch.full((seq_len, 3), -10.0, device=device),
+        }
     }
     # From toy_minus_gene, transcription order is B -> A
     # Donor must be at start of B, Acceptor at end of A (genomic coordinates)
