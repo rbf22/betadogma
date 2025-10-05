@@ -88,6 +88,8 @@ Detailed documentation: [`docs/DATASETS.md`](./docs/DATASETS.md)
 
 ## ⚙️ Quickstart (conceptual)
 
+> **Note:** This example is a conceptual guide. The API is under active development and this code is not yet runnable.
+
 ```python
 from betadogma import BetaDogmaModel, preprocess_sequence, preprocess_variant
 

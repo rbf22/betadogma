@@ -158,7 +158,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    model = BetaDogmaModel(config)
+    # The dummy encoder uses a hardcoded dimension of 1536
+    model = BetaDogmaModel(d_in=1536, config=config)
     model.to(device)
 
     # We are only training the scorer's weights

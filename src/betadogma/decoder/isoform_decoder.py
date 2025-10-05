@@ -44,6 +44,14 @@ def _find_peaks(logits: torch.Tensor, threshold: float, top_k: int = None) -> Tu
     return peak_indices, peak_probs
 
 
+def _order_exons_by_transcription(exons: List[Exon], strand: str) -> List[Exon]:
+    """Sorts a list of exons in transcription order."""
+    # key is a tuple to ensure deterministic sorting
+    key = lambda e: (e.start, e.end)
+    reverse = strand == '-'
+    return sorted(exons, key=key, reverse=reverse)
+
+
 class SpliceGraph:
     """
     A graph representation of potential splice sites and exons, using networkx.
@@ -73,7 +81,7 @@ class SpliceGraphBuilder:
     This version anchors the graph to high-confidence TSS and polyA sites.
     """
     def __init__(self, config: Dict):
-        self.config = config.get("decoder", {})
+        self.config = config
         self.thresholds = self.config.get("thresholds", {})
         self.priors = self.config.get("priors", {})
         self.max_starts = self.config.get("max_starts", 8)
@@ -115,8 +123,7 @@ class SpliceGraphBuilder:
             last_exons = self._get_exons(acceptor_indices, polya_indices, acceptor_scores, polya_scores)
             single_exons = self._get_exons(tss_indices, polya_indices, tss_scores, polya_scores)
         else:  # strand == '-'
-            # On the minus strand, an exon (in genomic coordinates) starts at a donor and ends at an acceptor.
-            # A "first" exon (5'-most) starts at a donor and ends at a TSS (higher coordinate).
+            # On the minus strand, exons are defined between (acceptor, donor), (donor, TSS), etc.
             internal_exons = self._get_exons(donor_indices, acceptor_indices, donor_scores, acceptor_scores)
             first_exons = self._get_exons(donor_indices, tss_indices, donor_scores, tss_scores)
             last_exons = self._get_exons(polya_indices, acceptor_indices, polya_scores, acceptor_scores)
@@ -142,10 +149,7 @@ class SpliceGraphBuilder:
         acceptor_set = set(acceptor_indices.tolist())
 
         # Sort exons by transcriptional order to find junctions
-        if strand == '+':
-            sorted_for_junctions = sorted(exons_list, key=lambda e: e.start)
-        else:  # strand == '-'
-            sorted_for_junctions = sorted(exons_list, key=lambda e: e.start, reverse=True)
+        sorted_for_junctions = _order_exons_by_transcription(exons_list, strand)
 
         for i, up_exon in enumerate(sorted_for_junctions):
             for j in range(i + 1, len(sorted_for_junctions)):
@@ -175,7 +179,7 @@ class IsoformEnumerator:
     Considers all visited paths as potential candidates.
     """
     def __init__(self, config: Dict):
-        self.config = config.get("decoder", {})
+        self.config = config
         self.beam_size = self.config.get("beam_size", 16)
 
     def enumerate(self, graph: SpliceGraph, max_paths: int, strand: str = '+') -> List[Isoform]:
@@ -189,8 +193,14 @@ class IsoformEnumerator:
         if not source_nodes:
             return []
 
+        # Sort source nodes by transcription order to initialize the beam correctly
+        # The node key is a (start, end) tuple.
+        source_exons = [Exon(start=n[0], end=n[1], score=graph.graph.nodes[n]['score']) for n in source_nodes]
+        sorted_source_exons = _order_exons_by_transcription(source_exons, strand)
+        sorted_source_nodes = [(e.start, e.end) for e in sorted_source_exons]
+
         # A beam is a list of (cumulative_score, path) tuples
-        beam = [(graph.graph.nodes[n]['score'], [n]) for n in source_nodes]
+        beam = [(graph.graph.nodes[n]['score'], [n]) for n in sorted_source_nodes]
         beam.sort(key=lambda x: x[0], reverse=True)
 
         all_candidate_paths = []
@@ -263,23 +273,25 @@ def _get_spliced_cDNA(isoform: Isoform, input_ids: torch.Tensor, token_map: Dict
     """
     Constructs the spliced cDNA sequence for an isoform from input token IDs.
     Handles reverse complement for the negative strand.
-    Returns the cDNA sequence and a list of the exon sequences.
+    Returns the cDNA sequence and a list of the exon sequences in transcription order.
     """
-    # Squeeze to handle batch dimension of 1
     sequence_str = "".join([token_map.get(token_id, "N") for token_id in input_ids.squeeze().tolist()])
 
-    # Sort exons by genomic coordinate to correctly assemble cDNA
-    sorted_exons = sorted(isoform.exons, key=lambda e: e.start)
-    exon_seqs = [sequence_str[exon.start:exon.end] for exon in sorted_exons]
-    spliced_seq = "".join(exon_seqs)
+    # To get the spliced sequence for cDNA, we must assemble in genomic order.
+    genomically_sorted_exons = sorted(isoform.exons, key=lambda e: e.start)
+    genomic_exon_seqs = [sequence_str[exon.start:exon.end] for exon in genomically_sorted_exons]
+    spliced_in_genomic_order = "".join(genomic_exon_seqs)
+
+    # For the PTC check, we need exon sequences in transcription order.
+    # We assume isoform.exons is already in transcription order from the decoder.
+    tx_ordered_exon_seqs = [sequence_str[exon.start:exon.end] for exon in isoform.exons]
 
     if isoform.strand == '-':
-        # For negative strand, the transcript is read from the reverse complement
         complement = {"A": "T", "T": "A", "C": "G", "G": "C", "N": "N"}
-        rev_comp = "".join(complement.get(base, "N") for base in reversed(spliced_seq))
-        return rev_comp, exon_seqs
-
-    return spliced_seq, exon_seqs
+        cDNA = "".join(complement.get(base, "N") for base in reversed(spliced_in_genomic_order))
+        return cDNA, tx_ordered_exon_seqs
+    else:
+        return spliced_in_genomic_order, tx_ordered_exon_seqs
 
 
 def _score_orf(
@@ -306,7 +318,8 @@ def _score_orf(
         if not isoform.exons:
             return torch.tensor(0.0, device=device)
 
-        tx_to_gen_map = [p for exon in sorted(isoform.exons, key=lambda e: e.start) for p in range(exon.start, exon.end)]
+        # isoform.exons are in transcription order, so no sort needed here.
+        tx_to_gen_map = [p for exon in isoform.exons for p in range(exon.start, exon.end)]
         if not tx_to_gen_map:
             return torch.tensor(0.0, device=device)
 
@@ -340,7 +353,8 @@ def _score_orf(
 
                         # Apply PTC penalty if stop is premature
                         if len(isoform.exons) > 1:
-                            exon_lengths = [e.end - e.start for e in sorted(isoform.exons, key=lambda e: e.start)[:-1]]
+                            # isoform.exons are in transcription order, so no sort needed here.
+                            exon_lengths = [e.end - e.start for e in isoform.exons[:-1]]
                             last_junction_pos = sum(exon_lengths)
                             if tx_pos < last_junction_pos - 55:
                                 score -= scoring_config["orf_gamma"]
@@ -361,6 +375,7 @@ def _score_orf(
             return torch.tensor(0.0, device=device)
 
         token_map = {0: "A", 1: "C", 2: "G", 3: "T", 4: "N"}
+        # cDNA is 5'->3', exon_seqs is in transcription order
         cDNA, exon_seqs = _get_spliced_cDNA(isoform, input_ids, token_map)
 
         best_score = -1.0
@@ -382,6 +397,7 @@ def _score_orf(
 
                         # PTC penalty
                         if len(exon_seqs) > 1:
+                            # exon_seqs is in transcription order, so this is correct now.
                             last_junction_pos = sum(len(s) for s in exon_seqs[:-1])
                             if j < last_junction_pos - 55:
                                 score -= scoring_config.get("orf_gamma", 0.6)
@@ -409,7 +425,7 @@ class IsoformScorer(nn.Module):
     """
     def __init__(self, config: Dict):
         super().__init__()
-        self.config = config.get("decoder", {})
+        self.config = config
         self.scoring_config = self.config.get("scoring", {})
         self.priors = self.config.get("priors", {})
 
@@ -439,30 +455,34 @@ class IsoformScorer(nn.Module):
                 donor_indices = [exon.start for exon in isoform.exons[:-1]]
                 acceptor_indices = [exon.end for exon in isoform.exons[1:]]
 
-            donor_log_probs = _log_sigmoid(donor_logits[donor_indices])
-            acceptor_log_probs = _log_sigmoid(acceptor_logits[acceptor_indices])
+            # By using the logits directly, we ensure that good splice sites (positive logits)
+            # contribute positively to the score, out-competing single-exon transcripts (score=0).
+            donor_scores = donor_logits[donor_indices]
+            acceptor_scores = acceptor_logits[acceptor_indices]
 
-            s_spl = (torch.sum(donor_log_probs) + torch.sum(acceptor_log_probs)) / (len(donor_indices) + len(acceptor_indices))
+            s_spl = (torch.sum(donor_scores) + torch.sum(acceptor_scores)) / (len(donor_indices) + len(acceptor_indices))
         else:
             s_spl = torch.tensor(0.0) # No junctions for single-exon transcripts
 
         # 2. TSS Score
         tss_logits = head_outputs.get("tss", {}).get("tss", None)
-        if tss_logits is not None:
+        s_tss = torch.tensor(0.0)
+        if tss_logits is not None and isoform.exons:
             tss_logits = tss_logits.squeeze()
-            start_bin = isoform.exons[0].start if isoform.exons else None
+            first_exon = isoform.exons[0]
+            # 5' end of transcript is start of first exon (+), end of first exon (-)
+            start_bin = first_exon.end if isoform.strand == '-' else first_exon.start
             s_tss = _get_peak_log_prob(tss_logits, start_bin, self.config.get("tss_pa_window", 1))
-        else:
-            s_tss = torch.tensor(0.0)
 
         # 3. PolyA Score
         polya_logits = head_outputs.get("polya", {}).get("polya", None)
-        if polya_logits is not None:
+        s_pa = torch.tensor(0.0)
+        if polya_logits is not None and isoform.exons:
             polya_logits = polya_logits.squeeze()
-            end_bin = isoform.exons[-1].end if isoform.exons else None
+            last_exon = isoform.exons[-1]
+            # 3' end of transcript is end of last exon (+), start of last exon (-)
+            end_bin = last_exon.start if isoform.strand == '-' else last_exon.end
             s_pa = _get_peak_log_prob(polya_logits, end_bin, self.config.get("tss_pa_window", 1))
-        else:
-            s_pa = torch.tensor(0.0)
 
         # 4. ORF Score
         s_orf = _score_orf(
@@ -525,6 +545,8 @@ class IsoformDecoder(nn.Module):
 
         # Re-score the final candidates with the learnable scorer.
         for isoform in candidates:
+            # Ensure exons are always in transcription order before scoring.
+            isoform.exons = _order_exons_by_transcription(isoform.exons, isoform.strand)
             isoform.score = self.scorer(isoform, head_outputs, input_ids=input_ids).item()
 
         # Sort candidates by score in descending order
