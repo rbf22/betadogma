@@ -11,7 +11,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from .core.encoder import BetaDogmaEncoder
 from .core.heads import SpliceHead, TSSHead, PolyAHead, ORFHead
 from .decoder.isoform_decoder import IsoformDecoder
 
@@ -31,19 +30,12 @@ class BetaDogmaModel(nn.Module):
     architecture of all its components.
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, d_in: int, config: Dict[str, Any]):
         super().__init__()
         self.config = config
 
-        # --- 1. Encoder ---
-        # This wrapper uses the enformer-pytorch library to load the Enformer model,
-        # which serves as the sequence backbone.
-        encoder_config = self.config["encoder"]
-        self.encoder = BetaDogmaEncoder(model_name=encoder_config["model_name"])
-
         # --- 2. Prediction Heads ---
         # These modules process the encoder embeddings to make per-base predictions.
-        d_in = encoder_config["hidden_size"]
         head_config = self.config["heads"]
         self.splice_head = SpliceHead(
             d_in=d_in,
@@ -75,14 +67,11 @@ class BetaDogmaModel(nn.Module):
         self.isoform_decoder = IsoformDecoder(config=self.config.get("decoder", {}))
 
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> Dict[str, Any]:
+    def forward(self, embeddings: torch.Tensor, input_ids: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """
-        Runs the encoder and all prediction heads.
+        Runs all prediction heads on pre-computed embeddings.
         This is the main forward pass for training, returning logits from each head.
         """
-        # Get base embeddings from the encoder
-        embeddings = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-
         # Pass embeddings through each prediction head
         outputs = {
             "splice": self.splice_head(embeddings),
