@@ -81,7 +81,7 @@ class SpliceGraphBuilder:
     This version anchors the graph to high-confidence TSS and polyA sites.
     """
     def __init__(self, config: Dict):
-        self.config = config.get("decoder", {})
+        self.config = config
         self.thresholds = self.config.get("thresholds", {})
         self.priors = self.config.get("priors", {})
         self.max_starts = self.config.get("max_starts", 8)
@@ -179,7 +179,7 @@ class IsoformEnumerator:
     Considers all visited paths as potential candidates.
     """
     def __init__(self, config: Dict):
-        self.config = config.get("decoder", {})
+        self.config = config
         self.beam_size = self.config.get("beam_size", 16)
 
     def enumerate(self, graph: SpliceGraph, max_paths: int, strand: str = '+') -> List[Isoform]:
@@ -425,7 +425,7 @@ class IsoformScorer(nn.Module):
     """
     def __init__(self, config: Dict):
         super().__init__()
-        self.config = config.get("decoder", {})
+        self.config = config
         self.scoring_config = self.config.get("scoring", {})
         self.priors = self.config.get("priors", {})
 
