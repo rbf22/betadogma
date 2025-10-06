@@ -1,192 +1,403 @@
 #!/usr/bin/env python
-# train.py (repo root)
+# -*- coding: utf-8 -*-
+"""
+Config-only training entrypoint (lives inside train/).
+- Defaults to configs under train/configs/.
+- Resolves imports from project-root/src.
+- Resolves paths in the config relative to the config file location.
+- Works on CPU/GPU; logs AUROC + loss; checkpoints best by AUROC.
+"""
 
-import argparse, os, math, random
-from typing import Any, Dict, Optional
+import os
+import sys
+import json
+import random
+import importlib
+import inspect
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-# --- config ---
-def load_config(path: str) -> Dict[str, Any]:
+# ---------- Project paths ----------
+THIS_FILE = Path(__file__).resolve()
+TRAIN_DIR = THIS_FILE.parent                    # .../train
+PROJECT_ROOT = TRAIN_DIR.parent                 # repo root
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))           # make betadogma importable
+
+DEFAULT_CFG = TRAIN_DIR / "configs" / "train.base.yaml"
+
+# ---------- Torch / Lightning ----------
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+from pytorch_lightning.loggers import TensorBoardLogger
+from torchmetrics.classification import BinaryAUROC
+
+# ---------- YAML loader ----------
+def load_config(path: Path) -> Dict[str, Any]:
     import yaml
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with path.open("r") as f:
+        cfg = yaml.safe_load(f) or {}
+    cfg["_config_dir"] = str(path.parent)   # keep for relative path resolution
+    return cfg
 
-def seed_everything(seed: int = 42):
-    import numpy as np, torch
+# ---------- Repro ----------
+def set_seed(seed: int):
+    import numpy as np
     random.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-# Ensure src/ is importable when running from repo root
-import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), "../src"))
+# ---------- DNA utils ----------
+DNA_VOCAB = {"A": 1, "C": 2, "G": 3, "T": 4, "N": 5}
+DNA_COMP = str.maketrans({"A": "T", "T": "A", "C": "G", "G": "C", "N": "N"})
 
-# Prefer your real modules if present
-try:
-    from betadogma.decoder import DecoderModel  # adjust if your class is named differently
-except Exception:
-    DecoderModel = None
+def revcomp(seq: str) -> str:
+    return seq.upper().translate(DNA_COMP)[::-1]
 
-try:
-    from betadogma.data import BetaDogmaDataset
-except Exception:
-    BetaDogmaDataset = None
+def encode_seq(seq: str, max_len: int, pad_value: int = 0) -> torch.LongTensor:
+    s = seq.upper()
+    ids = [DNA_VOCAB.get(ch, DNA_VOCAB["N"]) for ch in s[:max_len]]
+    if len(ids) < max_len:
+        ids += [pad_value] * (max_len - len(ids))
+    return torch.tensor(ids, dtype=torch.long)
 
-import torch
-from torch.utils.data import DataLoader, Dataset
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
-from pytorch_lightning.loggers import TensorBoardLogger
+# ---------- Dataset ----------
+class JsonlSeqDataset(Dataset):
+    def __init__(self, path: Path, max_len: int, use_strand: bool, revcomp_minus: bool):
+        if not path.exists():
+            raise FileNotFoundError(f"Dataset file not found: {path}")
+        self.max_len = int(max_len)
+        self.use_strand = bool(use_strand)
+        self.revcomp_minus = bool(revcomp_minus)
+        self._lines: List[str] = [ln.strip() for ln in path.read_text().splitlines() if ln.strip()]
+        if not self._lines:
+            raise ValueError(f"No records found in JSONL: {path}")
 
-# --- fallbacks to keep things runnable even if data/model aren't wired yet ---
-class _ToyDataset(Dataset):
-    def __init__(self, n: int, dim: int):
-        self.x = torch.randn(n, dim)
-        self.y = (self.x.sum(dim=1) > 0).float()
-    def __len__(self): return len(self.y)
-    def __getitem__(self, i): return {"x": self.x[i], "y": self.y[i]}
+    def __len__(self) -> int:
+        return len(self._lines)
 
-class LitDecoder(pl.LightningModule):
-    def __init__(self, model_cfg: Dict[str, Any], optim_cfg: Dict[str, Any]):
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        try:
+            ex = json.loads(self._lines[idx])
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Line {idx} is not valid JSON.") from e
+        if "sequence" not in ex or "label" not in ex:
+            raise KeyError("Each JSONL line must contain 'sequence' and 'label'.")
+        seq = ex["sequence"]
+        if not isinstance(seq, str) or not seq:
+            raise ValueError("`sequence` must be a non-empty string.")
+        if self.use_strand and ex.get("strand") == "-" and self.revcomp_minus:
+            seq = revcomp(seq)
+        x = encode_seq(seq, self.max_len)  # [L]
+        y = ex["label"]
+        if isinstance(y, bool):
+            y = int(y)
+        if y not in (0, 1):
+            raise ValueError("`label` must be 0 or 1.")
+        return {"x": x, "y": torch.tensor(float(y), dtype=torch.float32)}
+
+def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    x = torch.stack([b["x"] for b in batch], dim=0)         # [B, L]
+    y = torch.stack([b["y"] for b in batch], dim=0).float() # [B]
+    return {"x": x, "y": y}
+
+# ---------- Tiny fallback model (used if model.toy: true) ----------
+class TinySeqModel(nn.Module):
+    def __init__(self, vocab_size=6, embed_dim=64, hidden=128, dropout=0.1):
         super().__init__()
-        self.save_hyperparameters(ignore=["model_cfg", "optim_cfg"])
-        if DecoderModel is not None:
-            self.model = DecoderModel(**(model_cfg or {}))
-        else:
-            input_dim = model_cfg.get("input_dim", 1024)
-            hidden = model_cfg.get("hidden_dim", 512)
-            self.model = torch.nn.Sequential(
-                torch.nn.Linear(input_dim, hidden),
-                torch.nn.ReLU(),
-                torch.nn.Dropout(model_cfg.get("dropout", 0.1)),
-                torch.nn.Linear(hidden, 1),
-                torch.nn.Sigmoid(),
-            )
-        self.lr = float(optim_cfg.get("lr", 3e-4))
-        self.weight_decay = float(optim_cfg.get("weight_decay", 0.01))
-        self.warmup_steps = int(optim_cfg.get("warmup_steps", 0))
-        self.max_steps = optim_cfg.get("max_steps")
-        self.criterion = torch.nn.BCELoss()
+        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.encoder = nn.Sequential(
+            nn.Conv1d(embed_dim, hidden, kernel_size=7, padding=3),
+            nn.ReLU(),
+            nn.Conv1d(hidden, hidden, kernel_size=7, padding=3),
+            nn.ReLU(),
+            nn.AdaptiveMaxPool1d(1),
+        )
+        self.head = nn.Sequential(nn.Flatten(), nn.Dropout(dropout), nn.Linear(hidden, 1))
 
-    def forward(self, x): return self.model(x)
+    def forward(self, x_long: torch.LongTensor) -> torch.Tensor:
+        emb = self.embed(x_long).permute(0, 2, 1)  # [B,E,L]
+        feat = self.encoder(emb)                    # [B,H,1]
+        logits = self.head(feat).squeeze(1)         # [B]
+        return logits
 
-    def training_step(self, batch, _):
-        x = (batch["x"] if isinstance(batch, dict) else batch[0]).float()
-        y = (batch["y"] if isinstance(batch, dict) else batch[1]).float().view(-1, 1)
-        y_hat = self(x); loss = self.criterion(y_hat, y)
-        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=x.size(0))
+# ---------- LightningModule ----------
+class LitSeq(pl.LightningModule):
+    def __init__(self, model: nn.Module, lr: float, weight_decay: float):
+        super().__init__()
+        self.model = model
+        self.lr = float(lr)
+        self.weight_decay = float(weight_decay)
+        self.loss_fn = nn.BCEWithLogitsLoss()
+        self.auroc = BinaryAUROC()
+
+    def forward(self, x_long: torch.LongTensor) -> torch.Tensor:
+        return self.model(x_long)
+
+    def _shared_step(self, batch, stage: str):
+        x, y = batch["x"].long(), batch["y"].float()
+        logits = self(x)
+        loss = self.loss_fn(logits, y)
+        probs = torch.sigmoid(logits)
+        self.auroc.update(probs, y.int())
+        self.log(f"{stage}/loss", loss, on_epoch=True, prog_bar=(stage != "train"), batch_size=x.size(0))
         return loss
 
-    def validation_step(self, batch, _):
-        x = (batch["x"] if isinstance(batch, dict) else batch[0]).float()
-        y = (batch["y"] if isinstance(batch, dict) else batch[1]).float().view(-1, 1)
-        y_hat = self(x); loss = self.criterion(y_hat, y)
-        # Generic “val/score”: replace with your ORF/decoder score if available
-        pos = (y == 1).squeeze(1); neg = ~pos
-        pos_m = y_hat[pos].mean().item() if pos.any() else 0.0
-        neg_m = y_hat[neg].mean().item() if neg.any() else 0.0
-        score = max(0.0, pos_m - neg_m)
-        self.log("val/loss", loss, on_epoch=True, prog_bar=True, batch_size=x.size(0))
-        self.log("val/score", score, on_epoch=True, prog_bar=True, batch_size=x.size(0))
-        return {"val_loss": loss, "val_score": torch.tensor(score)}
+    def training_step(self, batch, _):  return self._shared_step(batch, "train")
+    def validation_step(self, batch, _): return self._shared_step(batch, "val")
+
+    def on_validation_epoch_end(self):
+        try:
+            au = self.auroc.compute()
+        except Exception:
+            au = torch.tensor(0.0)
+        self.log("val/auroc", au, prog_bar=True)
+        self.auroc.reset()
 
     def configure_optimizers(self):
-        opt = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        if not self.max_steps and self.warmup_steps == 0:
-            return opt
-        def lr_lambda(step):
-            if step < self.warmup_steps:
-                return float(step + 1) / max(1, self.warmup_steps)
-            if self.max_steps:
-                prog = (step - self.warmup_steps) / max(1, self.max_steps - self.warmup_steps)
-                return 0.5 * (1 + math.cos(math.pi * min(1.0, prog)))
-            return 1.0
-        sch = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
-        return {"optimizer": opt, "lr_scheduler": {"scheduler": sch, "interval": "step", "name": "lr"}}
+        return torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
-class DataModule(pl.LightningDataModule):
-    def __init__(self, data_cfg: Dict[str, Any]):
+# ---------- DataModule ----------
+class SeqDataModule(pl.LightningDataModule):
+    def __init__(self, dcfg: Dict[str, Any], cfg_dir: Path):
         super().__init__()
-        self.cfg = data_cfg
-        self.batch_size = int(data_cfg.get("batch_size", 32))
-        self.num_workers = int(data_cfg.get("num_workers", 4))
-        self.pin_memory = True
-    def setup(self, stage: Optional[str] = None):
-        if BetaDogmaDataset is not None:
-            root = self.cfg["path"]
-            self.train_ds = BetaDogmaDataset(root, split="train")
-            self.val_ds   = BetaDogmaDataset(root, split="val")
-        else:
-            dim = int(self.cfg.get("input_dim", 1024))
-            self.train_ds = _ToyDataset(2048, dim)
-            self.val_ds   = _ToyDataset(256, dim)
-    def train_dataloader(self):
-        return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=True,
-                          num_workers=self.num_workers, pin_memory=self.pin_memory, drop_last=True)
-    def val_dataloader(self):
-        return DataLoader(self.val_ds, batch_size=self.batch_size, shuffle=False,
-                          num_workers=self.num_workers, pin_memory=self.pin_memory)
+        self.cfg = dcfg
+        self.cfg_dir = cfg_dir  # for resolving relative paths in the config
+        self.pin_memory = (torch.cuda.is_available() if dcfg.get("pin_memory", "auto") == "auto"
+                           else bool(dcfg.get("pin_memory")))
 
-def build_trainer(cfg: Dict[str, Any]) -> pl.Trainer:
-    logdir = cfg.get("logging", {}).get("logdir", "runs/default")
-    logger = TensorBoardLogger(save_dir=logdir, name="", version=None, default_hp_metric=False)
-    ckpt = cfg.get("ckpt", {})
+    def _resolve(self, p: Optional[str]) -> Optional[Path]:
+        if p in (None, "", False):
+            return None
+        # Paths in the YAML are resolved relative to the CONFIG FILE directory.
+        pp = Path(p)
+        return (self.cfg_dir / pp) if not pp.is_absolute() else pp
+
+    def setup(self, stage: Optional[str] = None):
+        if self.cfg.get("toy", False):
+            self.train_ds = self._toy_ds(n=512, L=int(self.cfg["max_len"]))
+            self.val_ds   = self._toy_ds(n=128, L=int(self.cfg["max_len"]))
+        else:
+            req = ("train", "val", "max_len")
+            missing = [k for k in req if k not in self.cfg or self.cfg[k] in (None, "")]
+            if missing:
+                raise ValueError(f"Missing data config keys: {missing}")
+            train_path = self._resolve(self.cfg["train"])
+            val_path   = self._resolve(self.cfg["val"])
+            self.train_ds = JsonlSeqDataset(
+                train_path, self.cfg["max_len"], self.cfg.get("use_strand", False),
+                self.cfg.get("reverse_complement_minus", True),
+            )
+            self.val_ds = JsonlSeqDataset(
+                val_path, self.cfg["max_len"], self.cfg.get("use_strand", False),
+                self.cfg.get("reverse_complement_minus", True),
+            )
+
+    def train_dataloader(self):
+        return DataLoader(self.train_ds, batch_size=int(self.cfg.get("batch_size", 32)), shuffle=True,
+                          num_workers=int(self.cfg.get("num_workers", 2)), pin_memory=self.pin_memory,
+                          drop_last=True, collate_fn=collate_batch)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_ds, batch_size=int(self.cfg.get("batch_size", 32)), shuffle=False,
+                          num_workers=int(self.cfg.get("num_workers", 2)), pin_memory=self.pin_memory,
+                          collate_fn=collate_batch)
+
+    @staticmethod
+    def _toy_ds(n: int, L: int):
+        class _Toy(Dataset):
+            def __len__(self): return n
+            def __getitem__(self, i):
+                x = torch.randint(low=0, high=6, size=(L,), dtype=torch.long)
+                y = torch.tensor(float((x.sum() % 2)==0))
+                return {"x": x, "y": y}
+        return _Toy()
+
+# ---------- Helpers ----------
+def _maybe_load_yaml_or_dict(value: Union[Dict[str, Any], str, Path], cfg_dir: Path) -> Dict[str, Any]:
+    """Accept dicts as-is; load strings/paths as YAML; resolve relative to CONFIG file."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (str, Path)):
+        import yaml
+        p = Path(value)
+        if not p.is_absolute():
+            p = (cfg_dir / p)
+        if not p.exists():
+            raise FileNotFoundError(f"Model config file not found: {p}")
+        with p.open("r") as f:
+            return yaml.safe_load(f) or {}
+    raise TypeError("model.kwargs.config must be a dict or a path to a YAML file.")
+
+# ---------- Model factory ----------
+def build_model(mcfg: Dict[str, Any], max_len: int, cfg_dir: Path) -> nn.Module:
+    """
+    Accepts:
+      - model.class_path: "pkg.mod.Class" (preferred), or "pkg.mod" + model.class_name
+      - model.factory:    "pkg.mod:make_model" (callable -> nn.Module)
+    Only forwards 'max_len' if the constructor/factory actually accepts it.
+    Hydrates 'config' kwarg from dict or YAML path if present.
+    """
+    # Toy path
+    if mcfg.get("toy", False):
+        return TinySeqModel(
+            vocab_size=6,
+            embed_dim=int(mcfg.get("embed_dim", 64)),
+            hidden=int(mcfg.get("hidden_dim", 128)),
+            dropout=float(mcfg.get("dropout", 0.1)),
+        )
+
+    # Optional factory path: "package.module:make_model"
+    factory = mcfg.get("factory")
+    if factory:
+        mod_name, fn_name = factory.split(":", 1)
+        mod = importlib.import_module(mod_name)
+        fn = getattr(mod, fn_name)
+        kwargs = dict(mcfg.get("kwargs") or {})
+        # hydrate nested config
+        if "config" in kwargs:
+            kwargs["config"] = _maybe_load_yaml_or_dict(kwargs["config"], cfg_dir)
+        elif "config_path" in kwargs:
+            kwargs["config"] = _maybe_load_yaml_or_dict(kwargs.pop("config_path"), cfg_dir)
+        # add max_len only if factory takes it
+        try:
+            params = inspect.signature(fn).parameters
+            if "max_len" in params and "max_len" not in kwargs:
+                kwargs["max_len"] = int(max_len)
+        except (ValueError, TypeError):
+            pass
+        model = fn(**kwargs)
+        if not isinstance(model, nn.Module):
+            raise TypeError(f"Factory '{factory}' must return a torch.nn.Module.")
+        return model
+
+    # Class path route
+    class_path = mcfg.get("class_path")
+    class_name = mcfg.get("class_name")
+    if not class_path:
+        raise ValueError("model.class_path (or model.factory) is required unless model.toy is true.")
+
+    # Resolve module + class
+    if "." in class_path and class_path.split(".")[-1][:1].isupper() and not class_name:
+        module_name, cls_name = class_path.rsplit(".", 1)
+    else:
+        module_name, cls_name = class_path, (class_name or "")
+    mod = importlib.import_module(module_name)
+
+    obj = getattr(mod, cls_name) if cls_name else None
+    if obj is None or isinstance(obj, type(importlib)):
+        # fall back to a likely class in the module
+        candidates = [(k, v) for k, v in vars(mod).items()
+                      if isinstance(v, type) and issubclass(v, nn.Module) and k[:1].isupper()]
+        if not candidates:
+            raise ImportError(
+                f"No nn.Module classes found in '{module_name}'. "
+                f"Set model.class_path to 'pkg.mod.ClassName'."
+            )
+        # prefer names containing Decoder / Isoform
+        candidates.sort(key=lambda kv: (("Decoder" not in kv[0], "Isoform" not in kv[0]), kv[0]))
+        obj = candidates[0][1]
+
+    kwargs = dict(mcfg.get("kwargs") or {})
+    # hydrate nested config if provided
+    if "config" in kwargs:
+        kwargs["config"] = _maybe_load_yaml_or_dict(kwargs["config"], cfg_dir)
+    elif "config_path" in kwargs:
+        kwargs["config"] = _maybe_load_yaml_or_dict(kwargs.pop("config_path"), cfg_dir)
+
+    # add max_len only if constructor takes it
+    try:
+        params = inspect.signature(obj.__init__).parameters
+        if "max_len" in params and "max_len" not in kwargs:
+            kwargs["max_len"] = int(max_len)
+    except (ValueError, TypeError):
+        pass
+
+    return obj(**kwargs)
+
+# ---------- Trainer from config ----------
+def build_trainer(tcfg: Dict[str, Any], cfg_dir: Path) -> pl.Trainer:
+    # Resolve log/ckpt dirs relative to CONFIG file (keeps test runs separate)
+    logdir   = Path(tcfg.get("logdir", "runs/betadogma"))
+    ckpt_dir = Path(tcfg.get("ckpt_dir", "checkpoints/betadogma"))
+    if not logdir.is_absolute():   logdir   = cfg_dir / logdir
+    if not ckpt_dir.is_absolute(): ckpt_dir = cfg_dir / ckpt_dir
+    logdir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    logger = TensorBoardLogger(save_dir=str(logdir), name="", version=None, default_hp_metric=False)
     callbacks = [
-        ModelCheckpoint(dirpath=ckpt.get("dir", "checkpoints/default"),
-                        filename="{epoch:02d}-{val_score:.4f}",
-                        monitor=ckpt.get("monitor", "val/score"),
-                        mode=ckpt.get("mode", "max"),
-                        save_top_k=int(ckpt.get("save_top_k", 2)),
-                        save_last=True),
+        ModelCheckpoint(dirpath=str(ckpt_dir), filename="{epoch:02d}-{val_auroc:.4f}",
+                        monitor="val/auroc", mode="max",
+                        save_top_k=int(tcfg.get("save_top_k", 2)), save_last=True),
         LearningRateMonitor(logging_interval="step"),
     ]
-    pat = cfg.get("train", {}).get("early_stopping_patience")
+    pat = tcfg.get("early_stopping_patience", None)
     if pat is not None:
-        callbacks.append(EarlyStopping(monitor=ckpt.get("monitor", "val/score"),
-                                       mode=ckpt.get("mode", "max"),
-                                       patience=int(pat)))
-    precision = cfg.get("train", {}).get("precision", "bf16")
-    devices = int(cfg.get("train", {}).get("devices", 1))
-    max_epochs = int(cfg.get("optim", {}).get("epochs", 20))
+        callbacks.append(EarlyStopping(monitor="val/auroc", mode="max", patience=int(pat)))
+
+    precision = tcfg.get("precision", "32-true")
+    if not torch.cuda.is_available() and precision != "32-true":
+        precision = "32-true"  # avoid AMP-on-CPU warnings
+
     return pl.Trainer(
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=devices,
-        max_epochs=max_epochs,
-        precision=precision if isinstance(precision, int) else (16 if "16" in str(precision) else "bf16-mixed"),
-        accumulate_grad_batches=int(cfg.get("train", {}).get("accumulate_grad_batches", 1)),
+        devices=int(tcfg.get("devices", 1)),
+        max_epochs=int(tcfg.get("epochs", 20)),
+        precision=precision,
+        accumulate_grad_batches=int(tcfg.get("accumulate_grad_batches", 1)),
         logger=logger,
         callbacks=callbacks,
-        log_every_n_steps=int(cfg.get("train", {}).get("log_every_n_steps", 50)),
-        val_check_interval=cfg.get("train", {}).get("val_every_n_steps", None),
-        check_val_every_n_epoch=None if cfg.get("train", {}).get("val_every_n_steps") else 1,
+        log_every_n_steps=int(tcfg.get("log_every_n_steps", 25)),
+        check_val_every_n_epoch=1,
         deterministic=True,
+        enable_progress_bar=True,
+        limit_train_batches=tcfg.get("limit_train_batches", None),
+        limit_val_batches=tcfg.get("limit_val_batches", None),
     )
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str, default="configs/train.base.yaml")
-    ap.add_argument("--resume_from", type=str, default=None)
-    ap.add_argument("--limit_train_batches", type=float, default=None)
-    ap.add_argument("--limit_val_batches", type=float, default=None)
-    ap.add_argument("--max_epochs", type=int, default=None)
-    args = ap.parse_args()
+    # 1) Pick config (env or default inside train/configs/)
+    cfg_env = os.environ.get("TRAIN_CONFIG", "")
+    cfg_path = Path(cfg_env).resolve() if cfg_env else DEFAULT_CFG
+    if not cfg_path.is_absolute():
+        cfg_path = (TRAIN_DIR / cfg_path).resolve()
+    cfg = load_config(cfg_path)
+    cfg_dir = Path(cfg["_config_dir"]).resolve()
 
-    cfg = load_config(args.config) if os.path.exists(args.config) else {}
-    seed_everything(cfg.get("seed", 42))
+    # 2) Sections
+    seed = int(cfg.get("seed", 42))
+    dcfg = dict(cfg.get("data", {}))
+    mcfg = dict(cfg.get("model", {}))
+    ocfg = dict(cfg.get("optim", {"lr": 3e-4, "weight_decay": 0.01}))
+    tcfg = dict(cfg.get("trainer", {}))
 
-    dm = DataModule(cfg.get("data", {}))
-    lit = LitDecoder(cfg.get("model", {}), cfg.get("optim", {}))
-    trainer = build_trainer(cfg)
+    # 3) Validate presence of data unless toy
+    if not mcfg.get("toy", False):
+        for key in ("train", "val", "max_len"):
+            if key not in dcfg or dcfg[key] in (None, ""):
+                raise ValueError(f"Non-toy training requires data.{key}. Missing in {cfg_path}.")
 
-    fit_kwargs = {}
-    if args.limit_train_batches is not None:
-        fit_kwargs["limit_train_batches"] = args.limit_train_batches
-    if args.limit_val_batches is not None:
-        fit_kwargs["limit_val_batches"] = args.limit_val_batches
-    if args.max_epochs is not None:
-        trainer.max_epochs = args.max_epochs
+    # 4) Seed
+    set_seed(seed)
 
-    trainer.fit(lit, datamodule=dm, ckpt_path=args.resume_from or None)
+    # 5) Build components (paths resolved vs. CONFIG location)
+    dm = SeqDataModule(dcfg, cfg_dir=cfg_dir)
+    _model_kwargs = mcfg.get("kwargs") or {}
+    max_len = int(dcfg.get("max_len", _model_kwargs.get("max_len", 0)))
+    model = build_model(mcfg, max_len=max_len, cfg_dir=cfg_dir)
+    lit = LitSeq(model=model, lr=float(ocfg.get("lr", 3e-4)), weight_decay=float(ocfg.get("weight_decay", 0.01)))
+    trainer = build_trainer(tcfg, cfg_dir=cfg_dir)
+
+    # 6) Train
+    trainer.fit(lit, datamodule=dm)
 
 if __name__ == "__main__":
     main()

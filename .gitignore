@@ -10,4 +10,6 @@ dist/
 .env
 .cache/
 checkpoints/
-data/cache/
+data/raw
+data/processed
+train/runs

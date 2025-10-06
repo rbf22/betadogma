@@ -1,0 +1,53 @@
+# All paths resolve relative to THIS file.
+
+# 1) Optional: preprocess GENCODE (toggle on if your pipeline needs it)
+gencode:
+  enabled: true
+  kwargs:
+    # Example inputs (edit to real locations if you enable this step)
+    gencode_gtf: ../../data/raw/gencode/gencode.v44.annotation.gtf.gz
+    fasta:       ../../data/raw/genome/GRCh38.primary_assembly.genome.fa
+    out_dir:     ../../data/intermediate/gencode/
+  # If import-call fails, we fall back to CLI using these flags (optional):
+  # cli_args:
+  #   gencode_gtf: ../../data/raw/gencode/gencode.v44.annotation.gtf.gz
+  #   fasta:       ../../data/raw/genome/GRCh38.primary_assembly.genome.fa
+  #   out_dir:     ../../data/intermediate/gencode/
+
+# 2) Optional: preprocess GTEx (toggle on if your pipeline needs it)
+gtex:
+  enabled: false
+  kwargs:
+    gtex_expression: ../../data/raw/gtex/expression.tsv.gz
+    sample_table:    ../../data/raw/gtex/samples.tsv
+    out_dir:         ../../data/intermediate/gtex/
+  # cli_args:
+  #   gtex_expression: ../../data/raw/gtex/expression.tsv.gz
+  #   sample_table:    ../../data/raw/gtex/samples.tsv
+  #   out_dir:         ../../data/intermediate/gtex/
+
+# 3) REQUIRED: aggregate into final JSONLs for training
+aggregate:
+  enabled: true
+  kwargs:
+    # Change keys/paths to match betadogma.data.prepare_data signature.
+    # These are common patterns; adjust as needed for your code.
+    input_dir:  ../../data/intermediate/
+    output_dir: ../../data/processed/
+    val_split:  0.1
+    test_split: 0.0
+    seed:       42
+  # If import-call fails, we fall back to CLI with these flags (optional):
+  # cli_args:
+  #   input_dir:  ../../data/intermediate/
+  #   output_dir: ../../data/processed/
+  #   val_split:  0.1
+  #   test_split: 0.0
+  #   seed:       42
+
+# 4) Expected outputs (must exist after running)
+outputs:
+  dir: ../../data/processed
+  train_file: train.jsonl
+  val_file:   val.jsonl
+  # test_file: test.jsonl   # uncomment if your pipeline writes a test split

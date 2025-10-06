@@ -1,0 +1,44 @@
+# Repro
+seed: 42
+
+# DATA (paths are resolved relative to THIS config file's directory)
+data:
+  # REQUIRED unless model.toy: true
+  train: ../../data/processed/train.jsonl
+  val:   ../../data/processed/val.jsonl
+  max_len: 512
+
+  # Optional knobs
+  use_strand: true
+  reverse_complement_minus: true
+  batch_size: 32
+  num_workers: 2
+  pin_memory: auto     # auto | true | false
+
+# MODEL
+model:
+  toy: false
+  class_path: betadogma.decoder.isoform_decoder.IsoformDecoder
+  kwargs:
+    config_path: ../../src/betadogma/experiments/config/default.yaml
+
+# OPTIMIZER
+optim:
+  lr: 3.0e-4
+  weight_decay: 0.01
+
+# TRAINER (log/ckpt dirs are resolved relative to THIS config dir)
+trainer:
+  epochs: 20
+  devices: 1
+  precision: 32-true          # on GPU you can set: 16-mixed or bf16-mixed
+  accumulate_grad_batches: 1
+  logdir: ../runs/betadogma
+  ckpt_dir: ../checkpoints/betadogma
+  save_top_k: 2
+  early_stopping_patience: null
+  log_every_n_steps: 25
+
+  # (optional) debug limits
+  limit_train_batches: null    # e.g., 100 or 0.1
+  limit_val_batches: null
