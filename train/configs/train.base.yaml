@@ -1,44 +1,34 @@
-# Repro
 seed: 42
+task: structural
 
-# DATA (paths are resolved relative to THIS config file's directory)
 data:
-  # REQUIRED unless model.toy: true
-  train: ../../data/processed/train.jsonl
-  val:   ../../data/processed/val.jsonl
-  max_len: 512
-
-  # Optional knobs
-  use_strand: true
-  reverse_complement_minus: true
-  batch_size: 32
+  train_parquet_glob: data/cache/gencode_v44_structural_base/shard_*.parquet
+  val_parquet_glob:   data/cache/gencode_v44_structural_base/shard_*.parquet
+  batch_size: 2
   num_workers: 2
-  pin_memory: auto     # auto | true | false
 
-# MODEL
 model:
-  toy: false
-  class_path: betadogma.decoder.isoform_decoder.IsoformDecoder
-  kwargs:
-    config_path: ../../src/betadogma/experiments/config/default.yaml
+  encoder:
+    model_id: InstaDeepAI/nucleotide-transformer-500m-human-ref
+    hidden_size: 1280
+  heads:
+    hidden: 512
+    use_conv: true
+    dropout: 0.1
+  loss:
+    pos_weight: 25.0
+    w_splice: 1.0
+    w_tss: 0.5
+    w_polya: 0.5
+  decoder: {}  # optional; not used during structural training loss
 
-# OPTIMIZER
 optim:
-  lr: 3.0e-4
+  lr: 2.0e-4
   weight_decay: 0.01
 
-# TRAINER (log/ckpt dirs are resolved relative to THIS config dir)
 trainer:
-  epochs: 20
+  epochs: 2
   devices: 1
-  precision: 32-true          # on GPU you can set: 16-mixed or bf16-mixed
-  accumulate_grad_batches: 1
-  logdir: ../runs/betadogma
-  ckpt_dir: ../checkpoints/betadogma
-  save_top_k: 2
-  early_stopping_patience: null
-  log_every_n_steps: 25
-
-  # (optional) debug limits
-  limit_train_batches: null    # e.g., 100 or 0.1
-  limit_val_batches: null
+  ckpt_dir: checkpoints/structural
+  logdir: runs/structural
+  early_stopping_patience: 2

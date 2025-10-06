@@ -1,6 +1,5 @@
-# betadogma/experiments/train.py
 """
-Phase 1: Structural fine-tuning for splice/TSS/polyA heads.
+Phase 1: Structural fine-tuning for splice / TSS / polyA heads.
 
 Usage:
   python -m betadogma.experiments.train --config betadogma/experiments/config/default.yaml
@@ -8,145 +7,175 @@ Usage:
 from __future__ import annotations
 import argparse
 import os
-import yaml
 from glob import glob
 from typing import Dict, List
 
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+import yaml
 import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 from betadogma.core.encoder_nt import NTEncoder
 from betadogma.model import BetaDogmaModel
+from betadogma.core.losses import structural_bce_ce_loss
+
 
 # ---------------- Data ----------------
 
 class StructuralDataset(Dataset):
+    """
+    Expects Parquet shards where each row has:
+      - "seq": str DNA sequence (A/C/G/T/N)
+      - "donor", "acceptor", "tss", "polya": lists/arrays of 0/1 labels (length Lr)
+    """
     def __init__(self, parquet_paths: List[str], max_shards: int | None = None):
         self.paths = sorted(parquet_paths)[:max_shards] if max_shards else sorted(parquet_paths)
-        self._rows = []
+        self.rows = []
         for p in self.paths:
             df = pd.read_parquet(p)
-            self._rows.extend(df.to_dict("records"))
+            self.rows.extend(df.to_dict("records"))
 
-    def __len__(self): return len(self._rows)
+    def __len__(self) -> int:
+        return len(self.rows)
 
     def __getitem__(self, idx):
-        r = self._rows[idx]
-        seq = r["seq"]
-        # Convert binned labels to tensors
-        donor = torch.tensor(r["donor"], dtype=torch.float32)
-        acceptor = torch.tensor(r["acceptor"], dtype=torch.float32)
-        tss = torch.tensor(r["tss"], dtype=torch.float32)
-        polya = torch.tensor(r["polya"], dtype=torch.float32)
-        return {"seq": seq, "donor": donor, "acceptor": acceptor, "tss": tss, "polya": polya}
+        r = self.rows[idx]
+        return {
+            "seq": r["seq"],
+            "donor": torch.as_tensor(r["donor"], dtype=torch.float32),
+            "acceptor": torch.as_tensor(r["acceptor"], dtype=torch.float32),
+            "tss": torch.as_tensor(r["tss"], dtype=torch.float32),
+            "polya": torch.as_tensor(r["polya"], dtype=torch.float32),
+        }
 
-def collate(batch):
-    # Pad to max label length (Lr) in batch
-    max_label_len = max(len(x["donor"]) for x in batch)
 
-    def pad1d(x, target_len):
-        return torch.nn.functional.pad(x, (0, target_len - len(x)))
-
+def collate_structural(batch):
+    # Variable-length sequences allowed; encoder will pad at token level.
     seqs = [b["seq"] for b in batch]
-    donor = torch.stack([pad1d(b["donor"], max_label_len) for b in batch])
-    acceptor = torch.stack([pad1d(b["acceptor"], max_label_len) for b in batch])
-    tss = torch.stack([pad1d(b["tss"], max_label_len) for b in batch])
-    polya = torch.stack([pad1d(b["polya"], max_label_len) for b in batch])
 
-    return {"seqs": seqs, "donor": donor, "acceptor": acceptor, "tss": tss, "polya": polya}
+    # For labels we’ll pad to the max label length in this mini-batch
+    def pad1d(x, T):
+        L = x.numel()
+        if L < T:
+            return torch.nn.functional.pad(x, (0, T - L))
+        return x[:T]
+
+    max_Lr = max(b["donor"].numel() for b in batch)
+    donor   = torch.stack([pad1d(b["donor"],   max_Lr) for b in batch])  # (B, Lr)
+    accept  = torch.stack([pad1d(b["acceptor"],max_Lr) for b in batch])
+    tss     = torch.stack([pad1d(b["tss"],     max_Lr) for b in batch])
+    polya   = torch.stack([pad1d(b["polya"],   max_Lr) for b in batch])
+
+    return {"seqs": seqs, "donor": donor, "acceptor": accept, "tss": tss, "polya": polya}
 
 
-# --------------- Training ----------------
+# ---------------- Training ----------------
+
+def _align_labels_to_L(labels_B_Lr: torch.Tensor, L: int) -> torch.Tensor:
+    """Pad/crop labels along length dim to match encoder/heads length L."""
+    B, Lr = labels_B_Lr.shape
+    if Lr == L:
+        return labels_B_Lr
+    if Lr < L:
+        return torch.nn.functional.pad(labels_B_Lr, (0, L - Lr))
+    return labels_B_Lr[:, :L]
+
 
 def train(cfg: Dict):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # --- Initialize Encoder ---
-    enc_type = cfg["encoder"].get("type", "nt")
-    if enc_type == "nt":
-        encoder = NTEncoder(
-            model_id=cfg["encoder"].get("model_id") or "InstaDeepAI/nucleotide-transformer-500m-human-ref"
-        )
-    else:
-        raise ValueError(f"Unsupported encoder type: {enc_type}")
+    # --- Encoder ---
+    enc = NTEncoder(
+        model_id=cfg["encoder"].get("model_id", "InstaDeepAI/nucleotide-transformer-500m-human-ref"),
+        device=cfg["encoder"].get("device", "auto"),
+    )
 
-    d_model = encoder.hidden_size
-    bin_size = encoder.bin_size # pylint: disable=unused-variable
+    # --- Model ---
+    d_in = enc.hidden_size
+    model = BetaDogmaModel(d_in=d_in, config=cfg).to(device)
+    model.train()
 
-    # --- Initialize Model and Data ---
-    model = BetaDogmaModel(d_in=d_model, config=cfg).to(device)
-
-    shards_glob = os.path.join(cfg["data"]["out_cache"], "*.parquet")
-    paths = glob(shards_glob)
-    assert paths, f"No parquet shards found at {shards_glob}"
+    # --- Data ---
+    shard_glob = os.path.join(cfg["data"]["out_cache"], "*.parquet")
+    paths = glob(shard_glob)
+    assert paths, f"No parquet shards found at {shard_glob}"
 
     ds = StructuralDataset(paths, max_shards=cfg["trainer"].get("max_shards"))
-    dl = DataLoader(ds, batch_size=cfg["trainer"]["batch_size"], shuffle=True, collate_fn=collate)
+    dl = DataLoader(
+        ds,
+        batch_size=int(cfg["trainer"]["batch_size"]),
+        shuffle=True,
+        num_workers=int(cfg["trainer"].get("num_workers", 0)),
+        collate_fn=collate_structural,
+    )
 
-    # --- Optimizer and Loss Function ---
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg["optimizer"]["lr"], weight_decay=cfg["optimizer"]["weight_decay"])
-    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(cfg["loss"]["pos_weight"]).to(device))
-    loss_weights = cfg["loss"]
+    # --- Optimizer ---
+    opt = torch.optim.AdamW(model.parameters(),
+                            lr=float(cfg["optimizer"]["lr"]),
+                            weight_decay=float(cfg["optimizer"].get("weight_decay", 0.0)))
 
-    # --- Training Loop ---
-    model.train()
-    for epoch in range(cfg["trainer"]["epochs"]):
-        total_loss = 0.0
-        pbar = tqdm(dl, desc=f"Epoch {epoch+1}/{cfg['trainer']['epochs']}")
+    # Optional loss weights
+    w = {
+        "donor": cfg["loss"].get("w_splice", 1.0),
+        "acceptor": cfg["loss"].get("w_splice", 1.0),
+        "tss": cfg["loss"].get("w_tss", 1.0),
+        "polya": cfg["loss"].get("w_polya", 1.0),
+        "orf_start": cfg["loss"].get("w_orf_start", 0.0),
+        "orf_stop": cfg["loss"].get("w_orf_stop", 0.0),
+        "orf_frame": cfg["loss"].get("w_orf_frame", 0.0),
+    }
+
+    epochs = int(cfg["trainer"]["epochs"])
+    for ep in range(epochs):
+        running = 0.0
+        pbar = tqdm(dl, desc=f"[Structural] Epoch {ep+1}/{epochs}")
         for batch in pbar:
+            # Encode sequences -> embeddings + masks
+            enc_out = enc.forward(batch["seqs"])
+            embeddings = enc_out["embeddings"].to(device)   # (B, L, D)
+            input_ids  = enc_out["input_ids"].to(device)    # (B, L)
+            pad_mask   = enc_out["pad_mask"].to(device)     # (B, L)
+            B, L, _ = embeddings.shape
+
+            # Forward heads
+            head_outs = model(embeddings=embeddings, input_ids=input_ids)
+
+            # Align labels (B, Lr) to L
+            donor   = _align_labels_to_L(batch["donor"].to(device),   L).unsqueeze(-1)  # (B,L,1)
+            accept  = _align_labels_to_L(batch["acceptor"].to(device),L).unsqueeze(-1)
+            tss     = _align_labels_to_L(batch["tss"].to(device),     L).unsqueeze(-1)
+            polya   = _align_labels_to_L(batch["polya"].to(device),   L).unsqueeze(-1)
+
+            labels = {
+                "splice": {"donor": donor, "acceptor": accept},
+                "tss":    {"tss": tss},
+                "polya":  {"polya": polya},
+                # No ORF supervision in this phase; skip keys to weight=0 losses
+                "orf":    {"start": torch.zeros(B, L, 1, device=device),
+                           "stop":  torch.zeros(B, L, 1, device=device),
+                           "frame": torch.zeros(B, L, 3, device=device, dtype=torch.long)},
+            }
+
+            loss = structural_bce_ce_loss(head_outs, labels, pad_mask=pad_mask, weights=w)
+
             opt.zero_grad()
-
-            # --- Encoder Forward Pass ---
-            # The NTEncoder handles tokenization and embedding internally.
-            embeddings = encoder.forward(batch["seqs"]) # [B, L, D]
-
-            # --- Model Forward Pass ---
-            outputs = model(embeddings=embeddings)
-
-            # --- Calculate Multi-Task Loss ---
-            # Splice loss
-            splice_logits_donor = outputs['splice']['donor'].squeeze(-1)
-            splice_logits_acceptor = outputs['splice']['acceptor'].squeeze(-1)
-            labels_donor = batch['donor'].to(device)
-            labels_acceptor = batch['acceptor'].to(device)
-
-            min_len = min(splice_logits_donor.shape[1], labels_donor.shape[1])
-            loss_d = criterion(splice_logits_donor[:, :min_len], labels_donor[:, :min_len])
-            loss_a = criterion(splice_logits_acceptor[:, :min_len], labels_acceptor[:, :min_len])
-            splice_loss = (loss_d + loss_a) * loss_weights['w_splice']
-
-            # TSS loss
-            tss_logits = outputs['tss']['tss'].squeeze(-1)
-            labels_tss = batch['tss'].to(device)
-            min_len_tss = min(tss_logits.shape[1], labels_tss.shape[1])
-            tss_loss = criterion(tss_logits[:, :min_len_tss], labels_tss[:, :min_len_tss]) * loss_weights['w_tss']
-
-            # PolyA loss
-            polya_logits = outputs['polya']['polya'].squeeze(-1)
-            labels_polya = batch['polya'].to(device)
-            min_len_polya = min(polya_logits.shape[1], labels_polya.shape[1])
-            polya_loss = criterion(polya_logits[:, :min_len_polya], labels_polya[:, :min_len_polya]) * loss_weights['w_polya']
-
-            # Combine losses
-            loss = splice_loss + tss_loss + polya_loss
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["trainer"].get("grad_clip", 1.0))
+            torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["trainer"].get("grad_clip", 1.0)))
             opt.step()
 
-            total_loss += loss.item()
+            running += float(loss.item())
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        avg_loss = total_loss / max(1, len(dl))
-        print(f"Epoch {epoch+1}/{cfg['trainer']['epochs']} average loss: {avg_loss:.4f}")
+        avg = running / max(1, len(dl))
+        print(f"Epoch {ep+1}/{epochs}  avg_loss={avg:.4f}")
 
-    # --- Save Checkpoint ---
+    # --- Save ---
     ckpt_dir = cfg["trainer"]["ckpt_dir"]
     os.makedirs(ckpt_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(ckpt_dir, "betadogma_structural.pt"))
-    print("Saved checkpoint:", ckpt_dir)
+    print(f"Saved checkpoint to {ckpt_dir}/betadogma_structural.pt")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -155,6 +184,7 @@ def main():
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
     train(cfg)
+
 
 if __name__ == "__main__":
     main()

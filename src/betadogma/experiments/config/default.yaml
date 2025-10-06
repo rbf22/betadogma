@@ -1,32 +1,46 @@
 seed: 42
+
 encoder:
   type: nt
   model_id: InstaDeepAI/nucleotide-transformer-500m-human-ref
   hidden_size: 1280
   bin_size: 1
+  device: auto   # "cuda", "cpu", or "auto"
+
 heads:
   hidden: 512
   use_conv: true
   dropout: 0.1
+
 optimizer:
   lr: 2.0e-4
   weight_decay: 0.01
+
 trainer:
   epochs: 2
   batch_size: 2
   grad_clip: 1.0
   max_shards: 2
   ckpt_dir: checkpoints/structural
+  num_workers: 2  # set to 0 on Windows if needed
+
 loss:
-  pos_weight: 25.0
+  # Per-head weights for phase-1 structural training
   w_splice: 1.0
   w_tss: 0.5
   w_polya: 0.5
+  # Keep ORF losses off in phase-1 (heads will still run, just not supervised)
+  w_orf_start: 0.0
+  w_orf_stop: 0.0
+  w_orf_frame: 0.0
+
 data:
   fasta: /abs/path/GRCh38.primary_assembly.genome.fa
   gencode: /abs/path/gencode.v44.annotation.gtf
   out_cache: data/cache/gencode_v44_structural_base
+
 decoder:
+  max_candidates: 64         # helpful cap if graphs get large
   thresholds: { donor: 0.6, acceptor: 0.6, tss: 0.5, polya: 0.5 }
   tss_pa_window: 1
   beam_size: 8
@@ -45,3 +59,8 @@ decoder:
     orf_beta: 0.3
     orf_gamma: 0.6
     max_start_candidates: 5
+
+nmd:
+  mode: rule              # "rule" | "learned" | "hybrid"
+  ptc_rule_threshold: 55
+  cds_inclusive: false

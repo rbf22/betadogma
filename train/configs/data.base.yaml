@@ -1,53 +1,56 @@
-# All paths resolve relative to THIS file.
+seed: 42
 
-# 1) Optional: preprocess GENCODE (toggle on if your pipeline needs it)
 gencode:
   enabled: true
   kwargs:
-    # Example inputs (edit to real locations if you enable this step)
-    gencode_gtf: ../../data/raw/gencode/gencode.v44.annotation.gtf.gz
-    fasta:       ../../data/raw/genome/GRCh38.primary_assembly.genome.fa
-    out_dir:     ../../data/intermediate/gencode/
-  # If import-call fails, we fall back to CLI using these flags (optional):
-  # cli_args:
-  #   gencode_gtf: ../../data/raw/gencode/gencode.v44.annotation.gtf.gz
-  #   fasta:       ../../data/raw/genome/GRCh38.primary_assembly.genome.fa
-  #   out_dir:     ../../data/intermediate/gencode/
+    fasta: ../../data/raw/GRCh38.primary_assembly.genome.fa
+    gtf:   ../../data/raw/gencode.v44.annotation.gtf
+    out:   ../../data/cache/gencode_v44_structural_base
+    window: 131072            # 128k windows
+    stride: 65536             # 64k step
+    bin_size: 1               # base-resolution labels to match NTEncoder
+    chroms: "chr1,chr2"       # set "" to process all chr*
+    max_shard_bases: 50000000
 
-# 2) Optional: preprocess GTEx (toggle on if your pipeline needs it)
 gtex:
-  enabled: false
+  enabled: true
   kwargs:
-    gtex_expression: ../../data/raw/gtex/expression.tsv.gz
-    sample_table:    ../../data/raw/gtex/samples.tsv
-    out_dir:         ../../data/intermediate/gtex/
-  # cli_args:
-  #   gtex_expression: ../../data/raw/gtex/expression.tsv.gz
-  #   sample_table:    ../../data/raw/gtex/samples.tsv
-  #   out_dir:         ../../data/intermediate/gtex/
+    junctions: "../../data/gtex/junctions/*.parquet"  # per-sample junction counts
+    gtf:          ../../data/raw/gencode.v44.annotation.gtf
+    out:          ../../data/cache/gtex_psi
+    chroms:       ""        # or "chr1,chr2"
+    min_count:    5         # per-junction minimum count per sample
+    min_total:    20        # per-sample total junction count threshold
+    min_samples:  5         # require junction observed in ≥ this many samples
 
-# 3) REQUIRED: aggregate into final JSONLs for training
+variants:
+  enabled: true
+  kwargs:
+    vcf:           ../../data/variants/cohort.vcf.gz
+    windows_glob:  ../../data/cache/gencode_v44_structural_base/*.parquet  # align variants to these windows
+    out:           ../../data/cache/variants_aligned
+    apply_alt:     true      # write ALT-applied sequences alongside channels
+    max_per_window: 64       # safety cap per window
+    shard_size:     50000    # rows per output shard (tune for I/O)
+
 aggregate:
   enabled: true
   kwargs:
-    # Change keys/paths to match betadogma.data.prepare_data signature.
-    # These are common patterns; adjust as needed for your code.
-    input_dir:  ../../data/intermediate/
-    output_dir: ../../data/processed/
-    val_split:  0.1
-    test_split: 0.0
-    seed:       42
-  # If import-call fails, we fall back to CLI with these flags (optional):
-  # cli_args:
-  #   input_dir:  ../../data/intermediate/
-  #   output_dir: ../../data/processed/
-  #   val_split:  0.1
-  #   test_split: 0.0
-  #   seed:       42
+    # Your prepare_data module can merge/index these inputs as needed.
+    input_dir:   ../../data/cache/gencode_v44_structural_base
+    output_dir:  ../../data/processed/structural
+    gtex_dir:    ../../data/cache/gtex_psi
+    variant_dir: ../../data/cache/variants_aligned
+    # Add any extra switches your aggregator understands, e.g.:
+    # write_index: true
+    # split_by: "chrom"
+    # keep_columns: ["chrom","start","end","seq","donor","acceptor","tss","polya"]
 
-# 4) Expected outputs (must exist after running)
 outputs:
-  dir: ../../data/processed
-  train_file: train.jsonl
-  val_file:   val.jsonl
-  # test_file: test.jsonl   # uncomment if your pipeline writes a test split
+  # Prefer asserting existence via globs (works for Parquet shard outputs).
+  dir: ../../data/cache/gencode_v44_structural_base
+  expect:
+    - shard_*.parquet
+    # If your aggregator writes additional outputs, add their patterns too, e.g.:
+    # - ../../data/cache/gtex_psi/*.parquet
+    # - ../../data/cache/variants_aligned/*.parquet

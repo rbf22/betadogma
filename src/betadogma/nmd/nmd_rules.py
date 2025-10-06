@@ -1,70 +1,131 @@
 """
 Rule-based NMD heuristics (55-nt rule, last-exon exceptions, etc.).
+
+Conventions
+-----------
+- Exon coordinates are genomic, half-open: [start, end).
+- Isoform.exons are in transcription order for the given strand.
+- Isoform.cds is a genomic interval (start, end) covering the CDS, also half-open
+  by default. If your CDS is inclusive, set cds_inclusive=True in calls.
 """
+
+from __future__ import annotations
+from typing import Optional, Tuple
+
 from ..decoder.types import Isoform
 
 
-def rule_ptc_before_last_junction(isoform: Isoform, ptc_rule_threshold: int = 55) -> bool:
+def _last_junction_tx_coord(iso: Isoform) -> Optional[int]:
     """
-    Return True if PTC > `ptc_rule_threshold` nt upstream of the last exon junction.
+    Transcript index (0-based, in nucleotides) of the last exon–exon junction.
+    Returns None for single-exon isoforms.
+    """
+    if len(iso.exons) < 2:
+        return None
+    # Sum of all exon lengths except the last one.
+    return sum(e.end - e.start for e in iso.exons[:-1])
 
-    This function implements the classic "55-nucleotide rule" for nonsense-mediated
-    decay (NMD). An isoform is predicted to be an NMD target if its stop codon
-    (premature termination codon or PTC) is located more than a certain distance
-    upstream of the final exon-exon junction.
 
-    Args:
-        isoform: The isoform object to check. It must have its `cds` attribute
-                 populated with the genomic coordinates of the coding sequence.
-                 The `exons` attribute must be in transcription order.
-        ptc_rule_threshold: The distance threshold in nucleotides.
+def _ptc_genomic_start(iso: Isoform, cds_inclusive: bool = False) -> Optional[int]:
+    """
+    Genomic coordinate (0-based) of the *start* of the stop codon (PTC).
+    Returns None if CDS is missing.
+
+    If cds_inclusive=True, cds=(start,end) is treated as inclusive, so the
+    stop codon starts at end-2 on '+' and at start on '-' (after reverse logic).
+    In the default half-open case, stop codon starts at end-3 on '+'.
+    """
+    if iso.cds is None:
+        return None
+    cds_start, cds_end = iso.cds  # genomic
+    if cds_end <= cds_start:
+        return None
+
+    if iso.strand == '+':
+        # Plus strand: stop is at the *end* of CDS region.
+        if cds_inclusive:
+            # ...XYZ[stop] with end pointing to the last base (inclusive)
+            return cds_end - 2  # start of the 3-bp stop codon
+        else:
+            # Half-open: CDS is [start, end), stop codon occupies end-3..end-1
+            return cds_end - 3
+    else:
+        # Minus strand: CDS runs right->left; the stop codon is at genomic CDS start.
+        # For both inclusive and half-open, the *start* of the stop codon is cds_start
+        # because the three bases are cds_start..cds_start+2 on the minus strand.
+        return cds_start
+
+
+def _map_genomic_to_tx(iso: Isoform, gpos: int) -> Optional[int]:
+    """
+    Map a genomic position inside an exon to transcript (cDNA) index (0-based).
+    Returns None if gpos is not within any exon.
+
+    For '+' strand: offset from exon.start
+    For '-' strand: offset from exon 3' end, i.e., (exon.end - 1 - gpos)
+    """
+    tx = 0
+    for ex in iso.exons:  # already in transcription order
+        if ex.start <= gpos < ex.end:
+            if iso.strand == '+':
+                return tx + (gpos - ex.start)
+            else:
+                return tx + (ex.end - 1 - gpos)
+        tx += (ex.end - ex.start)
+    return None
+
+
+def ptc_distance_to_last_junction_tx(
+    isoform: Isoform,
+    cds_inclusive: bool = False,
+) -> Optional[int]:
+    """
+    Compute signed distance (in nt) from the PTC (start of stop codon) to the last
+    exon–exon junction, both measured along the transcript (cDNA) coordinate.
 
     Returns:
-        True if the isoform is predicted to be an NMD target, False otherwise.
+        distance = last_junction_tx - ptc_tx
+        - Positive: PTC is upstream of the last junction (NMD-prone).
+        - Negative: PTC is at/after last junction (usually NMD-escaping).
+        - None: if single-exon, missing CDS, or PTC not mappable.
     """
-    # Rule only applies to spliced transcripts (more than one exon)
-    if len(isoform.exons) < 2:
+    last_junc = _last_junction_tx_coord(isoform)
+    if last_junc is None:
+        return None
+
+    ptc_g = _ptc_genomic_start(isoform, cds_inclusive=cds_inclusive)
+    if ptc_g is None:
+        return None
+
+    ptc_tx = _map_genomic_to_tx(isoform, ptc_g)
+    if ptc_tx is None:
+        return None  # CDS stop not inside provided exons
+
+    return last_junc - ptc_tx
+
+
+def rule_ptc_before_last_junction(
+    isoform: Isoform,
+    ptc_rule_threshold: int = 55,
+    cds_inclusive: bool = False,
+    strict_gt: bool = True,
+) -> bool:
+    """
+    Return True if the PTC is more than `ptc_rule_threshold` nt upstream of the
+    last exon–exon junction (the classic "55-nt rule").
+
+    Args:
+        isoform: Isoform with exons in transcription order; isoform.cds is genomic (start,end).
+        ptc_rule_threshold: Threshold in nucleotides (commonly 50–55).
+        cds_inclusive: Set True if isoform.cds is inclusive [start,end] instead of half-open.
+        strict_gt: If True, use 'distance > threshold'; if False, use '>= threshold'.
+
+    Notes:
+        - This rule is only meaningful for multi-exon isoforms with a mapped CDS stop.
+        - This function does not model EJC deposition (~20–24 nt upstream of junction);
+          the 55-nt rule is an empirical proxy for that effect.
+    """
+    dist = ptc_distance_to_last_junction_tx(isoform, cds_inclusive=cds_inclusive)
+    if dist is None:
         return False
-
-    # Rule requires a defined CDS to locate the PTC
-    if isoform.cds is None:
-        return False
-
-    # 1. Find the transcript coordinate of the last exon-exon junction.
-    # `isoform.exons` is in transcription order. The junction is after the second-to-last exon.
-    last_junction_tx_coord = sum(e.end - e.start for e in isoform.exons[:-1])
-
-    # 2. Find the transcript coordinate of the PTC (start of the stop codon).
-    if isoform.strand == '+':
-        # For plus strand, the stop codon is at the end of the CDS.
-        # cds format is (start, end) of the entire CDS region.
-        # The stop codon starts at end - 3.
-        ptc_genomic_coord = isoform.cds[1] - 3
-    else:  # strand == '-'
-        # For minus strand, the stop codon is at the start of the CDS in genomic terms.
-        ptc_genomic_coord = isoform.cds[0]
-
-    ptc_tx_coord = -1
-    len_before_exon = 0
-    for exon in isoform.exons:  # Exons are in transcription order
-        if exon.start <= ptc_genomic_coord < exon.end:
-            # Found the exon containing the PTC
-            if isoform.strand == '+':
-                offset_in_exon = ptc_genomic_coord - exon.start
-            else:  # strand == '-'
-                # Transcription is right-to-left. The coordinate is relative to the exon's 3' end.
-                offset_in_exon = exon.end - 1 - ptc_genomic_coord
-            ptc_tx_coord = len_before_exon + offset_in_exon
-            break
-        len_before_exon += (exon.end - exon.start)
-
-    # If PTC wasn't found in any exon, something is wrong.
-    if ptc_tx_coord == -1:
-        return False
-
-    # 3. Calculate the distance and check the rule.
-    # The distance is from the PTC to the junction.
-    distance_from_ptc_to_junction = last_junction_tx_coord - ptc_tx_coord
-
-    # A positive distance means the PTC is upstream of the junction.
-    return distance_from_ptc_to_junction > ptc_rule_threshold
+    return (dist > ptc_rule_threshold) if strict_gt else (dist >= ptc_rule_threshold)
