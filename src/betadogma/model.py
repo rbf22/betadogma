@@ -6,21 +6,64 @@ This module exposes a simple interface for inference:
 - preprocess_sequence / preprocess_variant: utilities to create inputs.
 """
 from typing import Optional, Dict, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .core.heads import SpliceHead, TSSHead, PolyAHead, ORFHead
 from .decoder.isoform_decoder import IsoformDecoder
+from .decoder.types import Isoform
+from .nmd.nmd_model import NMDModel
+
+
+def _isoform_to_key(iso: Isoform) -> str:
+    """Creates a unique string identifier for an isoform."""
+    exon_str = ",".join(f"{e.start}-{e.end}" for e in iso.exons)
+    return f"{iso.strand}:{exon_str}"
 
 
 @dataclass
 class Prediction:
-    dominant_isoform: Dict[str, Any]
-    psi: Dict[str, float]
-    p_nmd: float
-    aux: Dict[str, Any]
+    """
+    Encapsulates the full output of a BetaDogma prediction.
+
+    This object holds the raw candidate isoforms and computes final values
+    (PSI, dominant isoform, NMD status) on demand via properties.
+    """
+    isoforms: list[Isoform]
+    _nmd_model: NMDModel # A reference to the NMD model for on-the-fly prediction
+
+    @property
+    def psi(self) -> Dict[str, float]:
+        """Calculate Percent Spliced In (PSI) values for all isoforms."""
+        if not self.isoforms:
+            return {}
+
+        scores = torch.tensor([iso.score for iso in self.isoforms])
+        psi_values = F.softmax(scores, dim=0)
+
+        return {
+            _isoform_to_key(iso): psi.item()
+            for iso, psi in zip(self.isoforms, psi_values)
+        }
+
+    @property
+    def dominant_isoform(self) -> Optional[Isoform]:
+        """Return the isoform with the highest PSI value."""
+        if not self.isoforms:
+            return None
+        # The dominant isoform corresponds to the one with the maximum raw score
+        return max(self.isoforms, key=lambda iso: iso.score)
+
+    @property
+    def p_nmd(self) -> float:
+        """Predict the NMD fate of the dominant isoform."""
+        dom_iso = self.dominant_isoform
+        if dom_iso is None:
+            return 0.0
+        return self._nmd_model.predict(dom_iso)
 
 
 class BetaDogmaModel(nn.Module):
@@ -66,6 +109,10 @@ class BetaDogmaModel(nn.Module):
         # This component assembles predictions into transcript structures.
         self.isoform_decoder = IsoformDecoder(config=self.config.get("decoder", {}))
 
+        # --- 4. NMD Model ---
+        # This component predicts NMD fate.
+        self.nmd_model = NMDModel(config=self.config.get("nmd", {}))
+
 
     def forward(self, embeddings: torch.Tensor, input_ids: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """
@@ -82,6 +129,31 @@ class BetaDogmaModel(nn.Module):
             "input_ids": input_ids, # Pass through for downstream use (e.g., sequence-based ORF scoring)
         }
         return outputs
+
+    def predict(self, head_outputs: Dict[str, Any], strand: str = '+') -> Prediction:
+        """
+        Decodes the raw outputs from the heads into a final, structured prediction
+        object that can compute isoform abundances and NMD status.
+
+        Args:
+            head_outputs: A dictionary containing the raw tensor outputs from the
+                          model's forward pass.
+            strand: The strand of the gene, either '+' or '-'.
+
+        Returns:
+            A Prediction object containing the candidate isoforms.
+        """
+        input_ids = head_outputs.get("input_ids")
+
+        # 1. Decode all candidate isoforms from the graph
+        candidate_isoforms = self.isoform_decoder.decode(
+            head_outputs,
+            strand=strand,
+            input_ids=input_ids,
+        )
+
+        # 2. Return the Prediction object, which handles all downstream calculations
+        return Prediction(isoforms=candidate_isoforms, _nmd_model=self.nmd_model)
 
     @classmethod
     def from_config_file(cls, config_path: str):
