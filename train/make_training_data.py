@@ -105,28 +105,48 @@ def step_prepare_gencode(cfg: Dict[str, Any], cfg_dir: Path) -> None:
         print("[data] gencode: skipped")
         return
 
+    # Get and process kwargs
     kwargs = dict(section.get("kwargs") or {})
-    # normalize common keys from earlier configs
+    
+    # Normalize common keys from earlier configs
     rename = {"gencode_gtf": "gtf", "out_dir": "out"}
     for old, new in rename.items():
         if old in kwargs and new not in kwargs:
             kwargs[new] = kwargs.pop(old)
 
-    for key in ("gtf", "fasta", "out"):
-        if key in kwargs:
-            rp = resolve_path(kwargs[key], cfg_dir)
-            kwargs[key] = str(rp) if rp is not None else kwargs[key]
+    # Resolve all paths relative to the config file
+    for key, value in kwargs.items():
+        if isinstance(value, str) and (value.endswith(('.fa', '.fasta', '.gtf', '.gz', '.parquet')) or '/' in value):
+            rp = resolve_path(value, cfg_dir)
+            if rp is not None:
+                kwargs[key] = str(rp)
 
-    module = "betadogma.data.prepare_gencode"
+    # Ensure required arguments are present
+    required = ['fasta', 'gtf', 'out']
+    missing = [arg for arg in required if arg not in kwargs]
+    if missing:
+        raise ValueError(f"Missing required arguments for prepare_gencode: {', '.join(missing)}")
+
     try:
-        call_module_entrypoint(module, kwargs)
+        # Import the module and call the function directly
+        from betadogma.data.prepare_gencode import prepare_gencode
+        
+        print(f"[data] Running prepare_gencode with kwargs: {kwargs}")
+        
+        # Map the kwargs to the function parameters
+        prepare_gencode(
+            fasta_path=kwargs['fasta'],
+            gtf_path=kwargs['gtf'],
+            out_dir=kwargs['out'],
+            window=kwargs.get('window', 131072),
+            stride=kwargs.get('stride', 65536),
+            bin_size=kwargs.get('bin_size', 1),
+            chroms=kwargs.get('chroms', ''),
+            max_shard_bases=kwargs.get('max_shard_bases', 50_000_000)
+        )
     except Exception as e:
-        print(f"[data] import-call failed for {module}: {e!r} -> trying CLI")
-        cli_args = []
-        for k, v in (section.get("cli_args") or {}).items():
-            rv = resolve_path(v, cfg_dir)
-            cli_args += [f"--{k.replace('_','-')}", str(rv if rv is not None else v)]
-        run_module_cli(module, cli_args)
+        print(f"[data] Error in prepare_gencode: {e!r}")
+        raise
 
 
 def step_prepare_gtex(cfg: Dict[str, Any], cfg_dir: Path) -> None:
@@ -135,91 +155,103 @@ def step_prepare_gtex(cfg: Dict[str, Any], cfg_dir: Path) -> None:
         print("[data] gtex: skipped")
         return
 
+    # Get and process kwargs
     kwargs = dict(section.get("kwargs") or {})
-    for key in ("gtex_expression", "sample_table", "out_dir", "out"):
-        if key in kwargs:
-            rp = resolve_path(kwargs[key], cfg_dir)
-            kwargs[key] = str(rp) if rp is not None else kwargs[key]
 
-    module = "betadogma.data.prepare_gtex"
+    # Resolve all paths relative to the config file
+    for key, value in kwargs.items():
+        if isinstance(value, str) and (value.endswith(('.gtf', '.parquet', '.csv', '.tsv')) or '/' in value):
+            rp = resolve_path(value, cfg_dir)
+            if rp is not None:
+                kwargs[key] = str(rp)
+
+    # Ensure required arguments are present
+    required = ['junctions', 'gtf', 'out']
+    missing = [arg for arg in required if arg not in kwargs]
+    if missing:
+        raise ValueError(f"Missing required arguments for prepare_gtex: {', '.join(missing)}")
+
     try:
-        call_module_entrypoint(module, kwargs)
+        # Import the required functions
+        from betadogma.data.prepare_gtex import (
+            read_junction_tables,
+            compute_junction_psi,
+            build_gene_index,
+            annotate_genes,
+            summarize_gene_psi
+        )
+        import os
+
+        print(f"[data] Running prepare_gtex with kwargs: {kwargs}")
+
+        # 1) Create output directory
+        os.makedirs(kwargs['out'], exist_ok=True)
+
+        # 2) Load junctions
+        df = read_junction_tables(kwargs['junctions'])
+
+        # 3) Optional chromosome filter
+        if 'chroms' in kwargs and kwargs['chroms']:
+            keep = set([c.strip() for c in kwargs['chroms'].split(",") if c.strip()])
+            df = df[df["chrom"].isin(keep)].copy()
+
+        # 4) Compute PSI
+        min_count = kwargs.get('min_count', 5)
+        min_total = kwargs.get('min_total', 20)
+        df_psi = compute_junction_psi(df, min_count=min_count, min_total=min_total)
+
+        # 5) Gene assignment
+        chroms = sorted(df_psi["chrom"].unique())
+        gene_index = build_gene_index(kwargs['gtf'], allowed_chroms=chroms)
+        df_psi = annotate_genes(df_psi, gene_index)
+
+        # 6) Write junction-level PSI
+        junc_out = os.path.join(kwargs['out'], "junction_psi.parquet")
+        df_psi.to_parquet(junc_out, index=False)
+        print(f"[data] Wrote {junc_out} ({len(df_psi):,} rows)")
+
+        # 7) Per-gene summary
+        min_samples = kwargs.get('min_samples', 5)
+        gene_sum = summarize_gene_psi(df_psi, min_samples=min_samples)
+        gene_out = os.path.join(kwargs['out'], "gene_psi_summary.parquet")
+        gene_sum.to_parquet(gene_out, index=False)
+        print(f"[data] Wrote {gene_out} ({len(gene_sum):,} genes)")
+
     except Exception as e:
-        print(f"[data] import-call failed for {module}: {e!r} -> trying CLI")
-        cli_args = []
-        for k, v in (section.get("cli_args") or {}).items():
-            rv = resolve_path(v, cfg_dir)
-            cli_args += [f"--{k.replace('_','-')}", str(rv if rv is not None else v)]
-        run_module_cli(module, cli_args)
-
-
-def step_prepare_variants(cfg: Dict[str, Any], cfg_dir: Path) -> None:
-    """
-    Optional variant channel preparation. Expects a module:
-        betadogma.data.prepare_variants
-    with an entrypoint taking kwargs like:
-        vcf, fasta, out, window, stride, bin_size, chroms
-    """
-    section = cfg.get("variants", {})
-    if not section or not section.get("enabled", False):
-        print("[data] variants: skipped")
-        return
-
-    kwargs = dict(section.get("kwargs") or {})
-    for key in ("vcf", "fasta", "out", "out_dir"):
-        if key in kwargs:
-            rp = resolve_path(kwargs[key], cfg_dir)
-            kwargs[key] = str(rp) if rp is not None else kwargs[key]
-    # normalize
-    if "out_dir" in kwargs and "out" not in kwargs:
-        kwargs["out"] = kwargs.pop("out_dir")
-
-    module = "betadogma.data.prepare_variants"
-    try:
-        call_module_entrypoint(module, kwargs)
-    except Exception as e:
-        print(f"[data] import-call failed for {module}: {e!r} -> trying CLI")
-        cli_args = []
-        for k, v in (section.get("cli_args") or {}).items():
-            rv = resolve_path(v, cfg_dir)
-            cli_args += [f"--{k.replace('_','-')}", str(rv if rv is not None else v)]
-        run_module_cli(module, cli_args)
-
-
-def step_prepare_data(cfg: Dict[str, Any], cfg_dir: Path) -> None:
-    """
-    REQUIRED: runs betadogma.data.prepare_data which should write final splits.
-    Accepts flexible inputs (e.g., structural shards, GTEx tables, variant shards).
-    """
-    section = cfg.get("aggregate", {})
-    if not section or not section.get("enabled", True):
-        raise RuntimeError("aggregate step is required; set aggregate.enabled: true")
-
-    kwargs = dict(section.get("kwargs") or {})
-    # common keys to resolve: any *dir or *path option
-    for key in list(kwargs.keys()):
-        if key.endswith(("dir", "path", "glob", "file")):
-            rp = resolve_path(kwargs[key], cfg_dir)
-            kwargs[key] = str(rp) if rp is not None else kwargs[key]
-
-    module = "betadogma.data.prepare_data"
-    try:
-        call_module_entrypoint(module, kwargs)
-    except Exception as e:
-        print(f"[data] import-call failed for {module}: {e!r} -> trying CLI")
-        cli_args = []
-        for k, v in (section.get("cli_args") or {}).items():
-            rv = resolve_path(v, cfg_dir)
-            cli_args += [f"--{k.replace('_','-')}", str(rv if rv is not None else v)]
-        run_module_cli(module, cli_args)
+        print(f"[data] Error in prepare_gtex: {e!r}")
+        raise
 
 
 # -------- main driver --------
 def main():
-    cfg_env = os.environ.get("DATA_CONFIG", "")
-    cfg_path = Path(cfg_env) if cfg_env else DEFAULT_CFG
+    import argparse
+    import os
+    from pathlib import Path
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Prepare training data for Betadogma')
+    parser.add_argument('--config', type=str, help='Path to config file')
+    args = parser.parse_args()
+    
+    # Set up paths
+    TRAIN_DIR = Path(__file__).parent
+    cfg_env = os.environ.get('DATA_CONFIG')
+    
+    # Handle config path resolution
+    if args.config:
+        cfg_path = Path(args.config)
+    elif cfg_env:
+        cfg_path = Path(cfg_env)
+    else:
+        # Default to configs/ directory in the project root (one level up from train/)
+        cfg_path = TRAIN_DIR.parent / 'configs' / 'data.base.yaml'
+    
+    # Convert to absolute path if not already
     if not cfg_path.is_absolute():
-        cfg_path = (TRAIN_DIR / cfg_path).resolve()
+        # Use the current working directory as the base for relative paths
+        cfg_path = Path.cwd() / cfg_path
+    
+    cfg_path = cfg_path.resolve()
     cfg = load_yaml(cfg_path)
     cfg_dir = Path(cfg["_config_dir"]).resolve()
 

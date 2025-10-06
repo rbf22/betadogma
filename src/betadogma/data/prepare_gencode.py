@@ -211,25 +211,48 @@ def make_binned_tracks(
     return arrs
 
 
-def main():
-    args = parse_args()
-    os.makedirs(args.out, exist_ok=True)
-
+def prepare_gencode(
+    fasta_path: str,
+    gtf_path: str,
+    out_dir: str,
+    window: int = 131072,
+    stride: int = 65536,
+    bin_size: int = 1,
+    chroms: str = "",
+    max_shard_bases: int = 50_000_000
+) -> None:
+    """Prepare GENCODE annotations into binned, model-ready labels for structural heads.
+    
+    Args:
+        fasta_path: Path to the reference genome FASTA file
+        gtf_path: Path to the GTF annotation file
+        out_dir: Output directory for the processed files
+        window: Window size for binning (default: 131072)
+        stride: Stride for sliding window (default: 65536)
+        bin_size: Size of each bin (default: 1)
+        chroms: Comma-separated list of chromosomes to process (default: "", process all)
+        max_shard_bases: Maximum number of bases per output shard (default: 50,000,000)
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    
     # Sanity checks: ensure nice binning
-    assert args.window > 0 and args.stride > 0 and args.bin_size > 0
-    assert args.window % args.bin_size == 0, "--window must be a multiple of --bin-size"
-    assert args.stride % args.bin_size == 0, "--stride must be a multiple of --bin-size"
+    if not (window > 0 and stride > 0 and bin_size > 0):
+        raise ValueError("window, stride, and bin_size must be positive integers")
+    if window % bin_size != 0:
+        raise ValueError("window must be a multiple of bin_size")
+    if stride % bin_size != 0:
+        raise ValueError("stride must be a multiple of bin_size")
 
     # Chromosome selection
-    allowed_chroms = set([c.strip() for c in args.chroms.split(",") if c.strip()]) if args.chroms else None
+    allowed_chroms = set([c.strip() for c in chroms.split(",") if c.strip()]) if chroms else None
 
     # 1) parse GTF (stream)
     print("[prepare_gencode] parsing GTF...")
-    gtf_iter = read_gtf_minimal(args.gtf, allowed_chroms)
+    gtf_iter = read_gtf_minimal(gtf_path, allowed_chroms)
     donors_dict, acceptors_dict, tss_dict, polya_dict = collect_sites(gtf_iter)
 
     # 2) reference genome
-    fasta = pyfaidx.Fasta(args.fasta, as_raw=True, sequence_always_upper=True)
+    fasta = pyfaidx.Fasta(fasta_path, as_raw=True, sequence_always_upper=True)
 
     # 3) sliding windows per chromosome
     shard_rows: List[Dict] = []
@@ -246,8 +269,8 @@ def main():
         if chrom not in fasta:
             continue
         clen = len(fasta[chrom])
-        w = args.window
-        stride = args.stride
+        w = window
+        stride = stride
         print(f"  - {chrom} (len={clen:,})")
         for wstart in range(0, max(1, clen - w + 1), stride):
             wend = wstart + w
@@ -256,7 +279,7 @@ def main():
             seq = str(fasta[chrom][wstart:wend])
 
             tracks = make_binned_tracks(
-                chrom, wstart, wend, args.bin_size,
+                chrom, wstart, wend, bin_size,
                 donors_dict.get(chrom, set()),
                 acceptors_dict.get(chrom, set()),
                 tss_dict.get(chrom, set()),
@@ -267,7 +290,7 @@ def main():
                 "start": int(wstart),
                 "end": int(wend),
                 "seq": seq,
-                "bin_size": int(args.bin_size),
+                "bin_size": int(bin_size),
                 "donor": [int(x) for x in tracks["donor"]],
                 "acceptor": [int(x) for x in tracks["acceptor"]],
                 "tss": [int(x) for x in tracks["tss"]],
@@ -276,9 +299,9 @@ def main():
             shard_rows.append(row)
             bases_in_shard += (wend - wstart)
 
-            if bases_in_shard >= args.max_shard_bases:
+            if bases_in_shard >= max_shard_bases:
                 df = pd.DataFrame(shard_rows)
-                outp = os.path.join(args.out, f"shard_{shard_idx:04d}.parquet")
+                outp = os.path.join(out_dir, f"shard_{shard_idx:04d}.parquet")
                 df.to_parquet(outp, index=False)
                 print(f"[prepare_gencode] wrote {outp} ({len(df)} rows)")
                 shard_rows.clear()
@@ -287,11 +310,10 @@ def main():
 
     if shard_rows:
         df = pd.DataFrame(shard_rows)
-        outp = os.path.join(args.out, f"shard_{shard_idx:04d}.parquet")
-        df.to_parquet(outp, index=False)
-        print(f"[prepare_gencode] wrote {outp} ({len(df)} rows)")
-
-    print(f"[prepare_gencode] DONE → {args.out}")
+        outp = os.path.join(out_dir, f"shard_{shard_idx:04d}.parquet")
+    df.to_parquet(outp, index=False)
+    print(f"[prepare_gencode] wrote {outp} ({len(df)} rows)")
+    print(f"[prepare_gencode] done. Wrote {shard_idx + 1} shard to {out_dir}")
 
 
 if __name__ == "__main__":

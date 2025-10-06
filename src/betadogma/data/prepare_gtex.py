@@ -290,36 +290,67 @@ def parse_args():
     return ap.parse_args()
 
 
-def main():
-    args = parse_args()
-    os.makedirs(args.out, exist_ok=True)
+def prepare_gtex(
+    junctions: str | List[str],
+    gtf: str,
+    out: str,
+    chroms: Optional[str] = None,
+    min_count: int = 5,
+    min_total: int = 20,
+    min_samples: int = 5
+) -> None:
+    """Prepare GTEx junction data with PSI calculations and gene annotations.
+    
+    Args:
+        junctions: Path or glob pattern to junction count files
+        gtf: Path to GTF annotation file
+        out: Output directory
+        chroms: Comma-separated list of chromosomes to include (None for all)
+        min_count: Minimum read count for a junction to be included
+        min_total: Minimum total read count for donor/acceptor sites
+        min_samples: Minimum number of samples with coverage for gene summary
+    """
+    os.makedirs(out, exist_ok=True)
 
     # 1) load junctions
-    df = read_junction_tables(args.junctions)
+    df = read_junction_tables(junctions)
 
     # optional chromosome filter
-    if args.chroms:
-        keep = set([c.strip() for c in args.chroms.split(",") if c.strip()])
+    if chroms:
+        keep = set([c.strip() for c in chroms.split(",") if c.strip()])
         df = df[df["chrom"].isin(keep)].copy()
 
     # 2) compute PSI
-    df_psi = compute_junction_psi(df, min_count=args.min_count, min_total=args.min_total)
+    df_psi = compute_junction_psi(df, min_count=min_count, min_total=min_total)
 
     # 3) gene assignment
-    chroms = [c for c in sorted(df_psi["chrom"].unique())]
-    gene_index = build_gene_index(args.gtf, allowed_chroms=chroms)
+    chroms_list = [c for c in sorted(df_psi["chrom"].unique())]
+    gene_index = build_gene_index(gtf, allowed_chroms=chroms_list)
     df_psi = annotate_genes(df_psi, gene_index)
 
     # 4) write junction-level PSI
-    junc_out = os.path.join(args.out, "junction_psi.parquet")
+    junc_out = os.path.join(out, "junction_psi.parquet")
     df_psi.to_parquet(junc_out, index=False)
     print(f"[prepare_gtex] wrote {junc_out} ({len(df_psi):,} rows)")
 
     # 5) per-gene summary
-    gene_sum = summarize_gene_psi(df_psi, min_samples=args.min_samples)
-    gene_out = os.path.join(args.out, "gene_psi_summary.parquet")
+    gene_sum = summarize_gene_psi(df_psi, min_samples=min_samples)
+    gene_out = os.path.join(out, "gene_psi_summary.parquet")
     gene_sum.to_parquet(gene_out, index=False)
     print(f"[prepare_gtex] wrote {gene_out} ({len(gene_sum):,} genes)")
+
+
+def main():
+    args = parse_args()
+    prepare_gtex(
+        junctions=args.junctions,
+        gtf=args.gtf,
+        out=args.out,
+        chroms=args.chroms,
+        min_count=args.min_count,
+        min_total=args.min_total,
+        min_samples=args.min_samples
+    )
 
 
 if __name__ == "__main__":
