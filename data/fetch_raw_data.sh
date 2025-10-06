@@ -36,14 +36,20 @@ GENCODE_GTF_MD5_URL="${GENCODE_GTF_URL}.md5"
 GENOME_FASTA_MD5_URL="${GENOME_FASTA_URL}.md5"
 
 # GTEx v8
-GTEX_BASE="https://storage.googleapis.com/gtex_analysis_v8"
-GTEX_EXPR_URL="${GTEX_BASE}/rna_seq_data/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_tpm.gct.gz"
-GTEX_SAMPLES_URL="${GTEX_BASE}/annotations/GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt"
+GTEX_BASE="https://storage.googleapis.com/adult-gtex"
+GTEX_EXPR_URL="${GTEX_BASE}/bulk-gex/v8/rna-seq/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_tpm.gct.gz"
+GTEX_SAMPLES_URL="${GTEX_BASE}/annotations/v8/metadata-files/GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt"
+
+# GTEx v10 - when you are ready
+# https://storage.googleapis.com/adult-gtex/bulk-gex/v10/rna-seq/GTEx_Analysis_v10_RNASeQCv2.4.2_gene_tpm.gct.gz
+# https://storage.googleapis.com/adult-gtex/annotations/v10/metadata-files/GTEx_Analysis_v10_Annotations_SampleAttributesDS.txt
+
 
 # Example Variants: 1000 Genomes chr22 (bgzipped + .tbi available)
 # Example: 1000 Genomes Phase 3 lifted to GRCh38
-VAR_VCF_BGZ_URL="https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502_supporting/grch38_positions/ALL.chr22_GRCh38.genotypes.20170504.vcf.gz"
+VAR_VCF_BGZ_URL="https://42basepairs.com/download/web/ensembl/data_files/homo_sapiens/GRCh38/variation_genotype/ALL.chr22_GRCh38.genotypes.20170504.vcf.gz"
 VAR_VCF_TBI_URL="${VAR_VCF_BGZ_URL}.tbi"
+
 
 # -----------------------------
 # Output filenames
@@ -225,5 +231,5 @@ echo "  Variants VCF:   ${VAR_VCF_BGZ}"
 echo "  Variants index: ${VAR_VCF_TBI} $( [[ -f "$VAR_VCF_TBI" ]] && echo "" || echo "(missing)")"
 echo
 echo "Next:"
-echo "  1) Build shards:  python train/build_data.py --config train/configs/data.full.yaml"
-echo "  2) Train heads:   python train/train.py --config train/configs/train.structural.yaml"
+echo "  1) Build shards:  poetry run python train/make_training_data.py --config train/configs/data.base.yaml"
+echo "  2) Train heads:   poetry run python train/train.py --config train/configs/train.base.yaml"

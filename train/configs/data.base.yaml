@@ -3,8 +3,8 @@ seed: 42
 gencode:
   enabled: true
   kwargs:
-    fasta: ../../data/raw/GRCh38.primary_assembly.genome.fa
-    gtf:   ../../data/raw/gencode.v44.annotation.gtf
+    fasta: ../../data/raw/genome/GRCh38.primary_assembly.genome.fa
+    gtf:   ../../data/raw/gencode/gencode.v44.annotation.gtf
     out:   ../../data/cache/gencode_v44_structural_base
     window: 131072            # 128k windows
     stride: 65536             # 64k step
