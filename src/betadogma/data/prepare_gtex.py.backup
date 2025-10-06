@@ -351,78 +351,42 @@ def convert_gct_to_parquet(
     if not junctions:
         raise ValueError("No valid junctions found in the GCT file")
     
-    # Apply two-read junction coverage filter
-    print(f"
-Applying two-read junction coverage criteria:")
-    print(f"  - ≥{min_count} reads per junction per sample")
-    print(f"  - ≥{min_samples} samples with coverage per junction")
-
-    # Convert junction info to DataFrame for filtering
+    # Convert junction info to DataFrame
     junctions_df = pd.DataFrame(junctions)
-
-    # Filter junctions based on two-read coverage criteria
-    qualifying_junctions = []
-
-    for idx, junction in junctions_df.iterrows():
-        # Get counts for this junction across all samples
-        junction_counts = [sample_data[sample_id][idx] for sample_id in sample_ids]
-
-        # Count samples with ≥2 reads (two-read junction coverage)
-        samples_with_coverage = sum(1 for count in junction_counts if count >= min_count)
-
-        if samples_with_coverage >= min_samples:
-            qualifying_junctions.append(junction)
-
-    print(f"Filtered to {len(qualifying_junctions)} junctions meeting two-read coverage criteria")
-
-    if not qualifying_junctions:
-        raise ValueError(f"No junctions meet the two-read coverage criteria (≥{min_count} reads in ≥{min_samples} samples)")
-
-    # Update junctions_df with only qualifying junctions
-    junctions_df = pd.DataFrame(qualifying_junctions)
-
-    # Rebuild sample_data with only qualifying junctions
-    filtered_sample_data = {sample_id: [] for sample_id in sample_ids}
-    for idx, junction in junctions_df.iterrows():
-        for sample_id in sample_ids:
-            filtered_sample_data[sample_id].append(sample_data[sample_id][idx])
-
-    sample_data = filtered_sample_data
-
     output_files = []
-
+    
     # Write per-sample Parquet files
     for sample_id in tqdm(sample_ids, desc="Writing sample files"):
         # Create sample DataFrame with junction info and counts
         sample_df = junctions_df.copy()
         sample_df['sample_id'] = sample_id
         sample_df['count'] = sample_data[sample_id]
-
+        
+        # Filter out low-count junctions
+        sample_df = sample_df[sample_df['count'] >= min_count]
+        
         if not sample_df.empty:
             # Create output filename from sample ID
             safe_sample_id = "".join(c if c.isalnum() else "_" for c in sample_id)
             output_file = output_dir / f"{safe_sample_id}.parquet"
-
+            
             # Select and order required columns
             sample_df = sample_df[['chrom', 'donor', 'acceptor', 'strand', 'count', 'sample_id']]
             sample_df.to_parquet(output_file, index=False)
             output_files.append(str(output_file))
-
-    print(f"Completed: Processed {len(junctions_df)} junctions meeting criteria, wrote {len(output_files)} files to {output_dir}")
+    
+    print(f"Completed: Processed {len(junctions)} junctions, wrote {len(output_files)} files to {output_dir}")
     return output_files
 
-def process_junctions_input(junctions: Union[str, List[str]],
+def process_junctions_input(junctions: Union[str, List[str]], 
                           min_count: int = 5,
-    min_samples: int = 3,
-                          min_samples: int = 3,
                           smoke: bool = False,
                           chroms: Optional[str] = None) -> List[str]:
     """Process junctions input, handling both GCT and existing Parquet files.
     
     Args:
         junctions: Path or list of paths to junction files or GCT file
-        min_count: Minimum reads per junction per sample (for two-read coverage)
-        min_samples: Minimum samples with ≥min_count reads for a junction to be included
+        min_count: Minimum read count for a junction to be included
         smoke: If True, run in smoke test mode (process only a subset of data)
         chroms: Comma-separated list of chromosomes to include (None for all)
     """
@@ -436,7 +400,6 @@ def process_junctions_input(junctions: Union[str, List[str]],
             gct_path=junctions,
             output_dir=output_dir,
             min_count=min_count,
-            min_samples=min_samples,
             smoke=smoke,
             chroms=chroms
         )
@@ -582,8 +545,7 @@ def assign_gene_for_junction(
 # Junction counts I/O
 # -----------------------------
 
-def read_junction_tables(junctions_glob_or_list, min_count: int = 5,
-    min_samples: int = 3, smoke: bool = False, chroms: Optional[str] = None) -> pd.DataFrame:
+def read_junction_tables(junctions_glob_or_list, min_count: int = 5, smoke: bool = False, chroms: Optional[str] = None) -> pd.DataFrame:
     """
     Read one or multiple junction-count files (parquet/csv/tsv/gct), stack into a DataFrame.
     If a GCT file is provided, it will be converted to Parquet format first.
@@ -694,7 +656,6 @@ def read_junction_tables(junctions_glob_or_list, min_count: int = 5,
 def compute_junction_psi(
     df: pd.DataFrame,
     min_count: int = 5,
-    min_samples: int = 3,
     min_total: int = 20,
 ) -> pd.DataFrame:
     """
@@ -819,7 +780,6 @@ def prepare_gtex(
     out: str,
     chroms: Optional[str] = None,
     min_count: int = 5,
-    min_samples: int = 3,
     min_total: int = 20,
     min_samples: int = 5,
     smoke: bool = False
@@ -831,8 +791,7 @@ def prepare_gtex(
         gtf: Path to GTF annotation file
         out: Output directory
         chroms: Comma-separated list of chromosomes to include (None for all)
-        min_count: Minimum reads per junction per sample (for two-read coverage)
-        min_samples: Minimum samples with ≥min_count reads for a junction to be included
+        min_count: Minimum read count for a junction to be included
         min_total: Minimum total read count for donor/acceptor sites
         min_samples: Minimum number of samples with coverage for gene summary
         smoke: If True, run in smoke test mode (process only a subset of data)
@@ -847,7 +806,7 @@ def prepare_gtex(
     print(f"Preparing GTEx data (smoke test: {'ON' if smoke else 'OFF'})")
     print("="*80)
     
-    junction_files = process_junctions_input(junctions, min_count, min_samples, smoke=smoke, chroms=chroms)
+    junction_files = process_junctions_input(junctions, min_count, smoke=smoke, chroms=chroms)
     if not junction_files:
         raise ValueError("No valid junction files found after processing input")
         

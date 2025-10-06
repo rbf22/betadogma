@@ -136,6 +136,61 @@ print("ΔNMD =", out_alt.P_NMD - out_ref.P_NMD)
 
 ---
 
+## 🛠️ Data Processing
+
+### 1. Fetching Raw Data (`data/fetch_data.py`)
+
+This script downloads and verifies the raw data needed for training.
+
+#### Usage:
+```bash
+# Download all data (full dataset)
+poetry run python data/fetch_data.py
+
+# Check download status without downloading
+poetry run python data/fetch_data.py --check
+
+# Force re-download of specific files
+poetry run python data/fetch_data.py --force gtex_junctions
+```
+
+#### Features:
+- Downloads data from various sources (GTEx, GENCODE, etc.)
+- Verifies file integrity with checksums
+- Skips already downloaded files by default
+- Supports resuming interrupted downloads
+
+### 2. Preparing Training Data (`train/make_training_data.py`)
+
+Processes raw data into training-ready format with PSI calculations and gene annotations.
+
+#### Basic Usage:
+```bash
+# Full processing (all steps)
+poetry run python train/make_training_data.py --config train/configs/data.base.yaml
+```
+
+#### Smoke Test Mode (for quick validation):
+```bash
+# Process only a small subset of data
+poetry run python train/make_training_data.py --config train/configs/data.base.yaml --smoke
+```
+
+#### Checkpointing and Resuming:
+```bash
+# Resume from a specific step if interrupted
+poetry run python train/make_training_data.py --config train/configs/data.base.yaml --from-step gtex
+
+# Use a custom checkpoint directory
+poetry run python train/make_training_data.py --config train/configs/data.base.yaml --checkpoint-dir my_checkpoints
+```
+
+#### Available Steps:
+- `gencode`: Process GENCODE annotations
+- `gtex`: Process GTEx junction data
+- `variants`: Process variant data
+- `data`: Final data aggregation
+
 ## 📜 License
 
 MIT

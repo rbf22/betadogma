@@ -15,13 +15,13 @@ gencode:
 gtex:
   enabled: true
   kwargs:
-    junctions: "../../data/gtex/junctions/*.parquet"  # per-sample junction counts
-    gtf:          ../../data/raw/gencode.v44.annotation.gtf
-    out:          ../../data/cache/gtex_psi
-    chroms:       "chr22"        # or "chr1,chr2"
-    min_count:    5         # per-junction minimum count per sample
-    min_total:    20        # per-sample total junction count threshold
-    min_samples:  5         # require junction observed in ≥ this many samples
+    junctions: "../../data/raw/gtex/junctions/GTEx_junctions.gct.gz"  # GCT format junction counts
+    gtf: "../../data/raw/gencode/gencode.v44.annotation.gtf"
+    out: "../../data/cache/gtex_psi"
+    chroms: "chr22"        # Filter to chromosome 22 only (confirmed exists in GTEx)
+    min_count: 2           # ≥2 reads per junction (two-read coverage criteria)
+    min_total: 10          # per-sample total junction count threshold (reduced for chr22)
+    min_samples: 3         # require junction observed in ≥3 samples (reduced for chr22)
 
 variants:
   enabled: true

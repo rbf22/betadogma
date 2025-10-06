@@ -1,3 +1,89 @@
+
+def step_prepare_variants(cfg: Dict[str, Any], cfg_dir: Path) -> None:
+    section = cfg.get("variants", {})
+    if not section or not section.get("enabled", False):
+        print("[data] variants: skipped")
+        return
+
+    # Get and process kwargs
+    kwargs = dict(section.get("kwargs") or {})
+
+    # Resolve all paths relative to the config file
+    for key, value in kwargs.items():
+        if isinstance(value, str) and (value.endswith(('.vcf', '.vcf.gz', '.parquet')) or '/' in value):
+            rp = resolve_path(value, cfg_dir)
+            if rp is not None:
+                kwargs[key] = str(rp)
+
+    # Ensure required arguments are present
+    required = ['vcf', 'windows_glob', 'out']
+    missing = [arg for arg in required if arg not in kwargs]
+    if missing:
+        raise ValueError(f"Missing required arguments for prepare_variants: {', '.join(missing)}")
+
+    try:
+        # Import the module and call the function directly
+        from betadogma.data.prepare_variants import prepare_variants
+
+        print(f"[data] Running prepare_variants with kwargs: {kwargs}")
+
+        # Map the kwargs to the function parameters
+        prepare_variants(
+            vcf_path=kwargs['vcf'],
+            windows_glob=kwargs['windows_glob'],
+            out_dir=kwargs['out'],
+            apply_alt=kwargs.get('apply_alt', True),
+            max_per_window=kwargs.get('max_per_window', 64),
+            shard_size=kwargs.get('shard_size', 50000)
+        )
+    except Exception as e:
+        print(f"[data] Error in prepare_variants: {erm test.txt}")
+        raise
+
+
+def step_prepare_data(cfg: Dict[str, Any], cfg_dir: Path) -> None:
+    section = cfg.get("aggregate", {})
+    if not section or not section.get("enabled", False):
+        print("[data] aggregate: skipped")
+        return
+
+    # Get and process kwargs
+    kwargs = dict(section.get("kwargs") or {})
+
+    # Resolve all paths relative to the config file
+    for key, value in kwargs.items():
+        if isinstance(value, str) and (value.endswith(('.parquet', '.jsonl')) or '/' in value):
+            rp = resolve_path(value, cfg_dir)
+            if rp is not None:
+                kwargs[key] = str(rp)
+
+    # Ensure required arguments are present
+    required = ['input_dir', 'output_dir']
+    missing = [arg for arg in required if arg not in kwargs]
+    if missing:
+        raise ValueError(f"Missing required arguments for prepare_data: {', '.join(missing)}")
+
+    try:
+        # Import the module and call the function directly
+        from betadogma.data.prepare_data import prepare_data
+
+        print(f"[data] Running prepare_data with kwargs: {kwargs}")
+
+        # Map the kwargs to the function parameters
+        prepare_data(
+            input_dir=kwargs['input_dir'],
+            output_dir=kwargs['output_dir'],
+            gtex_dir=kwargs.get('gtex_dir'),
+            variant_dir=kwargs.get('variant_dir'),
+            write_index=kwargs.get('write_index', True),
+            split_by=kwargs.get('split_by'),
+            keep_columns=kwargs.get('keep_columns')
+        )
+    except Exception as e:
+        print(f"[data] Error in prepare_data: {erm test.txt}")
+        raise
+
+
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
@@ -16,6 +102,7 @@ Strict data builder for Betadogma.
 
 import os
 import sys
+import argparse
 import subprocess
 import importlib
 import inspect
@@ -188,22 +275,32 @@ def step_prepare_gtex(cfg: Dict[str, Any], cfg_dir: Path) -> None:
         os.makedirs(kwargs['out'], exist_ok=True)
 
         # 2) Load junctions
-        df = read_junction_tables(kwargs['junctions'])
+        df = read_junction_tables(kwargs['junctions'], smoke=kwargs.get('smoke', False), chroms=kwargs.get('chroms'))
+        print(f"[data] Loaded {len(df)} junctions from {len(df['sample_id'].unique())} samples")
+        print(f"[data] Chromosomes in data: {sorted(df['chrom'].unique())}")
+        print(f"[data] Junctions per chromosome: {df['chrom'].value_counts().to_dict()}")
 
         # 3) Optional chromosome filter
         if 'chroms' in kwargs and kwargs['chroms']:
             keep = set([c.strip() for c in kwargs['chroms'].split(",") if c.strip()])
+            print(f"[data] Filtering GTEx data to chromosomes: {sorted(keep)}")
             df = df[df["chrom"].isin(keep)].copy()
+            print(f"[data] After chromosome filtering: {len(df)} junctions remain")
 
         # 4) Compute PSI
         min_count = kwargs.get('min_count', 5)
         min_total = kwargs.get('min_total', 20)
+        print(f"[data] Computing PSI with min_count={min_count}, min_total={min_total}")
+        print(f"[data] Input columns before PSI: {list(df.columns)}")
         df_psi = compute_junction_psi(df, min_count=min_count, min_total=min_total)
+        print(f"[data] Columns after PSI computation: {list(df_psi.columns)}")
 
         # 5) Gene assignment
         chroms = sorted(df_psi["chrom"].unique())
         gene_index = build_gene_index(kwargs['gtf'], allowed_chroms=chroms)
+        print(f"[data] Annotating genes for {len(chroms)} chromosomes")
         df_psi = annotate_genes(df_psi, gene_index)
+        print(f"[data] Columns after gene annotation: {list(df_psi.columns)}")
 
         # 6) Write junction-level PSI
         junc_out = os.path.join(kwargs['out'], "junction_psi.parquet")
@@ -212,6 +309,8 @@ def step_prepare_gtex(cfg: Dict[str, Any], cfg_dir: Path) -> None:
 
         # 7) Per-gene summary
         min_samples = kwargs.get('min_samples', 5)
+        print(f"[data] Creating gene summary with min_samples={min_samples}")
+        print(f"[data] Columns before gene summary: {list(df_psi.columns)}")
         gene_sum = summarize_gene_psi(df_psi, min_samples=min_samples)
         gene_out = os.path.join(kwargs['out'], "gene_psi_summary.parquet")
         gene_sum.to_parquet(gene_out, index=False)
@@ -223,15 +322,45 @@ def step_prepare_gtex(cfg: Dict[str, Any], cfg_dir: Path) -> None:
 
 
 # -------- main driver --------
-def main():
-    import argparse
-    import os
-    from pathlib import Path
-    
-    # Parse command line arguments
+def parse_args():
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Prepare training data for Betadogma')
     parser.add_argument('--config', type=str, help='Path to config file')
-    args = parser.parse_args()
+    parser.add_argument('--smoke', action='store_true', help='Run in smoke test mode (process only a small subset of data)')
+    parser.add_argument('--from-step', type=str, choices=['gencode', 'gtex', 'variants', 'data'], 
+                       help='Start from a specific step')
+    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints', 
+                       help='Directory to save checkpoints')
+    return parser.parse_args()
+
+
+def save_checkpoint(step_name: str, checkpoint_dir: Path):
+    """Save a checkpoint file for the given step."""
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_file = checkpoint_dir / f"{step_name}.done"
+    checkpoint_file.touch()
+
+
+def should_skip_step(step_name: str, checkpoint_dir: Path, from_step: Optional[str]) -> bool:
+    """Check if we should skip this step based on checkpoints and --from-step."""
+    if from_step:
+        # If we're starting from a specific step, skip all previous steps
+        step_order = ['gencode', 'gtex', 'variants', 'data']
+        if step_name in step_order and step_order.index(step_name) < step_order.index(from_step):
+            return True
+    
+    # Check if we already completed this step
+    checkpoint_file = checkpoint_dir / f"{step_name}.done"
+    return checkpoint_file.exists()
+
+
+def main():
+    import os
+    from pathlib import Path
+    import argparse
+    
+    # Parse command line arguments
+    args = parse_args()
     
     # Set up paths
     TRAIN_DIR = Path(__file__).parent
@@ -255,17 +384,50 @@ def main():
     cfg = load_yaml(cfg_path)
     cfg_dir = Path(cfg["_config_dir"]).resolve()
 
+    # Set up checkpoint directory
+    checkpoint_dir = Path(args.checkpoint_dir or 'checkpoints').resolve()
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Apply smoke test settings if enabled
+    if args.smoke:
+        print("\n[data] Running in SMOKE TEST mode - processing minimal data\n")
+        # Update config for smoke test
+        if 'gtex' in cfg and 'kwargs' in cfg['gtex']:
+            cfg['gtex']['kwargs']['smoke'] = True
+        if 'variants' in cfg and 'kwargs' in cfg['variants']:
+            cfg['variants']['kwargs']['smoke'] = True
+    
     # 1) optional raw preprocessing
-    step_prepare_gencode(cfg, cfg_dir)
+    if not should_skip_step('gencode', checkpoint_dir, args.from_step):
+        print("\n[data] Step 1/4: Running prepare_gencode\n")
+        step_prepare_gencode(cfg, cfg_dir)
+        save_checkpoint('gencode', checkpoint_dir)
+    else:
+        print("\n[data] Step 1/4: Skipping prepare_gencode (already completed)")
 
     # 2) optional expression preprocessing
-    step_prepare_gtex(cfg, cfg_dir)
+    if not should_skip_step('gtex', checkpoint_dir, args.from_step):
+        print("\n[data] Step 2/4: Running prepare_gtex\n")
+        step_prepare_gtex(cfg, cfg_dir)
+        save_checkpoint('gtex', checkpoint_dir)
+    else:
+        print("\n[data] Step 2/4: Skipping prepare_gtex (already completed)")
 
     # 3) optional variants preprocessing
-    step_prepare_variants(cfg, cfg_dir)
+    if not should_skip_step('variants', checkpoint_dir, args.from_step):
+        print("\n[data] Step 3/4: Running prepare_variants\n")
+        step_prepare_variants(cfg, cfg_dir)
+        save_checkpoint('variants', checkpoint_dir)
+    else:
+        print("\n[data] Step 3/4: Skipping prepare_variants (already completed)")
 
     # 4) required aggregation
-    step_prepare_data(cfg, cfg_dir)
+    if not should_skip_step('data', checkpoint_dir, args.from_step):
+        print("\n[data] Step 4/4: Running prepare_data\n")
+        step_prepare_data(cfg, cfg_dir)
+        save_checkpoint('data', checkpoint_dir)
+    else:
+        print("\n[data] Step 4/4: Skipping prepare_data (already completed)")
 
     # 5) verify outputs exist
     out = cfg.get("outputs", {})
