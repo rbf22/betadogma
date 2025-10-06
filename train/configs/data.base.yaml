@@ -9,7 +9,7 @@ gencode:
     window: 131072            # 128k windows
     stride: 65536             # 64k step
     bin_size: 1               # base-resolution labels to match NTEncoder
-    chroms: "chr1,chr2"       # set "" to process all chr*
+    chroms: "chr22"       # set "" to process all chr*
     max_shard_bases: 50000000
 
 gtex:
@@ -18,7 +18,7 @@ gtex:
     junctions: "../../data/gtex/junctions/*.parquet"  # per-sample junction counts
     gtf:          ../../data/raw/gencode.v44.annotation.gtf
     out:          ../../data/cache/gtex_psi
-    chroms:       ""        # or "chr1,chr2"
+    chroms:       "chr22"        # or "chr1,chr2"
     min_count:    5         # per-junction minimum count per sample
     min_total:    20        # per-sample total junction count threshold
     min_samples:  5         # require junction observed in ≥ this many samples

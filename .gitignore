@@ -12,4 +12,5 @@ dist/
 checkpoints/
 data/raw
 data/processed
+data/cache  
 train/runs
