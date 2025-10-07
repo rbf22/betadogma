@@ -64,15 +64,17 @@ def step_prepare_variants(cfg: Dict[str, Any], cfg_dir: Path) -> None:
         # Import the module and call the function directly
         from betadogma.data.prepare_variants import prepare_variants
 
-        print(f"[data] Running prepare_variants with kwargs: {kwargs}")
-
-        # Map the kwargs to the function parameters
+        # Use a reasonable max_per_window value to downsample in this first step
+        variant_limit = kwargs.get('max_per_window', 64)  # Keep the original limit
+        print(f"[data] Running prepare_variants with max_per_window={variant_limit} (downsampling enabled)")
+        
         prepare_variants(
             vcf=kwargs['vcf'],
             windows=kwargs['windows_glob'],
             out=kwargs['out'],
             apply_alt=kwargs.get('apply_alt', True),
-            max_per_window=kwargs.get('max_per_window', 64),
+            safety_limit=kwargs.get('safety_limit', 2000),  # Use reasonable limit for first step
+            max_per_window=variant_limit,  # Use reasonable limit for first step
             shard_size=kwargs.get('shard_size', 50000)
         )
     except Exception as e:
@@ -105,9 +107,9 @@ def step_prepare_data(cfg: Dict[str, Any], cfg_dir: Path) -> None:
         # Import the module and call the function directly
         from betadogma.data.prepare_data import prepare_data
 
-        print(f"[data] Running prepare_data with kwargs: {kwargs}")
-
-        # Map the kwargs to the function parameters
+        # Set to 0 (unlimited) to ensure no further downsampling happens
+        print(f"[data] Running prepare_data with max_variants_per_window=0 (no further downsampling)")
+        
         prepare_data(
             input_dir=kwargs['input_dir'],
             output_dir=kwargs['output_dir'],
@@ -116,8 +118,9 @@ def step_prepare_data(cfg: Dict[str, Any], cfg_dir: Path) -> None:
             write_index=kwargs.get('write_index', True),
             split_by=kwargs.get('split_by'),
             keep_columns=kwargs.get('keep_columns'),
-            max_variants_per_window=kwargs.get('max_per_window', 64)  # Get from config or default to 64
+            max_variants_per_window=0  # Set to 0 (unlimited) to preserve all variants from first step
         )
+
     except Exception as e:
         print(f"[data] Error in prepare_data: {e}")
         raise

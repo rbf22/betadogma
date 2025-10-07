@@ -31,6 +31,7 @@ variants:
     out:           ../../data/cache/variants_aligned
     apply_alt:     true      # write ALT-applied sequences alongside channels
     max_per_window: 64       # safety cap per window
+    safety_limit:  100       # safety limit for variants per window (prevents memory issues, 0 = unlimited)
     shard_size:     50000    # rows per output shard (tune for I/O)
 
 aggregate:
@@ -41,6 +42,7 @@ aggregate:
     output_dir:  ../../data/processed/structural
     gtex_dir:    ../../data/cache/gtex_psi
     variant_dir: ../../data/cache/variants_aligned
+    max_per_window: 0  # No downsampling in second step
     # Add any extra switches your aggregator understands, e.g.:
     # write_index: true
     # split_by: "chrom"

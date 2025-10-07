@@ -12,6 +12,7 @@ Usage:
 
 from __future__ import annotations
 import argparse
+import logging
 from . import prepare_gencode
 
 
@@ -25,12 +26,28 @@ def parse_args():
     ap.add_argument("--bin-size", type=int, default=128)
     ap.add_argument("--chroms", type=str, default="")
     ap.add_argument("--max-shard-bases", type=int, default=50_000_000)
+    ap.add_argument("--safety-limit", type=int, default=2000, 
+                    help="Safety limit for variants per window (prevents memory issues, 0 = unlimited)")
+    ap.add_argument("--debug", action="store_true", help="Enable debug output")
     return ap.parse_args()
+
+
+def setup_logging(debug=False):
+    """Configure logging based on debug flag"""
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    return logging.getLogger(__name__)
 
 
 def main():
     # This simply forwards to prepare_gencode with the same signature.
     args = parse_args()
+    # Setup logging
+    global logger
+    logger = setup_logging(args.debug)
     # prepare_gencode.main() already handles the exact same arg set.
     prepare_gencode.main()
 
@@ -46,6 +63,10 @@ from typing import Dict, List, Optional, Any, Union
 import numpy as np
 import gc  # Added missing import
 
+# Initialize logger at module level
+logger = logging.getLogger(__name__)
+
+
 def load_parquet_files(glob_pattern: str) -> pd.DataFrame:
     """Load and concatenate parquet files matching the glob pattern."""
     files = sorted(glob.glob(glob_pattern))
@@ -58,13 +79,48 @@ def load_parquet_files(glob_pattern: str) -> pd.DataFrame:
             df = pd.read_parquet(f)
             dfs.append(df)
         except Exception as e:
-            print(f"Error reading {f}: {e}")
+            logger.error(f"Error reading {f}: {e}")
             raise
     
     if not dfs:
         raise ValueError(f"No valid parquet files found in {glob_pattern}")
     
     return pd.concat(dfs, ignore_index=True)
+
+
+def prepare_variants_wrapper(
+    vcf_path: str, 
+    windows_path: str, 
+    out_path: str, 
+    apply_alt: bool = False,
+    safety_limit: int = 2000,
+    shard_size: int = 50_000,
+    seed: int = 42,
+    debug: bool = False
+):
+    """
+    Wrapper for prepare_variants.run with renamed parameters.
+    
+    This ensures we correctly pass safety_limit to the run function.
+    """
+    from .prepare_variants import run as prepare_variants_run
+    
+    # Log what we're doing
+    logger.info(f"Running prepare_variants with safety_limit={safety_limit}")
+    
+    # Call with updated parameter names
+    prepare_variants_run(
+        vcf=vcf_path,
+        windows=windows_path,
+        out=out_path,
+        apply_alt=apply_alt,
+        safety_limit=safety_limit,  # Pass the safety_limit parameter
+        max_per_window=0,  # Set to 0 as it's deprecated
+        shard_size=shard_size,
+        seed=seed,
+        debug=debug,
+    )
+
 
 def prepare_data(
     input_dir: str,
@@ -73,7 +129,8 @@ def prepare_data(
     variant_dir: Optional[str] = None,
     split_by: Optional[str] = "chrom",
     keep_columns: Optional[List[str]] = None,
-    max_variants_per_window: int = 64,  # Default max variants per window
+    safety_limit: int = 2000,  # Renamed from max_variants_per_window
+    vcf_path: Optional[str] = None,  # Added for direct variant processing
     **kwargs
 ) -> None:
     """
@@ -86,11 +143,36 @@ def prepare_data(
         variant_dir: Directory containing variant data
         split_by: Column to split data by (e.g., 'chrom')
         keep_columns: List of columns to keep in the final output
-        max_variants_per_window: Maximum number of variants to track per window
+        safety_limit: Safety limit for variants per window (prevents memory issues, 0 = unlimited)
+        vcf_path: Optional path to VCF file for direct variant processing
         **kwargs: Additional configuration parameters
     """
     from pathlib import Path
     
+    # Handle backward compatibility with max_variants_per_window
+    if 'max_variants_per_window' in kwargs:
+        safety_limit = kwargs['max_variants_per_window']
+        logger.info(f"Using max_variants_per_window={safety_limit} as safety_limit")
+        
+    # If we're directly processing variants from VCF
+    if vcf_path and not variant_dir:
+        logger.info(f"Processing variants directly from VCF: {vcf_path}")
+        variant_out_dir = os.path.join(output_dir, "variants_cache")
+        os.makedirs(variant_out_dir, exist_ok=True)
+        
+        # Call our wrapper to ensure safety_limit is passed correctly
+        prepare_variants_wrapper(
+            vcf_path=vcf_path,
+            windows_path=str(Path(input_dir) / "*.parquet"),
+            out_path=variant_out_dir,
+            safety_limit=safety_limit,
+            debug=kwargs.get('debug', False)
+        )
+        
+        # Update variant_dir to point to our processed output
+        variant_dir = variant_out_dir
+        logger.info(f"Set variant_dir to {variant_dir}")
+
     # Set default columns to keep if not specified
     if keep_columns is None:
         keep_columns = [
@@ -102,10 +184,10 @@ def prepare_data(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f"[prepare_data] Preparing data from {input_dir} to {output_dir}")
+    logger.info(f"Preparing data from {input_dir} to {output_dir}")
     
     # Load genomic windows data
-    print("[prepare_data] Loading genomic windows...")
+    logger.info("Loading genomic windows...")
     windows_glob = str(Path(input_dir) / "*.parquet")
     windows_df = load_parquet_files(windows_glob)
     
@@ -113,12 +195,12 @@ def prepare_data(
     if keep_columns:
         missing_cols = [col for col in keep_columns if col not in windows_df.columns]
         if missing_cols:
-            print(f"[prepare_data] Warning: Missing columns in windows data: {missing_cols}")
+            logger.warning(f"Missing columns in windows data: {missing_cols}")
         windows_df = windows_df[[col for col in keep_columns if col in windows_df.columns]]
     
     # Process GTEx junction data if available
     if gtex_dir and os.path.exists(gtex_dir):
-        print("[prepare_data] Processing GTEx junction data...")
+        logger.info("Processing GTEx junction data...")
         try:
             gtex_glob = str(Path(gtex_dir) / "*.parquet")
             gtex_df = load_parquet_files(gtex_glob)
@@ -178,17 +260,17 @@ def prepare_data(
                     how='left'
                 )
                 
-                print(f"[prepare_data] Processed {len(window_junctions)} junctions in {len(window_metrics)} windows")
+                logger.info(f"Processed {len(window_junctions)} junctions in {len(window_metrics)} windows")
             else:
-                print("[prepare_data] No junctions found in any windows")
+                logger.info("No junctions found in any windows")
                 
         except Exception as e:
-            print(f"[prepare_data] Error processing GTEx data: {e}")
+            logger.error(f"Error processing GTEx data: {e}")
             raise
     
     # Process variant data if available
     if variant_dir and os.path.exists(variant_dir):
-        print("[prepare_data] Processing variant data...")
+        logger.info("Processing variant data...")
         try:
             variant_glob = str(Path(variant_dir) / "*.parquet")
             variant_files = sorted(glob.glob(variant_glob))
@@ -220,7 +302,7 @@ def prepare_data(
                             
                         # Ensure we have the required columns
                         if 'variant_spec' not in df.columns:
-                            print(f"[prepare_data] Warning: 'variant_spec' column missing in {f}")
+                            logger.warning(f"'variant_spec' column missing in {f}")
                             continue
                         
                         # Debug: Check for variant types
@@ -233,14 +315,14 @@ def prepare_data(
                             # Specifically check for insertions
                             ins_count = (df['var_type'] == 'INS').sum()
                             if ins_count > 0:
-                                print(f"[DEBUG] Found {ins_count} insertions in {f}")
+                                logger.debug(f"Found {ins_count} insertions in {f}")
                             
                             # Debug: Show some example insertions if any exist
-                            if ins_count > 0:
+                            if ins_count > 0 and logger.isEnabledFor(logging.DEBUG):
                                 ins_examples = df[df['var_type'] == 'INS'].head(3)
-                                print(f"[DEBUG] Insertion examples from {f}:")
+                                logger.debug(f"Insertion examples from {f}:")
                                 for _, row in ins_examples.iterrows():
-                                    print(f"  - {row['chrom']}:{row['start']} - {row['variant_spec']}")
+                                    logger.debug(f"  - {row['chrom']}:{row['start']} - {row['variant_spec']}")
                             
                         # Create a unique identifier for each variant
                         df['variant_id'] = df['chrom'] + ':' + df['start'].astype(str) + ':' + df['variant_spec']
@@ -259,8 +341,8 @@ def prepare_data(
                             if variant_id in seen_variants:
                                 duplicate_count += 1
                                 if duplicate_count <= 5:  # Only print first few duplicates
-                                    print(f"[DEBUG] Duplicate variant detected: {variant_id}")
-                                    print(f"[DEBUG] File: {f}, Position: {chrom}:{pos}, Type: {row.get('var_type', 'UNK')}")
+                                    logger.debug(f"Duplicate variant detected: {variant_id}")
+                                    logger.debug(f"File: {f}, Position: {chrom}:{pos}, Type: {row.get('var_type', 'UNK')}")
                             else:
                                 seen_variants.add(variant_id)
                             
@@ -279,19 +361,19 @@ def prepare_data(
                                 variant_windows[variant_id].add(window_key)
                                 
                     except Exception as e:
-                        print(f"[prepare_data] Warning: Could not process {f}: {e}")
+                        logger.warning(f"Could not process {f}: {e}")
             
             # Print variant type distribution info
-            print(f"[DEBUG] Variant type distribution in input files:")
+            logger.info(f"Variant type distribution in input files:")
             for vtype, count in sorted(variant_type_distribution.items(), key=lambda x: x[1], reverse=True):
-                print(f"  - {vtype}: {count:,} variants")
+                logger.info(f"  - {vtype}: {count:,} variants")
             
             # Second pass: Count all variants per window and track their types
             # First, sort variants to ensure consistent selection when capping
             sorted_variants = sorted(variant_windows.items(), key=lambda x: x[0])
             
-            # Track windows exceeding max variants
-            windows_exceeding_max = []
+            # Track windows exceeding safety limit
+            windows_exceeding_safety = []
             
             for variant_id, windows in sorted_variants:
                 var_type = variant_types.get(variant_id, 'UNK')
@@ -303,21 +385,30 @@ def prepare_data(
                     # Always add variant to the count for accurate statistics
                     current_count = len(variant_counts[window_key]['total'])
                     
-                    # Issue warning if we've exceeded max variants but still count them
-                    if current_count == max_variants_per_window:
+                    # Track windows that exceed safety limit but still count all variants
+                    if safety_limit > 0 and current_count == safety_limit:
                         chrom, start, end = window_key
                         window_id = f"{chrom}:{start}-{end}"
-                        windows_exceeding_max.append(window_id)
-                        print(f"[WARNING] Window {window_id} exceeds {max_variants_per_window} variants specified in data.base.config")
+                        windows_exceeding_safety.append(window_id)
+                        if len(windows_exceeding_safety) <= 10:  # Limit excessive logging
+                            logger.warning(
+                                f"Window {window_id} has {current_count:,} variants "
+                                f"(exceeding safety_limit={safety_limit}). "
+                                f"This is expected with population-level data."
+                            )
                             
                     # Always add the variant to our tracking
                     if variant_id not in variant_counts[window_key]['total']:
                         variant_counts[window_key]['total'].add(variant_id)
                         variant_counts[window_key]['types'][var_type] += 1
             
-            if windows_exceeding_max:
-                print(f"[WARNING] Total of {len(windows_exceeding_max)} windows exceed the maximum variant count ({max_variants_per_window})")
-                print(f"          This may affect training as only up to {max_variants_per_window} variants can be used per window")
+            if windows_exceeding_safety:
+                total_exceeded = len(windows_exceeding_safety)
+                logger.warning(
+                    f"{total_exceeded} windows ({total_exceeded/len(windows_df)*100:.1f}%) "
+                    f"have more than {safety_limit:,} variants. This is expected with population-level "
+                    f"data and won't affect training as variants are tracked naturally."
+                )
             
             # Clear memory
             if 'df' in locals():
@@ -345,33 +436,45 @@ def prepare_data(
                 })
             
             # Print duplicate variant stats
-            print(f"[DEBUG] Total unique variants: {len(seen_variants):,}")
-            print(f"[DEBUG] Duplicate variants found: {duplicate_count:,}")
+            logger.info(f"Total unique variants: {len(seen_variants):,}")
+            logger.info(f"Duplicate variants found: {duplicate_count:,}")
             
-            # Debug: Print distribution of variant counts per window
+            # Enhanced variant statistics
             if variant_stats:
                 counts = [vs['variant_count'] for vs in variant_stats]
-                print(f"[prepare_data] Variant count distribution:")
-                print(f"  - Windows with variants: {len(counts)} of {len(windows_df)} ({len(counts)/len(windows_df)*100:.1f}%)")
-                print(f"  - Min variants per window: {min(counts) if counts else 0}")
-                print(f"  - Max variants per window: {max(counts) if counts else 0}")
-                print(f"  - Mean variants per window: {sum(counts)/len(counts) if counts else 0:.1f}")
+                windows_with_variants = sum(1 for c in counts if c > 0)
+                
+                # Calculate percentiles
+                if counts:
+                    percentiles = np.percentile(counts, [5, 25, 50, 75, 95])
+                
+                logger.info(f"Variant count distribution:")
+                logger.info(f"  - Windows with variants: {windows_with_variants} of {len(windows_df)} ({windows_with_variants/len(windows_df)*100:.1f}%)")
+                if counts:
+                    logger.info(f"  - Min variants per window: {min(counts)}")
+                    logger.info(f"  - 5th percentile: {percentiles[0]:.1f}")
+                    logger.info(f"  - 25th percentile: {percentiles[1]:.1f}")
+                    logger.info(f"  - Median variants per window: {percentiles[2]:.1f}")
+                    logger.info(f"  - 75th percentile: {percentiles[3]:.1f}")
+                    logger.info(f"  - 95th percentile: {percentiles[4]:.1f}")
+                    logger.info(f"  - Max variants per window: {max(counts)}")
+                    logger.info(f"  - Mean variants per window: {sum(counts)/len(counts):.1f}")
                 
                 # Print variant type distribution
                 total_variants = sum(counts)
                 if type_totals:
-                    print("  - Variant type distribution in assigned windows:")
+                    logger.info("  - Variant type distribution in assigned windows:")
                     for t, c in sorted(type_totals.items(), key=lambda x: x[1], reverse=True):
-                        print(f"    - {t}: {c:,} ({c/total_variants*100:.1f}%)")
+                        logger.info(f"    - {t}: {c:,} ({c/total_variants*100:.1f}%)")
                 
                 # Print top windows by variant count
                 top_windows = sorted(variant_stats, key=lambda x: x['variant_count'], reverse=True)[:5]
-                print("  - Top 5 windows by variant count:")
+                logger.info("  - Top 5 windows by variant count:")
                 for win in top_windows:
                     win_types = {k[:-6]: v for k, v in win.items() 
                                if k.endswith('_count') and k != 'variant_count'}
                     type_str = ", ".join(f"{k}:{v}" for k, v in win_types.items() if v > 0)
-                    print(f"    - {win['chrom']}:{win['start']}-{win['end']}: "
+                    logger.info(f"    - {win['chrom']}:{win['start']}-{win['end']}: "
                           f"{win['variant_count']} variants ({type_str})")
             
             if variant_stats:
@@ -391,50 +494,45 @@ def prepare_data(
                 )
                 windows_df["variant_count"] = windows_df["variant_count"].fillna(0).astype(int)
                 
-                # Calculate variant statistics
+                # Calculate variant statistics for logging
                 total_variants = sum(vs['variant_count'] for vs in variant_stats)
                 windows_with_variants = len([vs for vs in variant_stats if vs['variant_count'] > 0])
                 avg_variants_per_window = total_variants / len(windows_df) if not windows_df.empty else 0
                 max_variants_in_window = max((vs['variant_count'] for vs in variant_stats), default=0)
                 
-                # Print detailed statistics
-                print(f"[prepare_data] Variant Statistics:")
-                print(f"  - Total variants: {total_variants:,}")
-                print(f"  - Windows with variants: {windows_with_variants:,} of {len(windows_df):,} ({windows_with_variants/len(windows_df):.1%})")
-                print(f"  - Average variants per window: {avg_variants_per_window:.1f}")
-                print(f"  - Max variants in a window: {max_variants_in_window:,}")
+                # Log detailed statistics
+                logger.info(f"Variant Statistics:")
+                logger.info(f"  - Total variants: {total_variants:,}")
+                logger.info(f"  - Windows with variants: {windows_with_variants:,} of {len(windows_df):,} ({windows_with_variants/len(windows_df):.1%})")
+                logger.info(f"  - Average variants per window: {avg_variants_per_window:.1f}")
+                logger.info(f"  - Max variants in a window: {max_variants_in_window:,}")
                 
-                # Print top 5 windows with most variants
-                if max_variants_in_window > 0:
-                    top_windows = windows_df.nlargest(5, 'variant_count')[['chrom', 'start', 'end', 'variant_count']]
-                    print("  - Top 5 windows by variant count:")
-                    for _, row in top_windows.iterrows():
-                        print(f"    - {row['chrom']}:{row['start']}-{row['end']}: {row['variant_count']:,} variants")
-                        
             else:
-                print("[prepare_data] No variants found in any windows")
+                logger.info("No variants found in any windows")
                 windows_df["variant_count"] = 0
                 
         except Exception as e:
-            print(f"[prepare_data] Error processing variant data: {e}")
+            logger.error(f"Error processing variant data: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             raise
     
     # Save processed data
-    print("[prepare_data] Saving processed data...")
+    logger.info("Saving processed data...")
     
     # Split data if requested
     if split_by and split_by in windows_df.columns:
-        for chrom, group in windows_df.groupby(split_by):
-            chrom_dir = output_dir / str(chrom)
-            chrom_dir.mkdir(exist_ok=True)
-            output_file = chrom_dir / "data.parquet"
+        for group_val, group in windows_df.groupby(split_by):
+            group_dir = output_dir / str(group_val)
+            group_dir.mkdir(exist_ok=True)
+            output_file = group_dir / "data.parquet"
             group.to_parquet(output_file, index=False)
-        print(f"[prepare_data] Saved data split by {split_by} to {output_dir}")
+        logger.info(f"Saved data split by {split_by} to {output_dir}")
     else:
         # Save as single file
         output_file = output_dir / "data.parquet"
         windows_df.to_parquet(output_file, index=False)
-        print(f"[prepare_data] Saved data to {output_file}")
+        logger.info(f"Saved data to {output_file}")
     
     # Save metadata
     metadata = {
@@ -444,12 +542,13 @@ def prepare_data(
         "input_dir": str(input_dir),
         "gtex_dir": str(gtex_dir) if gtex_dir else None,
         "variant_dir": str(variant_dir) if variant_dir else None,
+        "safety_limit": safety_limit
     }
     
     with open(output_dir / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
     
-    print(f"[prepare_data] Data preparation complete. Processed {len(windows_df)} windows.")
+    logger.info(f"Data preparation complete. Processed {len(windows_df)} windows.")
 
 
 if __name__ == "__main__":
