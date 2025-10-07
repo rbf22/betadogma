@@ -48,15 +48,23 @@ CONFIG = {
         }
     },
     "variants": {
-        "url": "https://42basepairs.com/download/web/ensembl/data_files/homo_sapiens/GRCh38/variation_genotype/ALL.chr22_GRCh38.genotypes.20170504.vcf.gz"
+        "url": "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/1000G_2504_high_coverage/working/20201028_3202_raw_GT_with_annot/20201028_CCDG_14151_B01_GRM_WGS_2020-08-05_chr22.recalibrated_variants.annotated.vcf.gz",
+        "index_url": "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/1000G_2504_high_coverage/working/20201028_3202_raw_GT_with_annot/20201028_CCDG_14151_B01_GRM_WGS_2020-08-05_chr22.recalibrated_variants.annotated.vcf.gz.tbi"
     }
 }
 
 class DataFetcher:
-    def __init__(self, output_dir: str = "data/raw", skip_existing: bool = False):
-        """Initialize the data fetcher with output directory and options."""
+    def __init__(self, output_dir: str = "data/raw", skip_existing: bool = False, force: bool = False):
+        """Initialize the data fetcher with output directory and options.
+        
+        Args:
+            output_dir: Directory to save downloaded files
+            skip_existing: If True, skip downloading files that already exist
+            force: If True, always re-download files even if they exist
+        """
         self.output_dir = Path(output_dir).resolve()
         self.skip_existing = skip_existing
+        self.force = force
         self.setup_directories()
         
     def setup_directories(self) -> None:
@@ -177,9 +185,12 @@ class DataFetcher:
         Returns:
             bool: True if download and verification succeeded, False otherwise
         """
-        # Check if file exists and verify checksum if it does
+        # Check if file exists and handle based on force/skip_existing flags
         if output_path.exists():
-            if self.skip_existing:
+            if self.force:
+                print(f"[FORCE] Re-downloading {output_path.name}")
+                output_path.unlink()
+            elif self.skip_existing:
                 print(f"✓ {description} already exists")
                 if not self.verify_checksum(output_path, expected_checksum):
                     print("  Warning: File exists but checksum verification failed")
@@ -391,43 +402,63 @@ def main():
         default="data/raw",
         help="Base directory to save downloaded files (default: data/raw)"
     )
-    parser.add_argument(
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
         "--skip-existing",
         action="store_true",
         help="Skip downloading files that already exist"
     )
+    group.add_argument(
+        "--force",
+        action="store_true",
+        help="Force re-download of all files, even if they exist"
+    )
     args = parser.parse_args()
-
-    fetcher = DataFetcher(output_dir=args.output_dir, skip_existing=args.skip_existing)
     
-    print("\nStarting data download...")
+    # Create data fetcher instance
+    fetcher = DataFetcher(
+        output_dir=args.output_dir,
+        skip_existing=args.skip_existing,
+        force=args.force
+    )
     
-    # Track success of each download step
-    success = True
+    # Print header
+    print("\n" + "="*80)
+    print(f"Starting data download to: {args.output_dir}")
+    if args.force:
+        print("FORCE MODE: All files will be re-downloaded")
+    elif args.skip_existing:
+        print("SKIP-EXISTING MODE: Existing files will be skipped")
+    print("="*80 + "\n")
     
-    # Run each download step and track success
-    download_steps = [
-        ("GENCODE", fetcher.download_gencode),
-        ("GTEx", fetcher.download_gtex),
-        ("Variants", fetcher.download_variants)
-    ]
-    
-    for name, download_func in download_steps:
-        print(f"\n=== {name} ===")
-        try:
-            download_func()
-            print(f"✓ {name} download completed")
-        except Exception as e:
-            print(f"✗ {name} download failed: {e}")
-            success = False
-    
-    if success:
-        print("\n✓ All downloads completed successfully!")
-    else:
-        print("\n⚠ Some downloads may have failed. Please check the logs above for details.")
+    try:
+        # Download data
+        print("\n" + "-"*60)
+        print("DOWNLOADING GENCODE ANNOTATIONS AND REFERENCE GENOME")
+        print("-"*60)
+        fetcher.download_gencode()
+        
+        print("\n" + "-"*60)
+        print("DOWNLOADING GTEX DATA")
+        print("-"*60)
+        fetcher.download_gtex()
+        
+        print("\n" + "-"*60)
+        print("DOWNLOADING EXAMPLE VARIANT DATA")
+        print("-"*60)
+        fetcher.download_variants()
+        
+        print("\n" + "="*80)
+        print("✓ ALL DOWNLOADS COMPLETED SUCCESSFULLY!")
+        print("="*80)
+    except Exception as e:
+        print("\n" + "!"*60)
+        print(f"ERROR: {str(e)}")
+        print("!"*60)
+        sys.exit(1)
     
     print(f"\nData has been saved to: {fetcher.output_dir}")
-    return 0 if success else 1
+    return 0
 
 if __name__ == "__main__":
     main()

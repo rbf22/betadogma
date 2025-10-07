@@ -352,8 +352,7 @@ def convert_gct_to_parquet(
         raise ValueError("No valid junctions found in the GCT file")
     
     # Apply two-read junction coverage filter
-    print(f"
-Applying two-read junction coverage criteria:")
+    print("\nApplying two-read junction coverage criteria:")
     print(f"  - ≥{min_count} reads per junction per sample")
     print(f"  - ≥{min_samples} samples with coverage per junction")
 
@@ -413,7 +412,6 @@ Applying two-read junction coverage criteria:")
 
 def process_junctions_input(junctions: Union[str, List[str]],
                           min_count: int = 5,
-    min_samples: int = 3,
                           min_samples: int = 3,
                           smoke: bool = False,
                           chroms: Optional[str] = None) -> List[str]:
@@ -819,9 +817,8 @@ def prepare_gtex(
     out: str,
     chroms: Optional[str] = None,
     min_count: int = 5,
-    min_samples: int = 3,
-    min_total: int = 20,
     min_samples: int = 5,
+    min_total: int = 20,
     smoke: bool = False
 ) -> None:
     """Prepare GTEx junction data with PSI calculations and gene annotations.
@@ -832,9 +829,9 @@ def prepare_gtex(
         out: Output directory
         chroms: Comma-separated list of chromosomes to include (None for all)
         min_count: Minimum reads per junction per sample (for two-read coverage)
-        min_samples: Minimum samples with ≥min_count reads for a junction to be included
+        min_samples: Minimum samples with ≥min_count reads for a junction to be included, 
+                   and minimum number of samples with coverage for gene summary
         min_total: Minimum total read count for donor/acceptor sites
-        min_samples: Minimum number of samples with coverage for gene summary
         smoke: If True, run in smoke test mode (process only a subset of data)
     """
     from tqdm import tqdm

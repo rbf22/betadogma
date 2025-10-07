@@ -26,7 +26,7 @@ gtex:
 variants:
   enabled: true
   kwargs:
-    vcf:           ../../data/variants/cohort.vcf.gz
+    vcf:           ../../data/raw/variants/ALL.chr22_GRCh38.genotypes.vcf.gz
     windows_glob:  ../../data/cache/gencode_v44_structural_base/*.parquet  # align variants to these windows
     out:           ../../data/cache/variants_aligned
     apply_alt:     true      # write ALT-applied sequences alongside channels
