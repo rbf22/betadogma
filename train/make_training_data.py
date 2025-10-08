@@ -7,10 +7,12 @@ Strict data builder for Betadogma.
 - Steps (all optional except aggregate):
     - betadogma.data.prepare_gencode   (optional)
     - betadogma.data.prepare_gtex      (optional)
-    - betadogma.data.prepare_variants  (optional)
+    - betadogma.data.prepare_variants  (optional - creates non-overlapping base windows)
+    - betadogma.data.create_overlapping_windows (optional - creates overlapping windows from base)
     - betadogma.data.prepare_data      (REQUIRED aggregation)
 """
 
+import logging
 import os
 import sys
 import argparse
@@ -19,6 +21,7 @@ import importlib
 import inspect
 import yaml
 import time
+from glob import glob
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -30,6 +33,45 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 
+def setup_logging(log_file: str = "make_training_data.log", debug: bool = False):
+    """
+    Setup logging to both file and console.
+    File is overwritten each time (mode='w').
+    """
+    # Remove any existing handlers
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # Set level
+    level = logging.DEBUG if debug else logging.INFO
+    root_logger.setLevel(level)
+    
+    # Create formatters
+    detailed_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    simple_formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    
+    # File handler (overwrite mode with 'w')
+    file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)  # Always log DEBUG to file
+    file_handler.setFormatter(detailed_formatter)
+    root_logger.addHandler(file_handler)
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(level)
+    console_handler.setFormatter(simple_formatter)
+    root_logger.addHandler(console_handler)
+    
+    return root_logger
+
+
 def load_yaml(path: Path) -> Dict[str, Any]:
     """Load a YAML file and return its contents as a dictionary."""
     with open(path, 'r') as f:
@@ -38,7 +80,12 @@ def load_yaml(path: Path) -> Dict[str, Any]:
 
 DEFAULT_CFG = TRAIN_DIR / "configs" / "data.base.yaml"
 
+
 def step_prepare_variants(cfg: Dict[str, Any], cfg_dir: Path) -> None:
+    """
+    Step 1: Create NON-OVERLAPPING base windows with variants.
+    These windows are abutting (stride = window) to avoid redundant work.
+    """
     section = cfg.get("variants", {})
     if not section or not section.get("enabled", False):
         print("[data] variants: skipped")
@@ -55,7 +102,7 @@ def step_prepare_variants(cfg: Dict[str, Any], cfg_dir: Path) -> None:
                 kwargs[key] = str(rp)
 
     # Ensure required arguments are present
-    required = ['vcf', 'windows_glob', 'out']
+    required = ['vcf', 'windows', 'out']
     missing = [arg for arg in required if arg not in kwargs]
     if missing:
         raise ValueError(f"Missing required arguments for prepare_variants: {', '.join(missing)}")
@@ -64,24 +111,76 @@ def step_prepare_variants(cfg: Dict[str, Any], cfg_dir: Path) -> None:
         # Import the module and call the function directly
         from betadogma.data.prepare_variants import prepare_variants
 
-        # Use a reasonable max_per_window value to downsample in this first step
-        variant_limit = kwargs.get('max_per_window', 64)  # Keep the original limit
-        print(f"[data] Running prepare_variants with max_per_window={variant_limit} (downsampling enabled)")
+        variant_limit = kwargs.get('max_per_window', 100)
+        print(f"[data] Running prepare_variants on NON-OVERLAPPING windows with max_per_window={variant_limit}")
         
         prepare_variants(
             vcf=kwargs['vcf'],
-            windows=kwargs['windows_glob'],
+            windows=kwargs['windows'],
             out=kwargs['out'],
             apply_alt=kwargs.get('apply_alt', True),
-            safety_limit=kwargs.get('safety_limit', 2000),  # Use reasonable limit for first step
-            max_per_window=variant_limit,  # Use reasonable limit for first step
-            shard_size=kwargs.get('shard_size', 50000)
+            max_per_window=variant_limit,
+            shard_size=kwargs.get('shard_size', 50000),
+            seed=kwargs.get('seed', 42),
+            debug=kwargs.get('debug', False)
         )
+        
+        print(f"[data] Created base variant windows in: {kwargs['out']}")
+        
     except Exception as e:
         print(f"[data] Error in prepare_variants: {e}")
         raise
 
+
+def step_create_overlapping_windows(cfg: Dict[str, Any], cfg_dir: Path) -> None:
+    """
+    Step 2: Create OVERLAPPING windows from the non-overlapping base windows.
+    This reuses variants from base windows, only checking for conflicts at window boundaries.
+    """
+    section = cfg.get("overlapping_windows", {})
+    if not section or not section.get("enabled", False):
+        print("[data] overlapping_windows: skipped")
+        return
+
+    kwargs = dict(section.get("kwargs") or {})
+
+    # Resolve paths
+    for key, value in kwargs.items():
+        if isinstance(value, str) and (value.endswith('.parquet') or '/' in value):
+            rp = resolve_path(value, cfg_dir)
+            if rp is not None:
+                kwargs[key] = str(rp)
+
+    required = ['base_windows', 'out']
+    missing = [arg for arg in required if arg not in kwargs]
+    if missing:
+        raise ValueError(f"Missing required arguments for overlapping_windows: {', '.join(missing)}")
+
+    try:
+        from betadogma.data.create_overlapping_windows import create_overlapping_windows
+
+        stride = kwargs.get('stride', 65536)
+        print(f"[data] Creating overlapping windows with stride={stride}")
+        
+        create_overlapping_windows(
+            base_windows_dir=kwargs['base_windows'],
+            output_dir=kwargs['out'],
+            stride=stride,
+            seed=kwargs.get('seed', 42),
+            debug=kwargs.get('debug', False)
+        )
+        
+        print(f"[data] Created overlapping windows in: {kwargs['out']}")
+        
+    except Exception as e:
+        print(f"[data] Error in create_overlapping_windows: {e}")
+        raise
+
+
 def step_prepare_data(cfg: Dict[str, Any], cfg_dir: Path) -> None:
+    """
+    Step 3: Aggregate all data (gencode, gtex, variants) into final training format.
+    """
     section = cfg.get("aggregate", {})
     if not section or not section.get("enabled", False):
         print("[data] aggregate: skipped")
@@ -107,8 +206,7 @@ def step_prepare_data(cfg: Dict[str, Any], cfg_dir: Path) -> None:
         # Import the module and call the function directly
         from betadogma.data.prepare_data import prepare_data
 
-        # Set to 0 (unlimited) to ensure no further downsampling happens
-        print(f"[data] Running prepare_data with max_variants_per_window=0 (no further downsampling)")
+        print(f"[data] Running prepare_data (final aggregation)")
         
         prepare_data(
             input_dir=kwargs['input_dir'],
@@ -118,12 +216,13 @@ def step_prepare_data(cfg: Dict[str, Any], cfg_dir: Path) -> None:
             write_index=kwargs.get('write_index', True),
             split_by=kwargs.get('split_by'),
             keep_columns=kwargs.get('keep_columns'),
-            max_variants_per_window=0  # Set to 0 (unlimited) to preserve all variants from first step
+            max_variants_per_window=kwargs.get('max_variants_per_window', 0)
         )
 
     except Exception as e:
         print(f"[data] Error in prepare_data: {e}")
         raise
+
 
 def resolve_path(p: Optional[str], base: Path) -> Optional[Path]:
     if p in (None, "", False):
@@ -131,11 +230,13 @@ def resolve_path(p: Optional[str], base: Path) -> Optional[Path]:
     pp = Path(p)
     return pp if pp.is_absolute() else (base / pp)
 
+
 def run_module_cli(module: str, args: List[str]) -> None:
     """Run a module as a CLI: python -m module [--k v ...]"""
     cmd = [sys.executable, "-m", module] + args
     print(f"[data] CLI: {' '.join(cmd)}")
     subprocess.check_call(cmd)
+
 
 def call_module_entrypoint(module: str, kwargs: Dict[str, Any]) -> None:
     """
@@ -156,12 +257,15 @@ def call_module_entrypoint(module: str, kwargs: Dict[str, Any]) -> None:
             return fn(**filt)  # type: ignore
     raise AttributeError(f"No callable entrypoint (main/run/prepare/build) in {module}.")
 
+
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
+
 
 def expect_files(paths: List[Path]) -> Tuple[bool, List[Path]]:
     missing = [p for p in paths if not p.exists()]
     return (len(missing) == 0, missing)
+
 
 def expect_globs(patterns: List[Union[str, Path]]) -> Tuple[bool, List[str]]:
     """Return (ok, missing_patterns). ok=True if every pattern matched ≥1 file."""
@@ -173,7 +277,11 @@ def expect_globs(patterns: List[Union[str, Path]]) -> Tuple[bool, List[str]]:
             miss.append(str(pat))
     return (len(miss) == 0, miss)
 
+
 def step_prepare_gencode(cfg: Dict[str, Any], cfg_dir: Path) -> None:
+    """
+    Step 0a: Prepare gencode windows (NON-OVERLAPPING for initial processing).
+    """
     section = cfg.get("gencode", {})
     if not section or not section.get("enabled", False):
         print("[data] gencode: skipped")
@@ -205,15 +313,18 @@ def step_prepare_gencode(cfg: Dict[str, Any], cfg_dir: Path) -> None:
         # Import the module and call the function directly
         from betadogma.data.prepare_gencode import prepare_gencode
 
-        print(f"[data] Running prepare_gencode with kwargs: {kwargs}")
+        # For base windows, use stride = window (non-overlapping)
+        window = kwargs.get('window', 131072)
+        stride = window  # Non-overlapping!
+        
+        print(f"[data] Running prepare_gencode with window={window}, stride={stride} (non-overlapping)")
 
-        # Map the kwargs to the function parameters
         prepare_gencode(
             fasta_path=kwargs.get('fasta'),
             gtf_path=kwargs['gtf'],
             out_dir=kwargs['out'],
-            window=kwargs.get('window', 131072),
-            stride=kwargs.get('stride', 65536),
+            window=window,
+            stride=stride,
             bin_size=kwargs.get('bin_size', 1),
             chroms=kwargs.get('chroms', ''),
             max_shard_bases=kwargs.get('max_shard_bases', 50000000)
@@ -222,7 +333,11 @@ def step_prepare_gencode(cfg: Dict[str, Any], cfg_dir: Path) -> None:
         print(f"[data] Error in prepare_gencode: {e}")
         raise
 
+
 def step_prepare_gtex(cfg: Dict[str, Any], cfg_dir: Path) -> None:
+    """
+    Step 0b: Prepare GTEx data.
+    """
     section = cfg.get("gtex", {})
     if not section or not section.get("enabled", False):
         print("[data] gtex: skipped")
@@ -248,9 +363,8 @@ def step_prepare_gtex(cfg: Dict[str, Any], cfg_dir: Path) -> None:
         # Import the module and call the function directly
         from betadogma.data.prepare_gtex import prepare_gtex
 
-        print(f"[data] Running prepare_gtex with kwargs: {kwargs}")
+        print(f"[data] Running prepare_gtex")
 
-        # Map the kwargs to the function parameters
         prepare_gtex(
             junctions=kwargs['junctions'],
             gtf=kwargs['gtf'],
@@ -265,6 +379,7 @@ def step_prepare_gtex(cfg: Dict[str, Any], cfg_dir: Path) -> None:
         print(f"[data] Error in prepare_gtex: {e}")
         raise
 
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     ap = argparse.ArgumentParser(description="Prepare training data for Betadogma")
@@ -276,7 +391,7 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument(
         "--from-step",
-        choices=["gencode", "gtex", "variants", "aggregate"],
+        choices=["gencode", "gtex", "variants", "overlapping", "aggregate"],
         help="Start from this step (inclusive)",
     )
     ap.add_argument(
@@ -290,12 +405,25 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Force re-run all steps, ignoring checkpoints",
     )
+    ap.add_argument(
+        "--log-file",
+        type=str,
+        default="make_training_data.log",
+        help="Log file path (will be overwritten)"
+    )
+    ap.add_argument(
+        "--debug",
+        action="store_true",
+        help="Force debugging",
+    )
     return ap.parse_args()
+
 
 def save_checkpoint(step_name: str, checkpoint_dir: Path) -> None:
     """Save a checkpoint file for the given step."""
     checkpoint_dir.mkdir(exist_ok=True, parents=True)
     (checkpoint_dir / f"{step_name}.done").touch()
+
 
 def should_skip_step(step_name: str, checkpoint_dir: Path, from_step: Optional[str], force: bool = False) -> bool:
     """Check if we should skip this step based on checkpoints and --from-step.
@@ -307,7 +435,7 @@ def should_skip_step(step_name: str, checkpoint_dir: Path, from_step: Optional[s
         force: If True and step is at or after from_step, force it to run
     """
     # Define the order of steps
-    step_order = ["gencode", "gtex", "variants", "aggregate"]
+    step_order = ["gencode", "gtex", "variants", "overlapping", "aggregate"]
     
     # If --from-step is specified, check if we should run this step
     if from_step:
@@ -341,19 +469,39 @@ def should_skip_step(step_name: str, checkpoint_dir: Path, from_step: Optional[s
         
     return False
 
+
 def main() -> None:
     args = parse_args()
+    
+    # Setup logging FIRST, before any other code runs
+    logger = setup_logging(log_file=args.log_file, debug=args.debug)
+    
+    # Load config
     cfg = load_yaml(args.config.resolve())
     cfg_dir = args.config.parent
-    
+
     # Ensure checkpoint directory exists
     args.checkpoint_dir.mkdir(exist_ok=True, parents=True)
     
+    # Log startup info
+    logger.info("="*80)
+    logger.info("Starting BetaDogma Training Data Preparation")
+    logger.info(f"Config: {args.config}")
+    logger.info(f"Debug: {args.debug}")
+    logger.info(f"Log file: {args.log_file}")
+    logger.info(f"Checkpoint dir: {args.checkpoint_dir}")
+    if args.from_step:
+        logger.info(f"Starting from step: {args.from_step}")
+    if args.force:
+        logger.info("Force mode: ON")
+    logger.info("="*80)
+
     # Run each step in order
     steps = [
         ("gencode", step_prepare_gencode),
         ("gtex", step_prepare_gtex),
         ("variants", step_prepare_variants),
+        ("overlapping", step_create_overlapping_windows),
         ("aggregate", step_prepare_data),
     ]
     
@@ -383,9 +531,15 @@ def main() -> None:
             print(f"[data] COMPLETED STEP: {step_name.upper()} in {elapsed:.1f} seconds")
             print("-"*60 + "\n")
         except Exception as e:
+            logger.exception(f"ERROR in step {step_name}")
             print(f"[data] ERROR in step {step_name}: {e}")
             print("-"*60 + "\n")
             raise
+    
+    logger.info("="*80)
+    logger.info("Finished BetaDogma Training Data Preparation")
+    logger.info("="*80)
+
 
 if __name__ == "__main__":
     main()

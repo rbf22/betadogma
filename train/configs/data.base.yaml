@@ -26,13 +26,20 @@ gtex:
 variants:
   enabled: true
   kwargs:
-    vcf:           ../../data/raw/variants/ALL.chr22_GRCh38.genotypes.vcf.gz
-    windows_glob:  ../../data/cache/gencode_v44_structural_base/*.parquet  # align variants to these windows
-    out:           ../../data/cache/variants_aligned
-    apply_alt:     true      # write ALT-applied sequences alongside channels
-    max_per_window: 64       # safety cap per window
-    safety_limit:  100       # safety limit for variants per window (prevents memory issues, 0 = unlimited)
-    shard_size:     50000    # rows per output shard (tune for I/O)
+    vcf: "../../data/raw/variants/ALL.chr22_GRCh38.genotypes.vcf.gz"
+    windows: "../../data/cache/gencode_v44_structural_base/*.parquet"  # Non-overlapping!
+    out: "../../data/cache/variants_base"
+    max_per_window: 100
+    shard_size: 1000  # Small shards for memory management
+    debug: true
+
+
+overlapping_windows:
+  enabled: true
+  kwargs:
+    base_windows: "../../data/cache/variants_base"
+    out: "../../data/cache/variants_overlapping"
+    stride: 65536
 
 aggregate:
   enabled: true
@@ -41,7 +48,7 @@ aggregate:
     input_dir:   ../../data/cache/gencode_v44_structural_base
     output_dir:  ../../data/processed/structural
     gtex_dir:    ../../data/cache/gtex_psi
-    variant_dir: ../../data/cache/variants_aligned
+    variant_dir: ../../data/cache/variants_overlapping
     max_per_window: 0  # No downsampling in second step
     # Add any extra switches your aggregator understands, e.g.:
     # write_index: true

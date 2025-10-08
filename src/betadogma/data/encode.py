@@ -1,8 +1,11 @@
-# src/betadogma/data/encode.py
 """Variant encoding utilities for BetaDogma."""
 
+import logging
 from typing import List, Tuple, Dict, Any, Optional
 import numpy as np
+
+# Initialize logger
+logger = logging.getLogger(__name__)
 
 def encode_variant(ref_allele: str, alt_allele: str) -> Dict[str, Any]:
     """
@@ -159,6 +162,11 @@ def apply_variants_to_sequence(sequence: str, variants: List[Dict[str, Any]],
     # Track variant statistics
     mismatch_counts = {"SNP": 0, "INS": 0, "DEL": 0, "TOTAL": 0}
     
+    # Track insertion-specific stats
+    ins_attempted = 0
+    ins_rescued = 0
+    ins_failed = 0
+    
     for idx, v in enumerate(variants, 1):
         pos_1 = v['pos']  # 1-based position
         pos_0 = pos_1 - 1  # 0-based position
@@ -172,9 +180,17 @@ def apply_variants_to_sequence(sequence: str, variants: List[Dict[str, Any]],
             var_type = "DEL"
         elif len(ref) < len(alt):
             var_type = "INS"
+            ins_attempted += 1
+        
+        # Debug log for insertion variants
+        if var_type == "INS":
+            logger.debug(f"Processing insertion variant at {pos_1}: ref='{ref}' alt='{alt}'")
         
         # Check if position is within sequence bounds
         if pos_0 >= seq_len:
+            if var_type == "INS":
+                ins_failed += 1
+                logger.debug(f"Insertion at {pos_1} failed: position outside sequence bounds")
             raise VariantError(
                 f"Variant position {pos_1} is outside the reference sequence (length: {seq_len})",
                 variant=v
@@ -184,6 +200,9 @@ def apply_variants_to_sequence(sequence: str, variants: List[Dict[str, Any]],
         if pos_0 < i:
             # Calculate overlap details
             overlap = i - pos_0
+            if var_type == "INS":
+                ins_failed += 1
+                logger.debug(f"Insertion at {pos_1} failed: overlaps with previous variant")
             raise VariantError(
                 f"Variant at position {pos_1} overlaps with previous variant by {overlap} base(s)",
                 variant=v
@@ -210,32 +229,66 @@ def apply_variants_to_sequence(sequence: str, variants: List[Dict[str, Any]],
                 # Show the expected and actual reference sequence
                 pointer = ' ' * (pos_0 - context_start) + '^' * len(ref)
                 
-                raise VariantError(
+                error_msg = (
                     f"Reference allele mismatch at position {pos_1} ({var_type}):\n"
                     f"  Expected: {ref}\n"
                     f"  Found:    {ref_in_sequence}\n"
                     f"  Context:  {context}\n"
-                    f"            {pointer}",
-                    variant=v
+                    f"            {pointer}"
                 )
+                
+                if var_type == "INS":
+                    ins_failed += 1
+                    logger.debug(f"Insertion at {pos_1} failed: {error_msg}")
+                
+                raise VariantError(error_msg, variant=v)
             else:
                 # In non-strict mode, handle mismatches more gracefully
                 if var_type == "INS":
-                    # For insertions with mismatched reference, try to preserve insertion
-                    # as long as the first base matches (or we can make it match)
-                    if len(ref) > 0 and len(ref_in_sequence) > 0:
-                        if ref[0] == ref_in_sequence[0]:
-                            # First base matches, apply insertion
-                            pass
-                        else:
-                            # Mismatch, but we'll use actual reference base and insert after it
-                            if len(alt) > 0:
-                                # Replace first alt base with actual ref base
-                                alt = ref_in_sequence[0] + alt[1:] if len(alt) > 1 else ref_in_sequence[0]
-                    ref = ref_in_sequence  # Use actual reference
+                    # IMPROVED INSERTION HANDLING
+                    logger.debug(f"Fixing reference mismatch for insertion at {pos_1}: expected '{ref}', found '{ref_in_sequence}'")
+                    
+                    # The key concept for insertions is to preserve the inserted sequence
+                    # while matching the correct reference base
+                    
+                    original_alt = alt
+                    
+                    # Case 1: Standard VCF format where first base of ALT matches REF
+                    if len(ref) == 1 and len(alt) > len(ref) and alt.startswith(ref):
+                        # Replace the reference base with the actual one from the sequence
+                        alt = ref_in_sequence + alt[len(ref):]
+                        logger.debug(f"  Fixed by replacing ref base: new alt='{alt}'")
+                        ins_rescued += 1
+                    
+                    # Case 2: Non-standard format where we need to determine what's being inserted
+                    elif len(ref) >= 1 and len(alt) > len(ref):
+                        # Extract the inserted sequence (everything in alt that's not in ref)
+                        inserted_seq = alt[len(ref):] if alt.startswith(ref) else alt
+                        
+                        # Create new alt that uses the actual reference and the insertion
+                        alt = ref_in_sequence + inserted_seq
+                        logger.debug(f"  Fixed by extracting insertion: new alt='{alt}'")
+                        ins_rescued += 1
+                    
+                    # Case 3: If all else fails, try simple approach
+                    else:
+                        # Just use what we have but log it
+                        logger.debug(f"  Using best-effort insertion fix: ref='{ref_in_sequence}', alt='{alt}'")
+                        ins_rescued += 1
+                    
+                    # Use the actual reference sequence
+                    ref = ref_in_sequence
+                    
+                    # Log the outcome
+                    logger.debug(f"  Final: ref='{ref}', alt='{alt}' (original alt was '{original_alt}')")
+                    
                 elif var_type == "DEL":
                     # For deletions, use actual reference sequence
                     ref = ref_in_sequence
+        elif var_type == "INS":
+            # Reference matched correctly for insertion
+            logger.debug(f"Insertion at {pos_1} reference matches correctly")
+            ins_rescued += 1
         
         # Apply the variant
         result.append(alt)
@@ -244,12 +297,17 @@ def apply_variants_to_sequence(sequence: str, variants: List[Dict[str, Any]],
     # Add remaining sequence
     result.append(sequence[i:])
     
-    # Print info about mismatches if any were encountered in non-strict mode
+    # Log info about mismatches if any were encountered in non-strict mode
     if not strict_ref_check and mismatch_counts["TOTAL"] > 0:
-        print(f"WARNING: Applied variants with {mismatch_counts['TOTAL']} reference mismatches "
+        logger.warning(f"Applied variants with {mismatch_counts['TOTAL']} reference mismatches "
               f"(SNP: {mismatch_counts['SNP']}, "
               f"INS: {mismatch_counts['INS']}, "
               f"DEL: {mismatch_counts['DEL']})")
+    
+    # Log insertion-specific stats
+    if ins_attempted > 0:
+        logger.debug(f"Insertion processing: {ins_attempted} attempted, {ins_rescued} rescued, "
+                  f"{ins_failed} failed, {ins_attempted - ins_rescued - ins_failed} unmodified")
     
     return ''.join(result)
 
@@ -306,6 +364,9 @@ def build_variant_channels(
         'any': [0.0] * seq_len
     }
     
+    # Track variant statistics by type
+    variant_counts = {"SNP": 0, "INS": 0, "DEL": 0}
+    
     for pos, ref, alt in variants:
         # Convert to window coordinates
         pos_in_window = pos - 1 - window_start  # Convert to 0-based and adjust for window
@@ -313,21 +374,42 @@ def build_variant_channels(
         # Skip if variant is outside the window
         if pos_in_window < 0 or pos_in_window >= seq_len:
             continue
+        
+        # DEBUG: Check what we're getting
+        if len(ref) < len(alt):
+            logger.debug(f"DEBUG: Potential INS at pos {pos}: ref='{ref}' alt='{alt}' len(ref)={len(ref)} len(alt)={len(alt)}")
             
         # Get variant type
         var_info = encode_variant(ref, alt)
         
+        # DEBUG: Check what encode_variant returns
+        if len(ref) < len(alt):
+            logger.debug(f"DEBUG: encode_variant returned: {var_info}")
+        
         # Update channels based on variant type
         if var_info['is_snp']:
             channels['snp'][pos_in_window] = 1.0
+            variant_counts["SNP"] += 1
         elif var_info['is_ins']:
             channels['ins'][pos_in_window] = 1.0
+            variant_counts["INS"] += 1
+            logger.debug(f"DEBUG: Marked INS at pos_in_window={pos_in_window}")
         elif var_info['is_del']:
             # For deletions, mark all deleted bases
             for i in range(pos_in_window, min(pos_in_window + len(ref), seq_len)):
                 channels['del_'][i] = 1.0
+            variant_counts["DEL"] += 1
+        else:
+            logger.debug(f"Variant type misclassified: {var_info}")
         
         # Update 'any' channel for all variant types
         channels['any'][pos_in_window] = 1.0
+    
+    # Log variant distribution in this window
+    if variant_counts['INS'] > 0:
+        logger.debug(f"Variant channel distribution: "
+                   f"SNP={variant_counts['SNP']}, "
+                   f"INS={variant_counts['INS']}, "
+                   f"DEL={variant_counts['DEL']}")
     
     return channels

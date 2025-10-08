@@ -32,15 +32,20 @@ def parse_args():
     return ap.parse_args()
 
 
-def setup_logging(debug=False):
+def setup_logging(debug=None):
     """Configure logging based on debug flag"""
-    level = logging.DEBUG if debug else logging.INFO
+    if debug is None:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
     logging.basicConfig(
         level=level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     return logging.getLogger(__name__)
 
+
+setup_logging(debug=True)
 
 def main():
     # This simply forwards to prepare_gencode with the same signature.
@@ -73,10 +78,46 @@ def load_parquet_files(glob_pattern: str) -> pd.DataFrame:
     if not files:
         raise FileNotFoundError(f"No files found matching: {glob_pattern}")
     
+    # Add inspection for the first few files
+    inspect_count = min(3, len(files))
+    logger.info(f"Found {len(files)} parquet files matching pattern")
+    
     dfs = []
-    for f in files:
+    total_variants = 0
+    variant_type_counts = {"SNP": 0, "DEL": 0, "INS": 0, "Other": 0}
+    
+    for i, f in enumerate(files):
         try:
             df = pd.read_parquet(f)
+            total_variants += len(df)
+            
+            # Debug inspection of first few files
+            if i < inspect_count:
+                logger.info(f"Direct file inspection of {os.path.basename(f)}:")
+                logger.info(f"  File contains {len(df)} rows")
+                logger.info(f"  Column names: {df.columns.tolist()}")
+                
+                if 'var_type' in df.columns:
+                    type_counts = dict(df['var_type'].value_counts())
+                    logger.info(f"  Variant types in file: {type_counts}")
+                    
+                    # Track overall counts
+                    for vtype, count in type_counts.items():
+                        if vtype in variant_type_counts:
+                            variant_type_counts[vtype] += count
+                        else:
+                            variant_type_counts["Other"] += count
+                            
+                    # Look for any insertion-like variants
+                    for possible_ins in ['INS', 'Ins', 'ins', 'insertion']:
+                        if possible_ins in df['var_type'].values:
+                            ins_examples = df[df['var_type'] == possible_ins].head(2)
+                            logger.info(f"  Found {len(df[df['var_type'] == possible_ins])} variants with type '{possible_ins}'")
+                            if not ins_examples.empty:
+                                logger.info("  Example variants:")
+                                for _, row in ins_examples.iterrows():
+                                    logger.info(f"    - {row['chrom']}:{row.get('start', 'N/A')} - {row.get('variant_spec', 'N/A')}")
+            
             dfs.append(df)
         except Exception as e:
             logger.error(f"Error reading {f}: {e}")
@@ -85,8 +126,11 @@ def load_parquet_files(glob_pattern: str) -> pd.DataFrame:
     if not dfs:
         raise ValueError(f"No valid parquet files found in {glob_pattern}")
     
+    # Log overall statistics
+    logger.info(f"Loaded {total_variants} total variants from {len(files)} files")
+    logger.info(f"Variant type distribution across all inspected files: {variant_type_counts}")
+    
     return pd.concat(dfs, ignore_index=True)
-
 
 def prepare_variants_wrapper(
     vcf_path: str, 
@@ -315,14 +359,14 @@ def prepare_data(
                             # Specifically check for insertions
                             ins_count = (df['var_type'] == 'INS').sum()
                             if ins_count > 0:
-                                logger.debug(f"Found {ins_count} insertions in {f}")
+                                logger.info(f"Found {ins_count} insertions in {f}")
                             
                             # Debug: Show some example insertions if any exist
                             if ins_count > 0 and logger.isEnabledFor(logging.DEBUG):
                                 ins_examples = df[df['var_type'] == 'INS'].head(3)
-                                logger.debug(f"Insertion examples from {f}:")
+                                logger.info(f"Insertion examples from {f}:")
                                 for _, row in ins_examples.iterrows():
-                                    logger.debug(f"  - {row['chrom']}:{row['start']} - {row['variant_spec']}")
+                                    logger.info(f"  - {row['chrom']}:{row['start']} - {row['variant_spec']}")
                             
                         # Create a unique identifier for each variant
                         df['variant_id'] = df['chrom'] + ':' + df['start'].astype(str) + ':' + df['variant_spec']
@@ -336,7 +380,10 @@ def prepare_data(
                             # Store variant type if available
                             if 'var_type' in row:
                                 variant_types[variant_id] = row['var_type']
-                                
+                                # Debug: Track insertions specifically
+                                if row['var_type'] == 'INS':
+                                    logger.debug(f"Recording insertion variant: {variant_id}")
+                                                            
                             # Debug: Check for duplicate variants
                             if variant_id in seen_variants:
                                 duplicate_count += 1
@@ -401,6 +448,9 @@ def prepare_data(
                     if variant_id not in variant_counts[window_key]['total']:
                         variant_counts[window_key]['total'].add(variant_id)
                         variant_counts[window_key]['types'][var_type] += 1
+                        # Debug: Track insertion assignments
+                        if var_type == 'INS':
+                            logger.debug(f"Assigned insertion {variant_id} to window {window_key}")
             
             if windows_exceeding_safety:
                 total_exceeded = len(windows_exceeding_safety)
@@ -426,6 +476,10 @@ def prepare_data(
                 # Update global type totals
                 for t, c in type_counts.items():
                     type_totals[t] += c
+                    # Debug: Track insertion totals
+                    if t == 'INS':
+                        logger.debug(f"Added {c} INS variants to type_totals from window {(chrom, start, end)}")
+
                 
                 variant_stats.append({
                     'chrom': chrom,
@@ -459,6 +513,12 @@ def prepare_data(
                     logger.info(f"  - 95th percentile: {percentiles[4]:.1f}")
                     logger.info(f"  - Max variants per window: {max(counts)}")
                     logger.info(f"  - Mean variants per window: {sum(counts)/len(counts):.1f}")
+                
+                # Debug: Print all keys in type_totals before reporting
+                logger.debug(f"All variant types in type_totals: {list(type_totals.keys())}")
+                for possible_ins_key in ['INS', 'Ins', 'ins', 'insertion', 'INSERT']:
+                    if possible_ins_key in type_totals:
+                        logger.debug(f"Found {type_totals[possible_ins_key]} insertion variants with key '{possible_ins_key}'")
                 
                 # Print variant type distribution
                 total_variants = sum(counts)
