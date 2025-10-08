@@ -2,12 +2,13 @@ seed: 42
 task: structural
 
 data:
-  train_parquet_glob: data/cache/gencode_v44_structural_base/shard_*.parquet
-  val_parquet_glob:   data/cache/gencode_v44_structural_base/shard_*.parquet
+  train_parquet_glob: ../../data/cache/gencode_v44_structural_base/shard_*.parquet
+  val_parquet_glob:   ../../data/cache/gencode_v44_structural_base/shard_*.parquet
   batch_size: 2
   num_workers: 2
 
 model:
+  freeze_encoder: true  # Set to false if you want to fine-tune the encoder
   encoder:
     model_id: InstaDeepAI/nucleotide-transformer-500m-human-ref
     hidden_size: 1280

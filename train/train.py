@@ -219,8 +219,19 @@ class LitStructural(pl.LightningModule):
 
         self.cfg = model_cfg
         d_in = int(model_cfg["encoder"]["hidden_size"])
+        
+        # Keep encoder on CPU to avoid MPS device issues
         self.encoder = NTEncoder(model_id=model_cfg["encoder"].get("model_id") or
                                  "InstaDeepAI/nucleotide-transformer-500m-human-ref")
+        
+        # Ensure encoder stays on CPU
+        if hasattr(self.encoder, 'model'):
+            self.encoder.model = self.encoder.model.cpu()
+            for param in self.encoder.model.parameters():
+                param.requires_grad = False
+            self.encoder.model.eval()
+            print("[INFO] Encoder kept on CPU and frozen")
+        
         self.model = BetaDogmaModel(d_in=d_in, config=model_cfg)
 
         pos_w = torch.tensor(model_cfg["loss"]["pos_weight"])
@@ -229,6 +240,35 @@ class LitStructural(pl.LightningModule):
         self.weight_decay = float(weight_decay)
         self.save_hyperparameters({"lr": self.lr, "weight_decay": self.weight_decay})
 
+    def _get_embeddings(self, seqs):
+        """Extract embeddings tensor from encoder output (encoder runs on CPU)."""
+        # Force encoder to run on CPU
+        with torch.no_grad():
+            encoder_output = self.encoder.forward(seqs)
+        
+        # Handle different return types
+        if isinstance(encoder_output, torch.Tensor):
+            emb = encoder_output
+        elif isinstance(encoder_output, dict):
+            # Try common keys in order of preference
+            if "embeddings" in encoder_output:
+                emb = encoder_output["embeddings"]
+            elif "last_hidden_state" in encoder_output:
+                emb = encoder_output["last_hidden_state"]
+            elif "hidden_states" in encoder_output:
+                emb = encoder_output["hidden_states"]
+            else:
+                raise KeyError(f"Encoder returned dict with unexpected keys: {encoder_output.keys()}")
+        elif hasattr(encoder_output, "last_hidden_state"):
+            emb = encoder_output.last_hidden_state
+        elif hasattr(encoder_output, "embeddings"):
+            emb = encoder_output.embeddings
+        else:
+            raise TypeError(f"Unexpected encoder output type: {type(encoder_output)}")
+        
+        # Move embeddings from CPU to training device (MPS/GPU)
+        return emb.to(self.device)
+
     def _compute_loss(self, outputs, batch):
         # shapes: outputs['splice']['donor']: [B, L, 1] ; labels: [B, L]
         d_logits = outputs["splice"]["donor"].squeeze(-1)
@@ -236,10 +276,10 @@ class LitStructural(pl.LightningModule):
         t_logits = outputs["tss"]["tss"].squeeze(-1)
         p_logits = outputs["polya"]["polya"].squeeze(-1)
 
-        donor = batch["donor"].to(d_logits.device)
-        acceptor = batch["acceptor"].to(d_logits.device)
-        tss = batch["tss"].to(d_logits.device)
-        polya = batch["polya"].to(d_logits.device)
+        donor = batch["donor"].to(self.device)
+        acceptor = batch["acceptor"].to(self.device)
+        tss = batch["tss"].to(self.device)
+        polya = batch["polya"].to(self.device)
 
         # align by min length
         def cut(x, y): 
@@ -267,8 +307,9 @@ class LitStructural(pl.LightningModule):
         return total, logs
 
     def training_step(self, batch, _):
-        with torch.no_grad():
-            emb = self.encoder.forward(batch["seqs"])   # [B, L, D]
+        # Compute embeddings on CPU, then move to device
+        emb = self._get_embeddings(batch["seqs"])
+        
         outs = self.model(embeddings=emb)
         loss, logs = self._compute_loss(outs, batch)
         self.log_dict({f"train/{k}": v for k, v in logs.items()},
@@ -276,8 +317,7 @@ class LitStructural(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, _):
-        with torch.no_grad():
-            emb = self.encoder.forward(batch["seqs"])
+        emb = self._get_embeddings(batch["seqs"])
         outs = self.model(embeddings=emb)
         loss, logs = self._compute_loss(outs, batch)
         self.log("val/loss", loss, on_epoch=True, prog_bar=True, batch_size=len(batch["seqs"]))
@@ -285,6 +325,7 @@ class LitStructural(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
+        # Only optimize the BetaDogma model parameters (not the encoder)
         return torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
 # DataModule: Structural
@@ -295,6 +336,9 @@ class StructuralDataModule(pl.LightningDataModule):
         self.cfg_dir = cfg_dir
         self.pin_memory = (torch.cuda.is_available() if dcfg.get("pin_memory", "auto") == "auto"
                            else bool(dcfg.get("pin_memory")))
+        self.num_workers = int(dcfg.get("num_workers", 2))
+        # Enable persistent workers if using multiple workers
+        self.persistent_workers = self.num_workers > 0
 
     def _resolve_glob(self, pat: str) -> List[Path]:
         from glob import glob
@@ -308,22 +352,59 @@ class StructuralDataModule(pl.LightningDataModule):
         val_glob   = self.cfg.get("val_parquet_glob")
         if not train_glob or not val_glob:
             raise ValueError("For task=structural you must set data.train_parquet_glob and data.val_parquet_glob.")
+        
+        print(f"[DEBUG] Config dir: {self.cfg_dir}")
+        print(f"[DEBUG] Train glob pattern (raw): {train_glob}")
+        print(f"[DEBUG] Val glob pattern (raw): {val_glob}")
+        
         train_paths = self._resolve_glob(train_glob)
         val_paths   = self._resolve_glob(val_glob)
+        
+        print(f"[DEBUG] Train paths found: {len(train_paths)}")
+        if train_paths:
+            print(f"[DEBUG] First train path: {train_paths[0]}")
+        print(f"[DEBUG] Val paths found: {len(val_paths)}")
+        if val_paths:
+            print(f"[DEBUG] First val path: {val_paths[0]}")
+        
         if not train_paths or not val_paths:
-            raise FileNotFoundError("No Parquet shards matched train/val globs.")
+            raise FileNotFoundError(
+                f"No Parquet shards matched train/val globs.\n"
+                f"  Config dir: {self.cfg_dir}\n"
+                f"  Train glob: {train_glob} -> {len(train_paths)} files\n"
+                f"  Val glob: {val_glob} -> {len(val_paths)} files\n"
+                f"Check that:\n"
+                f"  1. Your YAML has data.train_parquet_glob and data.val_parquet_glob set\n"
+                f"  2. The glob patterns are correct (use wildcards like *.parquet)\n"
+                f"  3. The parquet files exist at those locations"
+            )
+        
         self.train_ds = StructuralParquetDataset(train_paths)
         self.val_ds   = StructuralParquetDataset(val_paths)
 
     def train_dataloader(self):
-        return DataLoader(self.train_ds, batch_size=int(self.cfg.get("batch_size", 2)), shuffle=True,
-                          num_workers=int(self.cfg.get("num_workers", 2)), pin_memory=self.pin_memory,
-                          drop_last=True, collate_fn=structural_collate)
+        return DataLoader(
+            self.train_ds,
+            batch_size=int(self.cfg.get("batch_size", 2)),
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            drop_last=True,
+            collate_fn=structural_collate,
+            persistent_workers=self.persistent_workers  # Added
+        )
 
     def val_dataloader(self):
-        return DataLoader(self.val_ds, batch_size=int(self.cfg.get("batch_size", 2)), shuffle=False,
-                          num_workers=int(self.cfg.get("num_workers", 2)), pin_memory=self.pin_memory,
-                          collate_fn=structural_collate)
+        return DataLoader(
+            self.val_ds,
+            batch_size=int(self.cfg.get("batch_size", 2)),
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            collate_fn=structural_collate,
+            persistent_workers=self.persistent_workers  # Added
+        )
+
 
 # ---------- Helpers ----------
 def _maybe_load_yaml_or_dict(value: Union[Dict[str, Any], str, Path], cfg_dir: Path) -> Dict[str, Any]:
@@ -431,11 +512,20 @@ def build_trainer(tcfg: Dict[str, Any], cfg_dir: Path) -> pl.Trainer:
         callbacks.append(EarlyStopping(monitor="val/loss", mode="min", patience=int(pat)))
 
     precision = tcfg.get("precision", "32-true")
-    if not torch.cuda.is_available() and precision != "32-true":
-        precision = "32-true"  # avoid AMP-on-CPU warnings
+    
+    # Determine accelerator
+    if torch.cuda.is_available():
+        accelerator = "gpu"
+    elif torch.backends.mps.is_available():
+        accelerator = "mps"  # Apple Silicon
+        if precision != "32-true":
+            precision = "32-true"  # MPS doesn't support mixed precision yet
+    else:
+        accelerator = "cpu"
+        precision = "32-true"
 
     return pl.Trainer(
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        accelerator=accelerator,
         devices=int(tcfg.get("devices", 1)),
         max_epochs=int(tcfg.get("epochs", 2)),
         precision=precision,
