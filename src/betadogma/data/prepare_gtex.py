@@ -47,11 +47,12 @@ import atexit
 import multiprocessing as mp
 from glob import glob
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Union, Any, Set, Callable, Iterable
+from typing import List, Dict, Tuple, Optional, Union, Any, Set, Callable, Iterable, cast, BinaryIO, TextIO, IO
 import re
+from typing_extensions import Literal, TypedDict
 
 import pandas as pd
-from tqdm import tqdm
+from tqdm import tqdm  # type: ignore[import-untyped]
 
 
 def parse_gct_header(gct_path: str, max_rows: Optional[int] = None) -> Tuple[List[str], int]:
@@ -67,69 +68,72 @@ def parse_gct_header(gct_path: str, max_rows: Optional[int] = None) -> Tuple[Lis
         - n_rows: Number of data rows to process (capped at max_rows if provided)
     """
     # Open gzipped or regular file
-    open_func = gzip.open if str(gct_path).endswith('.gz') else open
-    mode = 'rt'  # text mode
+    is_gzipped = str(gct_path).endswith('.gz')
     
-    with open_func(gct_path, mode) as f:
-        # First line: version
-        version = f.readline().strip()
-        if version not in ('#1.2', '#1.3'):
-            raise ValueError(f"Unsupported GCT version: {version}. Expected '#1.2' or '#1.3'")
-        
-        # Second line: dimensions
-        dim_line = f.readline().strip()
-        
-        if version == '#1.2':
-            # In v1.2, dimensions are space-separated and there's no description field
-            dims = dim_line.split()
-            if len(dims) != 2:
-                raise ValueError(f"Invalid GCT v1.2 dimensions. Expected 2 values, got {len(dims)}: {dims}")
-            n_rows, n_cols = int(dims[0]), int(dims[1])
-            
-            # The next line contains column headers
-            header_line = f.readline().strip()
-            # Remove any trailing tabs that might cause empty columns
-            if header_line.endswith('\t'):
-                header_line = header_line.rstrip('\t')
-            headers = header_line.split('\t')
-            
-            # First column is 'Name', rest are sample IDs
-            sample_ids = [h for h in headers[1:] if h]  # Filter out any empty strings
-            
-        else:  # v1.3
-            # In v1.3, dimensions include a description field
-            dims = dim_line.split('\t')
-            if len(dims) != 3:
-                raise ValueError(f"Invalid GCT v1.3 dimensions. Expected 3 values, got {len(dims)}: {dims}")
-            n_rows, n_cols = int(dims[0]), int(dims[1])
-            
-            # The next line contains column headers
-            header_line = f.readline().strip()
-            # Remove any trailing tabs that might cause empty columns
-            if header_line.endswith('\t'):
-                header_line = header_line.rstrip('\t')
-            headers = header_line.split('\t')
-            
-            # First two columns are 'Name' and 'Description', the rest are sample IDs
-            sample_ids = [h for h in headers[2:] if h]  # Filter out any empty strings
-        
-        # Handle cases where the header might have an extra tab
-        if len(sample_ids) == n_cols + 1 and (not sample_ids[-1] or sample_ids[-1].isspace()):
-            sample_ids = sample_ids[:-1]  # Remove the last empty column
-        
-        # If we're still off by one, adjust n_cols to match actual data
-        if len(sample_ids) != n_cols:
-            print(f"Adjusting column count from {n_cols} to {len(sample_ids)} to match actual header")
-            n_cols = len(sample_ids)
-        
-        if len(headers) < 2:
-            raise ValueError(f"Invalid GCT header line. Expected at least 2 columns, got {len(headers)}")
-        
-        # Cap the number of rows if max_rows is provided
-        if max_rows is not None:
-            n_rows = min(n_rows, max_rows)
-            
-        return sample_ids, n_rows
+    def read_header_lines(f: IO[str]) -> List[str]:
+        """Read header lines from GCT file."""
+        lines = []
+        for _ in range(3):  # Read first 3 lines for version, dimensions, and headers
+            line = f.readline()
+            if not line:
+                break
+            lines.append(line.strip())
+        return lines
+    
+    if is_gzipped:
+        with gzip.open(gct_path, 'rt') as f:
+            lines = read_header_lines(f)
+    else:
+        with open(gct_path, 'r') as f:
+            lines = read_header_lines(f)
+    
+    if len(lines) < 3:
+        raise ValueError(f"Invalid GCT file: expected at least 3 lines, got {len(lines)}")
+    
+    version = lines[0]
+    dim_line = lines[1]
+    header_line = lines[2]
+    
+    if version not in ('#1.2', '#1.3'):
+        raise ValueError(f"Unsupported GCT version: {version}. Expected '#1.2' or '#1.3'")
+    
+    # Parse dimensions
+    dims = dim_line.split()
+    if len(dims) < 2:
+        raise ValueError(f"Invalid GCT dimensions. Expected at least 2 values, got {len(dims)}: {dims}")
+    
+    n_rows = int(dims[0])
+    n_cols = int(dims[1])
+    
+    # Parse headers
+    if header_line.endswith('\t'):
+        header_line = header_line.rstrip('\t')
+    headers = header_line.split('\t')
+    
+    # First column is 'Name', rest are sample IDs
+    sample_ids = [h for h in headers[1:] if h]  # Filter out any empty strings
+    
+    # In v1.3, there's an extra description column we need to skip
+    if version == '#1.3' and len(headers) > 1 and headers[1] == 'Description':
+        sample_ids = [h for h in headers[2:] if h]
+    
+    # Handle cases where the header might have an extra tab
+    if len(sample_ids) == n_cols + 1 and (not sample_ids[-1] or sample_ids[-1].isspace()):
+        sample_ids = sample_ids[:-1]  # Remove the last empty column
+    
+    # If we're still off by one, adjust n_cols to match actual data
+    if len(sample_ids) != n_cols:
+        print(f"Adjusting column count from {n_cols} to {len(sample_ids)} to match actual header")
+        n_cols = len(sample_ids)
+    
+    if len(headers) < 2:
+        raise ValueError(f"Invalid GCT header line. Expected at least 2 columns, got {len(headers)}")
+    
+    # Cap the number of rows if max_rows is provided
+    if max_rows is not None:
+        n_rows = min(n_rows, max_rows)
+    
+    return sample_ids, n_rows
 
 # Configure multiprocessing for macOS
 try:
@@ -192,6 +196,7 @@ def convert_gct_to_parquet(
         print(f"[GCT] Filtering to chromosomes: {sorted(target_chroms)}")
     
     # Configure smoke test limits
+    max_junctions: Union[int, float]  # Type hint for max_junctions
     if smoke:
         # For smoke test, process only a small subset of junctions and samples
         max_junctions = 5  # Minimal requirement for testing
@@ -207,9 +212,9 @@ def convert_gct_to_parquet(
         sample_ids = all_sample_ids
         print(f"Processing all junctions across {len(sample_ids)} samples")
     
-    # Initialize data structures
-    junctions = []
-    sample_data = {sample_id: [] for sample_id in sample_ids}
+    # Initialize data structures with type hints
+    junctions: List[Dict[str, Union[str, int]]] = []
+    sample_data: Dict[str, List[int]] = {sample_id: [] for sample_id in sample_ids}
     
     # Process the GCT file
     with gzip.open(gct_path, 'rt') as f:
@@ -381,7 +386,7 @@ def convert_gct_to_parquet(
     junctions_df = pd.DataFrame(qualifying_junctions)
 
     # Rebuild sample_data with only qualifying junctions
-    filtered_sample_data = {sample_id: [] for sample_id in sample_ids}
+    filtered_sample_data: Dict[str, List[int]] = {sample_id: [] for sample_id in sample_ids}
     for idx, junction in junctions_df.iterrows():
         for sample_id in sample_ids:
             filtered_sample_data[sample_id].append(sample_data[sample_id][idx])
@@ -410,11 +415,13 @@ def convert_gct_to_parquet(
     print(f"Completed: Processed {len(junctions_df)} junctions meeting criteria, wrote {len(output_files)} files to {output_dir}")
     return output_files
 
-def process_junctions_input(junctions: Union[str, List[str]],
-                          min_count: int = 5,
-                          min_samples: int = 3,
-                          smoke: bool = False,
-                          chroms: Optional[str] = None) -> List[str]:
+def process_junctions_input(
+    junctions: Union[str, List[str]],
+    min_count: int = 5,
+    min_samples: int = 3,
+    smoke: bool = False,
+    chroms: Optional[str] = None
+) -> List[str]:
     """Process junctions input, handling both GCT and existing Parquet files.
     
     Args:
@@ -423,6 +430,9 @@ def process_junctions_input(junctions: Union[str, List[str]],
         min_samples: Minimum samples with ≥min_count reads for a junction to be included
         smoke: If True, run in smoke test mode (process only a subset of data)
         chroms: Comma-separated list of chromosomes to include (None for all)
+    
+    Returns:
+        List of paths to processed junction files
     """
     if not junctions:
         raise ValueError("No junction files or GCT file provided")
@@ -580,8 +590,13 @@ def assign_gene_for_junction(
 # Junction counts I/O
 # -----------------------------
 
-def read_junction_tables(junctions_glob_or_list, min_count: int = 5,
-    min_samples: int = 3, smoke: bool = False, chroms: Optional[str] = None) -> pd.DataFrame:
+def read_junction_tables(
+    junctions_glob_or_list: Union[str, List[str]],
+    min_count: int = 5,
+    min_samples: int = 3,
+    smoke: bool = False,
+    chroms: Optional[str] = None
+) -> pd.DataFrame:
     """
     Read one or multiple junction-count files (parquet/csv/tsv/gct), stack into a DataFrame.
     If a GCT file is provided, it will be converted to Parquet format first.
@@ -648,8 +663,8 @@ def read_junction_tables(junctions_glob_or_list, min_count: int = 5,
                     continue
 
                 df = df[list(required)].copy()
-                df["donor"] = df["donor"].astype(int)
-                df["acceptor"] = df["acceptor"].astype(int)
+                df["donor_total"] = df["donor_total"].astype(float)  # Keep as float for PSI calculation
+                df["acceptor_total"] = df["acceptor_total"].astype(float)  # Keep as float for PSI calculation
                 df["count"] = df["count"].astype(int)
                 df["strand"] = df["strand"].astype(str)
                 df["chrom"] = df["chrom"].astype(str)
@@ -734,11 +749,11 @@ def compute_junction_psi(
     df = df.merge(accept_tot, on=["sample_id", "chrom", "strand", "acceptor"], how="left")
 
     # PSI with coverage gating
-    min_total = float(min_total)
-    df["psi_donor"] = df["count"] / df["donor_total"]
-    df["psi_acceptor"] = df["count"] / df["acceptor_total"]
-    df.loc[df["donor_total"] < min_total, "psi_donor"] = float("nan")
-    df.loc[df["acceptor_total"] < min_total, "psi_acceptor"] = float("nan")
+    min_total_float = float(min_total)
+    df["psi_donor"] = df["count"].astype(float) / df["donor_total"]
+    df["psi_acceptor"] = df["count"].astype(float) / df["acceptor_total"]
+    df.loc[df["donor_total"] < min_total_float, "psi_donor"] = float("nan")
+    df.loc[df["acceptor_total"] < min_total_float, "psi_acceptor"] = float("nan")
 
     return df
 
@@ -812,9 +827,9 @@ def summarize_gene_psi(
 
 
 def prepare_gtex(
-    junctions: str | List[str],
+    junctions: Union[str, List[str]],
     gtf: str,
-    out: str,
+    out: Union[str, Path],
     chroms: Optional[str] = None,
     min_count: int = 5,
     min_samples: int = 5,
@@ -828,99 +843,100 @@ def prepare_gtex(
         gtf: Path to GTF annotation file
         out: Output directory
         chroms: Comma-separated list of chromosomes to include (None for all)
-        min_count: Minimum reads per junction per sample (for two-read coverage)
-        min_samples: Minimum samples with ≥min_count reads for a junction to be included, 
-                   and minimum number of samples with coverage for gene summary
+        min_count: Minimum reads per junction per sample
+        min_samples: Minimum samples with sufficient coverage
         min_total: Minimum total read count for donor/acceptor sites
         smoke: If True, run in smoke test mode (process only a subset of data)
     """
-    from tqdm import tqdm
+    out_path = Path(out)
+    out_path.mkdir(parents=True, exist_ok=True)
     
-    # Create output directory early to ensure we can write
-    os.makedirs(out, exist_ok=True)
-    
-    # Process junctions input (handle GCT or existing Parquet files)
-    print("\n" + "="*80)
     print(f"Preparing GTEx data (smoke test: {'ON' if smoke else 'OFF'})")
     print("="*80)
     
-    junction_files = process_junctions_input(junctions, min_count, min_samples, smoke=smoke, chroms=chroms)
+    # Process junctions input
+    junction_files = process_junctions_input(
+        junctions=junctions,
+        min_count=min_count,
+        min_samples=min_samples,
+        smoke=smoke,
+        chroms=chroms
+    )
+    
     if not junction_files:
         raise ValueError("No valid junction files found after processing input")
-        
+    
     if smoke and len(junction_files) > 10:
         junction_files = junction_files[:10]
         print(f"[smoke] Using first 10 of {len(junction_files)} junction files")
     else:
         print(f"Processing {len(junction_files)} junction files")
     
-    # Read and merge junction tables with progress tracking
-    try:
-        with tqdm(total=len(junction_files), desc="Reading junction files", unit="file") as pbar:
-            dfs = []
-            for p in junction_files:
-                p_str = str(p)
-                p_lower = p_str.lower()
-                pbar.set_postfix(file=Path(p_str).name[:20] + ("..." if len(Path(p_str).name) > 20 else ""))
-                
-                try:
-                    if p_lower.endswith(".parquet"):
-                        df = pd.read_parquet(p_str)
-                    elif p_lower.endswith(".csv"):
-                        df = pd.read_csv(p_str)
-                    elif p_lower.endswith(".tsv") or p_lower.endswith(".txt"):
-                        df = pd.read_csv(p_str, sep="\t")
-                    else:
-                        print(f"\nSkipping unsupported file: {p_str}")
-                        continue
+    # Read and process junction tables
+    df = read_junction_tables(
+        junction_files,
+        min_count=min_count,
+        min_samples=min_samples,
+        smoke=smoke,
+        chroms=chroms
+    )
+    
+    if df.empty:
+        raise ValueError("No valid junction data found after processing")
+    
+    # Compute PSI values
+    df_psi = compute_junction_psi(
+        df,
+        min_count=min_count,
+        min_samples=min_samples,
+        min_total=min_total
+    )
+    
+    # Annotate genes
+    gene_index = build_gene_index(gtf)
+    df_psi = annotate_genes(df_psi, gene_index)
+    
+    # Save results
+    output_file = out_path / "junction_psi.parquet"
+    df_psi.to_parquet(output_file, index=False)
+    print(f"Saved junction PSI to {output_file}")
+    
+    # Generate and save gene summary
+    gene_summary = summarize_gene_psi(df_psi, min_samples=min_samples)
+    summary_file = out_path / "gene_psi_summary.parquet"
+    gene_summary.to_parquet(summary_file, index=False)
+    print(f"Saved gene summary to {summary_file}")
+    print("="*80)
+    print("Done!")
 
-                    # Normalize required columns and dtypes
-                    required = {"sample_id", "chrom", "donor", "acceptor", "strand", "count"}
-                    missing = required - set(df.columns)
-                    if missing:
-                        print(f"\nWarning: {p_str} is missing required columns: {sorted(missing)}")
-                        continue
 
-                    df = df[list(required)].copy()
-                    df["donor"] = df["donor"].astype(int)
-                    df["acceptor"] = df["acceptor"].astype(int)
-                    df["count"] = df["count"].astype(int)
-                    df["strand"] = df["strand"].astype(str)
-                    df["chrom"] = df["chrom"].astype(str)
-                    
-                    if not df.empty:
-                        dfs.append(df)
-                        pbar.update(1)
-                    else:
-                        print(f"\nWarning: {p_str} is empty after filtering")
-                    
-                except Exception as e:
-                    print(f"\nError reading {p_str}: {str(e)[:200]}")
-                    continue
+def main() -> None:
+    parser = argparse.ArgumentParser(description='Prepare GTEx junction PSI data')
+    parser.add_argument('--junctions', required=True, help='Path or glob pattern to junction count files or GCT file')
+    parser.add_argument('--gtf', required=True, help='Path to GTF annotation file')
+    parser.add_argument('--out', required=True, help='Output directory')
+    parser.add_argument('--chroms', default='', help='Comma-separated list of chromosomes to include (default: all)')
+    parser.add_argument('--min-count', type=int, default=5, help='Minimum reads per junction per sample')
+    parser.add_argument('--min-samples', type=int, default=5, help='Minimum samples with sufficient coverage')
+    parser.add_argument('--min-total', type=int, default=20, help='Minimum total read count for donor/acceptor sites')
+    parser.add_argument('--smoke', action='store_true', help='Run in smoke test mode (process only a subset of data)')
+    
+    args = parser.parse_args()
+    
+    # Create output directory if it doesn't exist
+    out_path = Path(args.out)
+    out_path.mkdir(parents=True, exist_ok=True)
+    
+    prepare_gtex(
+        junctions=args.junctions,
+        gtf=args.gtf,
+        out=str(out_path),
+        chroms=args.chroms if args.chroms else None,
+        min_count=args.min_count,
+        min_samples=args.min_samples,
+        min_total=args.min_total,
+        smoke=args.smoke
+    )
 
-        if not dfs:
-            raise ValueError("No valid junction data was loaded from the provided files.")
-        
-        print(f"\nMerging {len(dfs)} junction tables...")
-        with tqdm(total=len(dfs), desc="Merging tables", unit="chunk") as pbar:
-            # Process in chunks to avoid high memory usage
-            chunk_size = 1000
-            chunks = []
-            for i in range(0, len(dfs), chunk_size):
-                chunk = pd.concat(dfs[i:i+chunk_size], ignore_index=True)
-                chunks.append(chunk)
-                pbar.update(min(chunk_size, len(dfs) - i))
-            
-            # Merge chunks
-            out = pd.concat(chunks, ignore_index=True)
-        
-        print(f"Merged {len(dfs)} files into {len(out):,} junctions")
-        return out
-    except Exception as e:
-        print(f"\n{'-'*40} ERROR {'-'*40}")
-        print(f"Error processing junction files: {str(e)}")
-        print("-" * 80)
-        import traceback
-        traceback.print_exc()
-        raise
-
+if __name__ == "__main__":
+    main()

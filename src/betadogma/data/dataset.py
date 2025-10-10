@@ -49,13 +49,36 @@ class BetaDogmaDataset(Dataset):
     In-memory dataset from a list of dicts or BetaDogmaRecord objects.
     Useful for small tests and unit fixtures.
     """
-    def __init__(self, records: List[Dict[str, Any]] | List[BetaDogmaRecord]):
-        self.records = [r.__dict__ if hasattr(r, "__dict__") else r for r in records]
+    def __init__(self, records: List[Union[Dict[str, Any], BetaDogmaRecord]]):
+        """Initialize the dataset with a list of records.
+        
+        Args:
+            records: List of records, where each record is either a dictionary
+                    or a BetaDogmaRecord instance.
+        """
+        self.records: List[Dict[str, Any]] = [
+            r if isinstance(r, dict) else r.__dict__ 
+            for r in records
+        ]
 
     def __len__(self) -> int:
+        """Return the number of records in the dataset."""
         return len(self.records)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """Get a record by index.
+        
+        Args:
+            idx: Index of the record to retrieve.
+            
+        Returns:
+            A dictionary containing the record data.
+            
+        Raises:
+            IndexError: If the index is out of range.
+        """
+        if idx < 0 or idx >= len(self.records):
+            raise IndexError(f"Index {idx} is out of range for dataset of size {len(self.records)}")
         return self.records[idx]
 
 

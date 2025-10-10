@@ -16,13 +16,24 @@ Exposed (tests import these):
 """
 
 from __future__ import annotations
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Union, TypeVar, cast
 
 import torch
 import torch.nn as nn
 import networkx as nx
 
 from .types import Isoform, Exon
+
+# Type aliases for better readability
+Tensor = torch.Tensor
+Module = nn.Module
+Graph = 'nx.DiGraph'  # Forward reference to avoid circular imports
+
+# Generic type variable for type hints
+T = TypeVar('T')
+
+# Type for networkx graph nodes
+NodeType = Union[Exon, int, str]
 
 __all__ = [
     "_get_spliced_cDNA",
@@ -43,6 +54,12 @@ def _as_1d(x: torch.Tensor) -> torch.Tensor:
     Normalize logits to shape [L] by selecting batch 0 and squeezing any trailing
     singleton 'channel' dim. Handles: [B,L,1], [B,L], [1,L], [L,1], [L].
     Returns contiguous [L].
+    
+    Args:
+        x: Input tensor of shape [B,L,1], [B,L], [1,L], [L,1], or [L]
+        
+    Returns:
+        A 1D tensor of shape [L]
     """
     t = x
     # [B,L,1] -> [B,L]
@@ -56,26 +73,40 @@ def _as_1d(x: torch.Tensor) -> torch.Tensor:
             t = t[:, 0]
     # [L,1] -> [L]
     if t.dim() == 2 and t.size(-1) == 1:
-        t = t[:, 0]
+        t = t.squeeze(1)
+    
     # final safety: if still not 1D, try squeeze
     if t.dim() > 1:
         t = t.squeeze()
+    
     return t.contiguous()
 
 def _as_L3(x: torch.Tensor) -> torch.Tensor:
     """
     Normalize ORF frame logits to shape [L,3].
-    Accepts shapes: [B,L,3], [1,L,3], [L,3].
-    Returns contiguous [L,3].
+    
+    Args:
+        x: Input tensor of shape [B,L,3], [1,L,3], [L,3], or [L]
+        
+    Returns:
+        A 2D tensor of shape [L,3]
     """
-    t = x
-    if t.dim() == 4 and t.size(1) == 1:  # e.g., [B,1,L,3]
-        t = t.squeeze(1)
-    if t.dim() == 3 and t.size(0) > 1:   # [B,L,3] -> [L,3]
-        t = t[0]
-    if t.dim() == 3 and t.size(0) == 1:  # [1,L,3] -> [L,3]
-        t = t[0]
-    return t.contiguous()
+    if x.dim() == 3:
+        # Handle [B,L,3] or [1,L,3]
+        if x.size(0) == 1:
+            return x[0].contiguous()
+        return x.contiguous()
+    
+    # Handle [L,3] or [L]
+    if x.dim() == 2 and x.size(1) == 3:
+        return x.contiguous()
+    
+    # Handle [L] -> [L,3] by repeating along last dim
+    if x.dim() == 1:
+        return x.unsqueeze(1).expand(-1, 3).contiguous()
+    
+    # Fallback for any other shape
+    return x.view(-1, 3).contiguous()
 
 # -------------------------
 # Utilities
@@ -285,19 +316,38 @@ def _score_orf(
 
 class SpliceGraph:
     """Graph of exon nodes with junction edges."""
-    def __init__(self):
+    
+    def __init__(self) -> None:
+        """Initialize an empty splice graph."""
         self.graph = nx.DiGraph()
 
-    def add_exon(self, exon: Exon):
+    def add_exon(self, exon: Exon) -> None:
+        """Add an exon node to the graph.
+        
+        Args:
+            exon: The Exon object to add to the graph.
+        """
         node_key = (exon.start, exon.end)
         self.graph.add_node(node_key, score=exon.score, type='exon')
 
-    def add_junction(self, from_exon: Exon, to_exon: Exon, score: float):
+    def add_junction(self, from_exon: Exon, to_exon: Exon, score: float) -> None:
+        """Add a junction edge between two exons.
+        
+        Args:
+            from_exon: The source exon of the junction.
+            to_exon: The target exon of the junction.
+            score: The score/weight of the junction.
+        """
         fk = (from_exon.start, from_exon.end)
         tk = (to_exon.start, to_exon.end)
         self.graph.add_edge(fk, tk, score=score, type='junction')
 
-    def __repr__(self):
+    def __repr__(self) -> str:
+        """Return a string representation of the graph.
+        
+        Returns:
+            A string containing the number of nodes and edges in the graph.
+        """
         return f"SpliceGraph(nodes={self.graph.number_of_nodes()}, edges={self.graph.number_of_edges()})"
 
 
@@ -319,6 +369,18 @@ class SpliceGraphBuilder:
 
     def _get_exons(self, starts: List[int], ends: List[int],
                    start_scores: List[float], end_scores: List[float], strand: str) -> List[Exon]:
+        """Generate exon objects from detected splice sites and their scores.
+        
+        Args:
+            starts: List of start positions for potential exons
+            ends: List of end positions for potential exons
+            start_scores: Confidence scores for each start position
+            end_scores: Confidence scores for each end position
+            strand: Strand direction ('+' or '-')
+            
+        Returns:
+            List of Exon objects with calculated scores
+        """
         exons: List[Exon] = []
         is_fwd = (strand == '+')
         for i, s_idx in enumerate(starts):
@@ -401,28 +463,46 @@ class SpliceGraphBuilder:
 
 class IsoformEnumerator:
     """Beam-search enumeration of candidate exon paths."""
-    def __init__(self, config: Dict):
+    def __init__(self, config: Dict[str, Any]) -> None:
+        """Initialize the IsoformEnumerator with configuration.
+        
+        Args:
+            config: Dictionary containing configuration parameters including 'beam_size'
+        """
         self.config = config
         self.beam_size = self.config.get("beam_size", 16)
 
     def enumerate(self, graph: SpliceGraph, max_paths: int, strand: str = '+') -> List[Isoform]:
+        """Enumerate candidate isoform paths through the splice graph using beam search.
+        
+        Args:
+            graph: The splice graph to traverse
+            max_paths: Maximum number of paths to return
+            strand: Strand direction ('+' or '-')
+            
+        Returns:
+            List of candidate Isoform objects sorted by score
+        """
         if not graph.graph or graph.graph.number_of_nodes() == 0:
             return []
 
-        source_nodes = [n for n, deg in graph.graph.in_degree() if deg == 0]
+        source_nodes: List[Tuple[int, int]] = [n for n, deg in graph.graph.in_degree() if deg == 0]
         if not source_nodes:
             return []
 
         src_exons = [Exon(start=n[0], end=n[1], score=graph.graph.nodes[n]['score']) for n in source_nodes]
         sorted_src = _order_exons_by_transcription(src_exons, strand)
-        beam = [(graph.graph.nodes[(e.start, e.end)]['score'], [(e.start, e.end)]) for e in sorted_src]
+        beam: List[Tuple[float, List[Tuple[int, int]]]] = [
+            (graph.graph.nodes[(e.start, e.end)]['score'], [(e.start, e.end)]) 
+            for e in sorted_src
+        ]
         beam.sort(key=lambda x: x[0], reverse=True)
 
-        all_paths: List[Tuple[float, List[Tuple[int,int]]]] = []
+        all_paths: List[Tuple[float, List[Tuple[int, int]]]] = []
 
         while beam:
             all_paths.extend(beam)
-            new_beam: List[Tuple[float, List[Tuple[int,int]]]] = []
+            new_beam: List[Tuple[float, List[Tuple[int, int]]]] = []
             for score, path in beam:
                 last = path[-1]
                 for nb in graph.graph.neighbors(last):
@@ -433,13 +513,13 @@ class IsoformEnumerator:
             if not beam:
                 break
 
-        best_by_path: Dict[Tuple[Tuple[int,int], ...], float] = {}
+        best_by_path: Dict[Tuple[Tuple[int, int], ...], float] = {}
         for score, path in all_paths:
             pt = tuple(path)
             if pt not in best_by_path or score > best_by_path[pt]:
                 best_by_path[pt] = score
 
-        sorted_paths = sorted(best_by_path.items(), key=lambda kv: kv[1] / len(kv[0]), reverse=True)
+        sorted_paths = sorted(best_by_path.items(), key=lambda kv: kv[1] / max(1, len(kv[0])), reverse=True)
 
         isoforms: List[Isoform] = []
         for path_tuple, score in sorted_paths[: max_paths]:
@@ -452,7 +532,16 @@ class IsoformEnumerator:
         return isoforms
 
 
-def _score_length(isoform: Isoform, priors: Dict) -> torch.Tensor:
+def _score_length(isoform: Isoform, priors: Dict[str, Any]) -> torch.Tensor:
+    """Score an isoform based on its length characteristics.
+    
+    Args:
+        isoform: The isoform to score
+        priors: Dictionary containing prior probabilities and parameters
+        
+    Returns:
+        A tensor containing the length-based score for the isoform
+    """
     num_exons = len(isoform.exons)
     if num_exons < 2 or num_exons > 20:
         return torch.tensor(-0.5)

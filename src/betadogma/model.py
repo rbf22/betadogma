@@ -9,12 +9,18 @@ This module exposes a simple interface for inference:
 from __future__ import annotations
 
 import re
-from typing import Optional, Dict, Any, List
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, TypedDict, Union, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import yaml
+
+# Type aliases for better readability
+TensorDict = Dict[str, torch.Tensor]  # e.g., {"donor": (B,L,1), "acceptor": (B,L,1)}
+HeadOutputs = Dict[str, TensorDict]    # e.g., {"splice": {"donor": ..., "acceptor": ...}}
 
 # Heads each return a dict of per-base logits with fixed keys:
 #   SpliceHead -> {"donor": (B,L,1), "acceptor": (B,L,1)}
@@ -41,21 +47,66 @@ def _isoform_to_key(iso: Isoform) -> str:
 
 # ---------- Prediction container
 
+# Type for window information
+class WindowInfo(TypedDict, total=False):
+    """Type definition for window information dictionary.
+    
+    Attributes:
+        chrom: Chromosome name (e.g., 'chr1')
+        start: Start position (0-based, inclusive)
+        end: End position (0-based, exclusive)
+        seq: DNA sequence in the window (uppercase A/C/G/T/N)
+    """
+    chrom: str
+    start: int
+    end: int
+    seq: str
+
+# Type for variant information
+class VariantInfo(TypedDict, total=False):
+    """Type definition for variant information dictionary."""
+    chrom: str
+    pos: int
+    ref: str
+    alt: str
+    type: Literal["SNP", "DEL", "INS", "INDEL"]
+    in_window_idx: Optional[int]
+
 @dataclass
 class Prediction:
-    """
-    Encapsulates the full output of a BetaDogma prediction.
-
-    Holds candidate isoforms and exposes convenience properties:
-    - psi: dict[isoform_key] -> PSI
-    - dominant_isoform: Isoform with highest raw score
-    - p_nmd: NMD probability for the dominant isoform
+    """Encapsulates the full output of a BetaDogma prediction.
+    
+    This class provides a convenient interface to access prediction results,
+    including isoform probabilities and NMD predictions.
+    
+    Example:
+        >>> # Assuming we have a prediction result
+        >>> prediction = Prediction(isoforms=predicted_isoforms, _nmd_model=nmd_model)
+        >>> 
+        >>> # Get PSI (percent spliced in) for each isoform
+        >>> psi = prediction.psi  # {'+:100-200,300-400': 0.7, '+:100-500': 0.3}
+        >>> 
+        >>> # Get the dominant isoform
+        >>> dom_iso = prediction.dominant_isoform
+        >>> 
+        >>> # Get NMD probability for the dominant isoform
+        >>> nmd_prob = prediction.p_nmd
     """
     isoforms: List[Isoform]
-    _nmd_model: NMDModel  # reference used on-demand
+    _nmd_model: NMDModel  # reference to NMD model for on-demand prediction
 
     @property
     def psi(self) -> Dict[str, float]:
+        """Calculate percent spliced-in (PSI) for each isoform.
+        
+        Returns:
+            Dictionary mapping isoform keys to their PSI values (sums to 1.0).
+            The keys are generated using _isoform_to_key().
+            
+        Note:
+            PSI is calculated using softmax over the raw isoform scores.
+            An empty dictionary is returned if no isoforms are present.
+        """
         if not self.isoforms:
             return {}
         scores = torch.tensor([iso.score for iso in self.isoforms], dtype=torch.float32)
@@ -64,12 +115,30 @@ class Prediction:
 
     @property
     def dominant_isoform(self) -> Optional[Isoform]:
+        """Get the isoform with the highest raw score.
+        
+        Returns:
+            The highest-scoring Isoform, or None if no isoforms are present.
+            
+        Note:
+            In case of a tie, returns the first isoform with the maximum score.
+        """
         if not self.isoforms:
             return None
         return max(self.isoforms, key=lambda iso: iso.score)
 
     @property
     def p_nmd(self) -> float:
+        """Get the NMD probability for the dominant isoform.
+        
+        Returns:
+            NMD probability as a float between 0.0 and 1.0.
+            Returns 0.0 if no isoforms are present.
+            
+        Note:
+            This evaluates the NMD model on the dominant (highest scoring) isoform.
+            To get NMD probabilities for all isoforms, use the NMDModel directly.
+        """
         dom = self.dominant_isoform
         if dom is None:
             return 0.0
@@ -92,7 +161,22 @@ class BetaDogmaModel(nn.Module):
       nmd: { ... }      # passed to NMDModel
     """
 
-    def __init__(self, d_in: int, config: Dict[str, Any]):
+    def __init__(self, d_in: int, config: Dict[str, Any]) -> None:
+        """Initialize BetaDogmaModel with given configuration.
+        
+        Args:
+            d_in: Input dimension (embedding size)
+            config: Configuration dictionary with the following structure:
+                {
+                    "heads": {
+                        "hidden": int,     # Hidden dimension size (default: 768)
+                        "dropout": float,  # Dropout rate (default: 0.1)
+                        "use_conv": bool   # Whether to use convolutional layers (default: True)
+                    },
+                    "decoder": { ... },    # Configuration for IsoformDecoder
+                    "nmd": { ... }         # Configuration for NMDModel
+                }
+        """
         super().__init__()
         self.config = config
 
@@ -107,19 +191,22 @@ class BetaDogmaModel(nn.Module):
         self.polya_head  = PolyAHead( d_in=d_in, d_hidden=d_hidden, dropout=dropout, use_conv=use_conv)
         self.orf_head    = ORFHead(   d_in=d_in, d_hidden=d_hidden, dropout=dropout, use_conv=use_conv)
 
-        # Isoform decoder (graph + scoring)
         self.isoform_decoder = IsoformDecoder(config=config.get("decoder", {}))
 
         # NMD predictor
         self.nmd_model = NMDModel(config=config.get("nmd", {}))
 
-    def forward(self, embeddings: torch.Tensor, input_ids: Optional[torch.Tensor] = None) -> Dict[str, Any]:
+    def forward(
+        self, 
+        embeddings: torch.Tensor, 
+        input_ids: Optional[torch.Tensor] = None
+    ) -> Dict[str, Union[Dict[str, torch.Tensor], torch.Tensor, None]]:
         """
         Run the per-base heads on precomputed embeddings.
 
         Args:
             embeddings: (B, L, d_in) tensor
-            input_ids: optional sequence tokens aligned to L (e.g., A/C/G/T/N vocab)
+            input_ids: Optional sequence tokens aligned to L (e.g., A/C/G/T/N vocab)
 
         Returns:
             A dict bundling all head outputs, plus embeddings/input_ids passthrough:
@@ -142,45 +229,75 @@ class BetaDogmaModel(nn.Module):
         }
         return outputs
 
-    @torch.no_grad()
-    def predict(self, head_outputs: Dict[str, Any], strand: str = "+") -> Prediction:
-        """
-        Decode head outputs into isoforms and wrap them in a Prediction object.
-        """
-        input_ids = head_outputs.get("input_ids", None)
-        isoforms = self.isoform_decoder.decode(head_outputs, strand=strand, input_ids=input_ids)
-        return Prediction(isoforms=isoforms, _nmd_model=self.nmd_model)
-
     @classmethod
-    def from_config_file(cls, config_path: str) -> "BetaDogmaModel":
-        """Build a model from a YAML config file. Expects encoder.hidden_size."""
-        import yaml
-        with open(config_path, "r") as f:
-            cfg = yaml.safe_load(f)
-        d_in = cfg.get("encoder", {}).get("hidden_size")
-        if d_in is None:
-            raise ValueError("`encoder.hidden_size` must be specified in the config.")
-        return cls(d_in=d_in, config=cfg)
+    def from_config_file(cls, config_path: Union[str, Path]) -> 'BetaDogmaModel':
+        """Build a model from a YAML config file.
+        
+        Args:
+            config_path: Path to the YAML configuration file
+            
+        Returns:
+            An initialized BetaDogmaModel instance
+            
+        Raises:
+            FileNotFoundError: If the config file doesn't exist
+            KeyError: If required configuration keys are missing
+        """
+        config_path = Path(config_path)
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+            
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+            
+        if "encoder" not in config or "hidden_size" not in config["encoder"]:
+            raise KeyError("Config must contain 'encoder.hidden_size'")
+            
+        return cls(d_in=config["encoder"]["hidden_size"], config=config)
 
 
 # ---------- Convenience preprocessing utilities
 
-def preprocess_sequence(chrom: str, start: int, end: int, fasta_path: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Extract an uppercased DNA window (A/C/G/T/N) from FASTA.
-
-    Returns: {"chrom":str, "start":int, "end":int, "seq":str}
+def preprocess_sequence(
+    chrom: str, 
+    start: int, 
+    end: int, 
+    fasta_path: Optional[Union[str, Path]] = None
+) -> WindowInfo:
+    """Extract a DNA window from a FASTA file.
+    
+    Args:
+        chrom: Chromosome name (e.g., 'chr1')
+        start: Start position (0-based, inclusive)
+        end: End position (0-based, exclusive)
+        fasta_path: Path to the FASTA file. If None, returns a mock sequence.
+        
+    Returns:
+        A dictionary containing:
+        {
+            "chrom": str,  # Chromosome name
+            "start": int,  # Start position (0-based, inclusive)
+            "end": int,    # End position (0-based, exclusive)
+            "seq": str     # Uppercased DNA sequence (A/C/G/T/N)
+        }
+        
+    Raises:
+        ValueError: If start >= end or if coordinates are invalid
+        FileNotFoundError: If fasta_path is provided but doesn't exist
     """
     if end <= start:
         raise ValueError("end must be > start")
 
     seq = "N" * (end - start)
     if fasta_path:
-        from pyfaidx import Fasta
-        fa = Fasta(fasta_path, as_raw=True, sequence_always_upper=True)
-        if chrom not in fa:
-            raise KeyError(f"Chromosome {chrom} not found in FASTA.")
-        contig_len = len(fa[chrom])
+        try:
+            from pyfaidx import Fasta  # type: ignore
+            fa = Fasta(str(fasta_path), as_raw=True, sequence_always_upper=True)
+            if chrom not in fa:
+                raise KeyError(f"Chromosome {chrom} not found in FASTA.")
+            contig_len = len(fa[chrom])
+        except ImportError:
+            raise ImportError("pyfaidx is required for FASTA processing. Install with: pip install pyfaidx")
         s = max(0, start)
         e = min(end, contig_len)
         core = str(fa[chrom][s:e])
@@ -191,25 +308,36 @@ def preprocess_sequence(chrom: str, start: int, end: int, fasta_path: Optional[s
     return {"chrom": chrom, "start": start, "end": end, "seq": seq}
 
 
-def preprocess_variant(vcf_like: str, window: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    Parse strings like '17:43051000A>T' or 'chr1:12345-DEL3' into a normalized record.
-
+def preprocess_variant(
+    vcf_like: str, 
+    window: Optional[WindowInfo] = None
+) -> VariantInfo:
+    """Parse a VCF-like variant string into a normalized record.
+    
+    Args:
+        vcf_like: Variant string in format 'CHR:POSREF>ALT' or 'CHR:POS-TYPE[LEN]'
+                 (e.g., '17:43051000A>T', 'chr1:12345-DEL3')
+        window: Optional window information to calculate in_window_idx
+        
     Returns:
-      {
-        "chrom": str,
-        "pos": int,           # 0-based genomic position of the first ref base (or insertion point)
-        "ref": str,
-        "alt": str,
-        "type": "SNP"|"DEL"|"INS"|"INDEL",
-        "in_window_idx": Optional[int],  # 0-based index into `window["seq"]`, if applicable
-      }
+        A dictionary containing:
+        {
+            "chrom": str,           # Chromosome name
+            "pos": int,             # 0-based genomic position
+            "ref": str,             # Reference allele
+            "alt": str,             # Alternate allele
+            "type": Literal[        # Variant type
+                "SNP", "DEL", "INS", "INDEL"
+            ],
+            "in_window_idx": Optional[int]  # 0-based index into window["seq"] if window provided
+        }
+        
+    Raises:
+        ValueError: If the variant string is malformed
     """
     m = re.match(r'(?P<chrom>[^:]+):(?P<pos>\d+)(?P<ref>[ACGTN\-]+)>(?P<alt>[ACGTN\-]+)$', vcf_like)
     if not m:
         raise ValueError(f"Unrecognized variant format: {vcf_like}")
-
-    chrom = m["chrom"]
     pos0 = int(m["pos"]) - 1
     ref = m["ref"]
     alt = m["alt"]
@@ -223,9 +351,19 @@ def preprocess_variant(vcf_like: str, window: Optional[Dict[str, Any]] = None) -
     else:
         vtype = "INDEL"
 
-    in_idx = None
-    if window and window.get("chrom") == chrom and window.get("start") is not None and window.get("end") is not None:
-        if window["start"] <= pos0 < window["end"]:
-            in_idx = pos0 - window["start"]
+    # If we have a window, compute the in-window index
+    in_window_idx = None
+    if window and window.get("chrom") == m["chrom"] and window.get("start", 0) <= pos0 < window.get("end", 0):
+        in_window_idx = pos0 - window["start"]
 
-    return {"chrom": chrom, "pos": pos0, "ref": ref, "alt": alt, "type": vtype, "in_window_idx": in_idx}
+    # Cast vtype to Literal type for type checking
+    variant_type: Literal["SNP", "DEL", "INS", "INDEL"] = vtype  # type: ignore
+
+    return {
+        "chrom": m["chrom"],
+        "pos": pos0,
+        "ref": ref,
+        "alt": alt,
+        "type": variant_type,
+        "in_window_idx": in_window_idx,
+    }

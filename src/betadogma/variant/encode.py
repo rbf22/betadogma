@@ -67,25 +67,54 @@ def encode_variant(spec: str, window: Optional[Dict[str, Any]] = None) -> Dict[s
 # -----------------------------
 
 def apply_variant_to_sequence(seq: str, window_start: int, var: Dict[str, Any]) -> str:
-    """Apply a parsed variant to a sequence window string."""
-    idx = var.get("in_window_idx", var["pos0"] - window_start)
-    if idx < 0 or idx > len(seq):
+    """Apply a parsed variant to a sequence window string.
+    
+    Args:
+        seq: The input DNA sequence
+        window_start: The start position of the sequence window
+        var: A dictionary containing variant information
+        
+    Returns:
+        The modified sequence with the variant applied, or the original sequence
+        if the variant cannot be applied.
+    """
+    if not seq:
+        return ""
+        
+    try:
+        idx = var.get("in_window_idx", var["pos0"] - window_start)
+        if not isinstance(idx, int) or idx < 0 or idx > len(seq):
+            return seq
+
+        ref = str(var.get("ref", ""))
+        alt = str(var.get("alt", ""))
+        vtype = str(var.get("type", ""))
+
+        if vtype == "SNP" and 0 <= idx < len(seq):
+            result = seq[:idx] + alt + seq[idx + 1:]
+            return result if isinstance(result, str) else seq
+            
+        elif vtype == "INS":
+            result = seq[:idx] + alt + seq[idx:]
+            return result if isinstance(result, str) else seq
+            
+        elif vtype in {"DEL", "INDEL"}:
+            span = var.get("span_in_window")
+            if span and isinstance(span, (tuple, list)) and len(span) == 2:
+                s, e = int(span[0]), int(span[1])
+                if 0 <= s <= e <= len(seq):
+                    result = seq[:s] + ("" if alt == "-" else alt) + seq[e:]
+                    return result if isinstance(result, str) else seq
+            else:
+                s, e = idx, idx + len(ref)
+                if 0 <= s <= e <= len(seq):
+                    result = seq[:s] + ("" if alt == "-" else alt) + seq[e:]
+                    return result if isinstance(result, str) else seq
         return seq
-
-    ref, alt, vtype = var["ref"], var["alt"], var["type"]
-
-    if vtype == "SNP" and 0 <= idx < len(seq):
-        return seq[:idx] + alt + seq[idx + 1 :]
-    elif vtype == "INS":
-        return seq[:idx] + alt + seq[idx :]
-    elif vtype in {"DEL", "INDEL"}:
-        span = var.get("span_in_window")
-        if span:
-            s, e = span
-        else:
-            s, e = idx, idx + len(ref)
-        return seq[:s] + ("" if alt == "-" else alt) + seq[e:]
-    return seq
+        
+    except (IndexError, TypeError, KeyError, ValueError) as e:
+        # Return original sequence if any error occurs during variant application
+        return seq
 
 
 # -----------------------------

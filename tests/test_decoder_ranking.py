@@ -1,10 +1,19 @@
 # tests/test_decoder_ranking.py
+from __future__ import annotations
+
 import torch
 import yaml
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any, Union
 
-from betadogma.model import BetaDogmaModel
-from betadogma.decoder import Isoform, Exon
+# Import local modules with type checking only
+try:
+    from betadogma.model import BetaDogmaModel
+    from betadogma.decoder import Isoform, Exon
+    from betadogma.core.losses import structural_bce_ce_loss
+    from betadogma.core.encoder_nt import NTEncoder
+except ImportError:
+    pass  # For type checking only
 
 HERE = Path(__file__).resolve().parent
 CFG = HERE.parent / "src" / "betadogma" / "experiments" / "config" / "default.yaml"
@@ -16,7 +25,7 @@ class PairwiseHingeLoss(torch.nn.Module):
     def forward(self, pos: torch.Tensor, neg: torch.Tensor) -> torch.Tensor:
         return torch.relu(self.margin - (pos - neg)).mean()
 
-def _mock_batch(device: torch.device, L: int = 2048):
+def _mock_batch(device: torch.device, L: int = 2048) -> Tuple[Dict[str, Dict[str, torch.Tensor]], Isoform, torch.Tensor]:
     # Create logits with a clean “true path”: TSS@50, donor@200, acceptor@300, polyA@500
     donor = torch.full((1, L), -10.0, device=device)
     acceptor = torch.full((1, L), -10.0, device=device)
@@ -45,12 +54,18 @@ def _mock_batch(device: torch.device, L: int = 2048):
     return head_outputs, true_iso, input_ids
 
 @torch.no_grad()
-def _score_pair(model, head_outputs, true_iso, input_ids):
+def _score_pair(
+    model: Any, 
+    head_outputs: Dict[str, Dict[str, torch.Tensor]], 
+    true_iso: Isoform, 
+    input_ids: torch.Tensor
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     # enumerate candidates
     cands = model.isoform_decoder.decode(head_outputs, strand="+", input_ids=input_ids)
     # split
     true_exon_pairs = tuple((e.start, e.end) for e in true_iso.exons)
-    pos, neg = [], []
+    pos: List[Isoform] = []
+    neg: List[Isoform] = []
     for c in cands:
         pairs = tuple((e.start, e.end) for e in c.exons)
         (pos if pairs == true_exon_pairs else neg).append(c)

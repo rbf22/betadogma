@@ -14,22 +14,26 @@ Usage:
       --gtf /path/gencode.v44.annotation.gtf \
       --out data/cache/gencode_v44_structural_base \
       --window 131072 \
-      --stride 65536 \
       --bin-size 1 \
       --chroms chr1,chr2
 """
 
 from __future__ import annotations
-import argparse
-import os
-from typing import Dict, List, Tuple, Iterable
-from collections import defaultdict
 
+import argparse
+import gzip
+import os
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Set, Tuple, Union, Any, cast
+
+import numpy as np
 import pandas as pd
 
 try:
     import pyfaidx
-except Exception as e:  # pragma: no cover
+except ImportError as e:  # pragma: no cover
     raise RuntimeError("pyfaidx is required. Install with `pip install pyfaidx`.") from e
 
 
@@ -98,7 +102,7 @@ def read_gtf_minimal(gtf_path: str, allowed_chroms: set[str] | None) -> Iterable
             }
 
 
-def collect_sites(records: Iterable[Dict]):
+def collect_sites(records: Iterable[Dict]) -> Tuple[Dict[str, set[int]], Dict[str, set[int]], Dict[str, set[int]], Dict[str, set[int]]]:
     """
     From GTF records, collect base-resolution sets:
       donors, acceptors, tss, polya
@@ -109,13 +113,15 @@ def collect_sites(records: Iterable[Dict]):
       - tss = transcript 5' end by strand
       - polyA = transcript 3' end by strand
     """
-    donors = defaultdict(set)    # chrom -> set[int]
-    acceptors = defaultdict(set)
-    tss = defaultdict(set)
-    polya = defaultdict(set)
+    donors: Dict[str, set[int]] = defaultdict(set)    # chrom -> set[int]
+    acceptors: Dict[str, set[int]] = defaultdict(set)  # chrom -> set[int]
+    tss: Dict[str, set[int]] = defaultdict(set)        # chrom -> set[int]
+    polya: Dict[str, set[int]] = defaultdict(set)      # chrom -> set[int]
 
     # transcript bounds to infer TSS/polyA
-    tx_bounds = defaultdict(lambda: {"chrom": None, "strand": None, "start": None, "end": None})
+    tx_bounds: Dict[str, Dict[str, Optional[Union[str, int]]]] = defaultdict(
+        lambda: {"chrom": None, "strand": None, "start": None, "end": None}
+    )
     # per-transcript exon lists to infer junctions
     exons_by_tx = defaultdict(list)
 
@@ -143,9 +149,14 @@ def collect_sites(records: Iterable[Dict]):
 
     # TSS / polyA
     for tid, info in tx_bounds.items():
-        chrom = info["chrom"]; strand = info["strand"]; s = info["start"]; e = info["end"]
+        chrom = cast(Optional[str], info["chrom"])
+        strand = cast(Optional[str], info["strand"])
+        s = cast(Optional[int], info["start"])
+        e = cast(Optional[int], info["end"])
+        
         if chrom is None or strand is None or s is None or e is None:
             continue
+            
         if strand == "+":
             tss[chrom].add(s)
             polya[chrom].add(e - 1)
@@ -311,10 +322,23 @@ def prepare_gencode(
     if shard_rows:
         df = pd.DataFrame(shard_rows)
         outp = os.path.join(out_dir, f"shard_{shard_idx:04d}.parquet")
-    df.to_parquet(outp, index=False)
-    print(f"[prepare_gencode] wrote {outp} ({len(df)} rows)")
-    print(f"[prepare_gencode] done. Wrote {shard_idx + 1} shard to {out_dir}")
+        df.to_parquet(outp, index=False)
+        print(f"[prepare_gencode] wrote {outp} ({len(df)} rows)")
+    print(f"[prepare_gencode] done. Wrote {shard_idx} shards to {out_dir}")
 
+
+def main() -> None:
+    args = parse_args()
+    prepare_gencode(
+        fasta_path=args.fasta,
+        gtf_path=args.gtf,
+        out_dir=args.out,
+        window=args.window,
+        stride=args.stride,
+        bin_size=args.bin_size,
+        chroms=args.chroms,
+        max_shard_bases=args.max_shard_bases
+    )
 
 if __name__ == "__main__":
     main()

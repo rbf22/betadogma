@@ -208,13 +208,41 @@ class LitStructural(pl.LightningModule):
         self.weight_decay = float(weight_decay)
         self.save_hyperparameters({"lr": self.lr, "weight_decay": self.weight_decay})
 
-    def _get_embeddings(self, seqs):
-        """Extract embeddings tensor from encoder output (encoder runs on CPU)."""
-        # Force encoder to run on CPU
+    def _get_embeddings(self, seqs: Union[List[str], torch.Tensor]) -> torch.Tensor:
+        """Extract embeddings tensor from encoder output (encoder runs on CPU).
+        
+        Args:
+            seqs: List of DNA sequences to encode or a tensor of token IDs.
+                If a tensor is provided, it should be of shape [batch_size, seq_len].
+                
+        Returns:
+            Tensor of shape [batch_size, seq_len, hidden_size] containing the embeddings.
+            
+        Raises:
+            KeyError: If encoder returns a dict with unexpected keys.
+            TypeError: If encoder returns an unexpected type.
+            RuntimeError: If the input tensor cannot be processed.
+        """
+        # Handle case where seqs is already a tensor
+        if isinstance(seqs, torch.Tensor):
+            if seqs.dim() == 1:  # [batch_size * seq_len]
+                seqs = seqs.view(-1, seqs.size(0))  # Reshape to [1, seq_len]
+            elif seqs.dim() > 2:
+                raise ValueError(f"Expected 1D or 2D tensor, got {seqs.dim()}D")
+            
+            # Convert tensor to list of strings if needed
+            # This is a simplified version - adjust based on your tokenization scheme
+            try:
+                seqs = [''.join([str(x.item()) for x in seq if x != 0]) for seq in seqs]
+            except Exception as e:
+                raise RuntimeError(f"Failed to convert tensor to sequences: {e}")
+        
+        # Run encoder on CPU
         with torch.no_grad():
             encoder_output = self.encoder.forward(seqs)
         
-        # Handle different return types
+        # Handle different return types with type hints
+        emb: torch.Tensor
         if isinstance(encoder_output, torch.Tensor):
             emb = encoder_output
         elif isinstance(encoder_output, dict):
@@ -225,125 +253,291 @@ class LitStructural(pl.LightningModule):
                 emb = encoder_output["last_hidden_state"]
             elif "hidden_states" in encoder_output:
                 emb = encoder_output["hidden_states"]
+                if isinstance(emb, (list, tuple)):
+                    emb = emb[-1]  # Use last layer's hidden state
             else:
-                raise KeyError(f"Encoder returned dict with unexpected keys: {encoder_output.keys()}")
+                raise KeyError(f"Encoder returned dict with unexpected keys: {list(encoder_output.keys())}")
         elif hasattr(encoder_output, "last_hidden_state"):
             emb = encoder_output.last_hidden_state
         elif hasattr(encoder_output, "embeddings"):
             emb = encoder_output.embeddings
         else:
-            raise TypeError(f"Unexpected encoder output type: {type(encoder_output)}")
+            raise TypeError(f"Unexpected encoder output type: {type(encoder_output).__name__}")
+            
+        # Ensure we have a tensor
+        if not isinstance(emb, torch.Tensor):
+            raise TypeError(f"Expected tensor output, got {type(emb).__name__}")
         
         # Move embeddings from CPU to training device (MPS/GPU)
         return emb.to(self.device)
 
-    def _compute_loss(self, outputs, batch):
-        # shapes: outputs['splice']['donor']: [B, L, 1] ; labels: [B, L]
-        d_logits = outputs["splice"]["donor"].squeeze(-1)
-        a_logits = outputs["splice"]["acceptor"].squeeze(-1)
-        t_logits = outputs["tss"]["tss"].squeeze(-1)
-        p_logits = outputs["polya"]["polya"].squeeze(-1)
+    def _compute_loss(
+        self, 
+        outputs: Dict[str, Dict[str, torch.Tensor]], 
+        batch: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute the total loss and individual component losses.
+        
+        This method computes the loss for each task (donor, acceptor, TSS, polyA) and combines
+        them into a total loss with task-specific weights.
+        
+        Args:
+            outputs: Dictionary containing model outputs for each task.
+                Expected structure:
+                {
+                    'splice': {'donor': Tensor[B, L, 1], 'acceptor': Tensor[B, L, 1]},
+                    'tss': {'tss': Tensor[B, L, 1]},
+                    'polya': {'polya': Tensor[B, L, 1]}
+                }
+            batch: Dictionary containing ground truth labels.
+                Expected keys: 'donor', 'acceptor', 'tss', 'polya', each Tensor[B, L]
+                
+        Returns:
+            A tuple of (total_loss, logs_dict) where:
+            - total_loss: The weighted sum of all task losses
+            - logs_dict: Dictionary containing individual loss components for logging
+            
+        Raises:
+            KeyError: If required keys are missing from inputs
+            RuntimeError: If there's a device mismatch between tensors
+        """
+        try:
+            # Extract logits for each task and ensure correct shape [B, L]
+            d_logits = outputs["splice"]["donor"].squeeze(-1)  # [B, L, 1] -> [B, L]
+            a_logits = outputs["splice"]["acceptor"].squeeze(-1)
+            t_logits = outputs["tss"]["tss"].squeeze(-1)
+            p_logits = outputs["polya"]["polya"].squeeze(-1)
 
-        donor = batch["donor"].to(self.device)
-        acceptor = batch["acceptor"].to(self.device)
-        tss = batch["tss"].to(self.device)
-        polya = batch["polya"].to(self.device)
+            # Move labels to the correct device and ensure float32 dtype for loss computation
+            def prepare_label(tensor: torch.Tensor) -> torch.Tensor:
+                return tensor.to(device=self.device, dtype=torch.float32)
 
-        # align by min length
-        def cut(x, y): 
-            L = min(x.shape[1], y.shape[1])
-            return x[:, :L], y[:, :L]
+            donor = prepare_label(batch["donor"])
+            acceptor = prepare_label(batch["acceptor"])
+            tss = prepare_label(batch["tss"])
+            polya = prepare_label(batch["polya"])
 
-        d_log, d_lab = cut(d_logits, donor)
-        a_log, a_lab = cut(a_logits, acceptor)
-        t_log, t_lab = cut(t_logits, tss)
-        p_log, p_lab = cut(p_logits, polya)
+            def cut(x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                """Truncate tensors to the minimum length along dimension 1."""
+                if x.dim() != 2 or y.dim() != 2:
+                    raise ValueError(f"Expected 2D tensors, got shapes {x.shape} and {y.shape}")
+                L = min(x.shape[1], y.shape[1])
+                return x[:, :L].contiguous(), y[:, :L].contiguous()
 
-        w = self.cfg["loss"]
+            # Align logits and labels by minimum sequence length
+            d_log, d_lab = cut(d_logits, donor)
+            a_log, a_lab = cut(a_logits, acceptor)
+            t_log, t_lab = cut(t_logits, tss)
+            p_log, p_lab = cut(p_logits, polya)
 
-        def _masked_loss(logits, labels, weight):
-            # Calculate loss per element. `labels` can contain NaNs.
-            loss_elements = self.criterion(logits, labels)
+            # Get loss weights from config
+            w = self.cfg["loss"]
+            w_splice = float(w["w_splice"])
+            w_tss = float(w["w_tss"])
+            w_polya = float(w["w_polya"])
 
-            # Create a mask to select only non-NaN labels
-            mask = ~torch.isnan(labels)
+            def _masked_loss(
+                logits: torch.Tensor, 
+                labels: torch.Tensor, 
+                weight: float
+            ) -> torch.Tensor:
+                """Compute masked binary cross-entropy loss with NaN handling.
+                
+                Args:
+                    logits: Model predictions of shape [B, L]
+                    labels: Ground truth labels of shape [B, L] (may contain NaNs)
+                    weight: Weight for this loss component
+                    
+                Returns:
+                    Weighted loss value as a scalar tensor.
+                    
+                Note:
+                    - NaN values in labels are treated as missing/masked out
+                    - Loss is only computed over valid (non-NaN) positions
+                    - Returns zero if no valid positions are found
+                """
+                if logits.device != labels.device:
+                    raise RuntimeError(
+                        f"Device mismatch: logits on {logits.device}, labels on {labels.device}"
+                    )
+                
+                # Calculate per-element loss
+                loss_elements = self.criterion(logits, labels)
+                
+                # Create mask for valid (non-NaN) labels
+                mask = ~torch.isnan(labels)
+                
+                # Return zero loss if no valid labels
+                if not mask.any():
+                    return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+                
+                # Compute mean loss over valid positions
+                loss = loss_elements[mask].mean()
+                return loss * weight
 
-            # If there are no valid labels, loss is 0 for this head
-            if not mask.any():
-                return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+            # Compute individual task losses
+            loss_d = _masked_loss(d_log, d_lab, w_splice)
+            loss_a = _masked_loss(a_log, a_lab, w_splice)
+            loss_t = _masked_loss(t_log, t_lab, w_tss)
+            loss_p = _masked_loss(p_log, p_lab, w_polya)
 
-            # Take the mean of the loss over only the valid (non-NaN) labels
-            loss = loss_elements[mask].mean()
-            return loss * float(weight)
+            # Combine losses
+            total = loss_d + loss_a + loss_t + loss_p
+            
+            # Prepare logs with detached tensors to avoid memory leaks
+            logs = {
+                "loss/total": total.detach().clone(),
+                "loss/donor": loss_d.detach().clone(),
+                "loss/acceptor": loss_a.detach().clone(),
+                "loss/tss": loss_t.detach().clone(),
+                "loss/polya": loss_p.detach().clone(),
+            }
+            
+            return total, logs
+            
+        except KeyError as e:
+            raise KeyError(f"Missing required key in input: {e}")
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                raise RuntimeError("CUDA out of memory - try reducing batch size") from e
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Error in _compute_loss: {str(e)}") from e
 
-        loss_d = _masked_loss(d_log, d_lab, w["w_splice"])
-        loss_a = _masked_loss(a_log, a_lab, w["w_splice"])
-        loss_t = _masked_loss(t_log, t_lab, w["w_tss"])
-        loss_p = _masked_loss(p_log, p_lab, w["w_polya"])
-
-        total = loss_d + loss_a + loss_t + loss_p
-        logs = {
-            "loss/total": total,
-            "loss/donor": loss_d.detach(),
-            "loss/acceptor": loss_a.detach(),
-            "loss/tss": loss_t.detach(),
-            "loss/polya": loss_p.detach(),
-        }
-        return total, logs
-
-    def training_step(self, batch, _):
+    def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        """Training step for the model.
+        
+        Args:
+            batch: Dictionary containing the input batch
+            batch_idx: Index of the current batch
+            
+        Returns:
+            The computed loss for this batch
+        """
         # Compute embeddings on CPU, then move to device
         emb = self._get_embeddings(batch["seqs"])
         
         outs = self.model(embeddings=emb)
         loss, logs = self._compute_loss(outs, batch)
-        self.log_dict({f"train/{k}": v for k, v in logs.items()},
-                      on_epoch=True, prog_bar=True, batch_size=len(batch["seqs"]))
+        self.log_dict(
+            {f"train/{k}": v for k, v in logs.items()},
+            on_epoch=True, 
+            prog_bar=True, 
+            batch_size=len(batch["seqs"])
+        )
         return loss
 
-    def validation_step(self, batch, _):
+    def validation_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        """Validation step for the model.
+        
+        Args:
+            batch: Dictionary containing the input batch
+            batch_idx: Index of the current batch
+            
+        Returns:
+            The computed loss for this batch
+        """
         emb = self._get_embeddings(batch["seqs"])
         outs = self.model(embeddings=emb)
         loss, logs = self._compute_loss(outs, batch)
-        self.log("val/loss", loss, on_epoch=True, prog_bar=True, batch_size=len(batch["seqs"]))
-        self.log_dict({f"val/{k}": v for k, v in logs.items()}, on_epoch=True, prog_bar=False)
+        self.log(
+            "val/loss", 
+            loss, 
+            on_epoch=True, 
+            prog_bar=True, 
+            batch_size=len(batch["seqs"])
+        )
+        self.log_dict(
+            {f"val/{k}": v for k, v in logs.items()}, 
+            on_epoch=True, 
+            prog_bar=False
+        )
         return loss
 
-    def configure_optimizers(self):
-        # Only optimize the BetaDogma model parameters (not the encoder)
-        return torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+    def configure_optimizers(self) -> torch.optim.Optimizer:
+        """Configure the optimizer for training.
+        
+        Note: Only optimizes the BetaDogma model parameters (not the encoder).
+        
+        Returns:
+            Configured optimizer
+        """
+        return torch.optim.AdamW(
+            self.model.parameters(), 
+            lr=self.lr, 
+            weight_decay=self.weight_decay
+        )
 
 # DataModule: Structural
 class StructuralDataModule(pl.LightningDataModule):
-    def __init__(self, dcfg: dict[str, Any], cfg_dir: Path):
+    """PyTorch Lightning DataModule for handling structural data loading.
+    
+    This DataModule is responsible for loading and preparing structural data
+    (e.g., splice sites, TSS, polyA) from Parquet files for training and validation.
+    
+    Args:
+        dcfg: Data configuration dictionary containing paths and settings.
+        cfg_dir: Directory containing the configuration file (for resolving relative paths).
+    """
+    
+    def __init__(self, dcfg: dict[str, Any], cfg_dir: Path) -> None:
+        """Initialize the StructuralDataModule with the given configuration.
+        
+        Args:
+            dcfg: Data configuration dictionary.
+            cfg_dir: Directory containing the configuration file.
+        """
         super().__init__()
         self.cfg = dcfg
         self.cfg_dir = cfg_dir
-        self.pin_memory = (torch.cuda.is_available() if dcfg.get("pin_memory", "auto") == "auto"
-                           else bool(dcfg.get("pin_memory")))
+        self.pin_memory = (
+            torch.cuda.is_available() 
+            if dcfg.get("pin_memory", "auto") == "auto"
+            else bool(dcfg.get("pin_memory"))
+        )
         self.num_workers = int(dcfg.get("num_workers", 2))
         # Enable persistent workers if using multiple workers
         self.persistent_workers = self.num_workers > 0
+        
+        # Initialize dataset attributes
+        self.train_ds: Optional[StructuralParquetDataset] = None
+        self.val_ds: Optional[StructuralParquetDataset] = None
 
     def _resolve_glob(self, pat: str) -> list[Path]:
+        """Resolve a glob pattern to absolute paths.
+        
+        Args:
+            pat: Glob pattern (can be relative to cfg_dir).
+            
+        Returns:
+            List of sorted Path objects matching the pattern.
+        """
         from glob import glob
         p = Path(pat)
         if not p.is_absolute():
             p = self.cfg_dir / p
         return [Path(x) for x in sorted(glob(str(p)))]
 
-    def setup(self, stage: Optional[str] = None):
+    def setup(self, stage: Optional[str] = None) -> None:
+        """Set up the data module by loading and preparing the datasets.
+        
+        Args:
+            stage: Optional stage ('fit', 'validate', 'test', or 'predict').
+        """
         train_glob = self.cfg.get("train_parquet_glob")
-        val_glob   = self.cfg.get("val_parquet_glob")
+        val_glob = self.cfg.get("val_parquet_glob")
+        
         if not train_glob or not val_glob:
-            raise ValueError("For task=structural you must set data.train_parquet_glob and data.val_parquet_glob.")
+            raise ValueError(
+                "For task=structural you must set data.train_parquet_glob and data.val_parquet_glob."
+            )
         
         print(f"[DEBUG] Config dir: {self.cfg_dir}")
         print(f"[DEBUG] Train glob pattern (raw): {train_glob}")
         print(f"[DEBUG] Val glob pattern (raw): {val_glob}")
         
         train_paths = self._resolve_glob(train_glob)
-        val_paths   = self._resolve_glob(val_glob)
+        val_paths = self._resolve_glob(val_glob)
         
         print(f"[DEBUG] Train paths found: {len(train_paths)}")
         if train_paths:
@@ -365,9 +559,20 @@ class StructuralDataModule(pl.LightningDataModule):
             )
         
         self.train_ds = StructuralParquetDataset(train_paths)
-        self.val_ds   = StructuralParquetDataset(val_paths)
+        self.val_ds = StructuralParquetDataset(val_paths)
 
-    def train_dataloader(self):
+    def train_dataloader(self) -> DataLoader:
+        """Create and return the training DataLoader.
+        
+        Returns:
+            DataLoader configured for training data.
+            
+        Raises:
+            RuntimeError: If called before setup().
+        """
+        if self.train_ds is None:
+            raise RuntimeError("Call setup() before requesting a DataLoader")
+            
         return DataLoader(
             self.train_ds,
             batch_size=int(self.cfg.get("batch_size", 2)),
@@ -376,10 +581,21 @@ class StructuralDataModule(pl.LightningDataModule):
             pin_memory=self.pin_memory,
             drop_last=True,
             collate_fn=structural_collate,
-            persistent_workers=self.persistent_workers  # Added
+            persistent_workers=self.persistent_workers
         )
 
-    def val_dataloader(self):
+    def val_dataloader(self) -> DataLoader:
+        """Create and return the validation DataLoader.
+        
+        Returns:
+            DataLoader configured for validation data.
+            
+        Raises:
+            RuntimeError: If called before setup().
+        """
+        if self.val_ds is None:
+            raise RuntimeError("Call setup() before requesting a DataLoader")
+            
         return DataLoader(
             self.val_ds,
             batch_size=int(self.cfg.get("batch_size", 2)),
@@ -387,7 +603,7 @@ class StructuralDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             collate_fn=structural_collate,
-            persistent_workers=self.persistent_workers  # Added
+            persistent_workers=self.persistent_workers
         )
 
 
