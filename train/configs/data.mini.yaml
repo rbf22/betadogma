@@ -1,0 +1,34 @@
+seed: 42
+
+gencode:
+  enabled: true
+  kwargs:
+    fasta: ../../data/data_mini/genome/GRCh38.primary_assembly.chr21.genome.fa
+    gtf:   ../../data/data_mini/gencode/gencode.v44.chr21.annotation.gtf.gz
+    out:   ../../data/data_mini/processed/gencode
+    window: 65536            # 64k windows
+    stride: 65536            # No overlap for minimal dataset
+    bin_size: 1              # base-resolution labels
+    chroms: "chr21"          # Only use chr21
+    max_shard_bases: 1000000 # Smaller shard size for minimal dataset
+
+gtex:
+  enabled: false  # Skip GTEx for minimal dataset
+
+variants:
+  enabled: false  # Skip variants for minimal dataset
+
+overlapping_windows:
+  enabled: false  # Skip overlapping windows for minimal dataset
+
+aggregate:
+  enabled: true
+  kwargs:
+    input_dir: ../../data/data_mini/processed/gencode
+    output_dir: ../../data/data_mini/processed/final
+    max_per_window: 0  # No downsampling
+
+outputs:
+  dir: ../../data/data_mini/processed/final
+  expect:
+    - "*.parquet"

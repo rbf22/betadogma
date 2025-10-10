@@ -9,8 +9,10 @@ dist/
 .venv/
 .env
 .cache/
-checkpoints/
-data/raw
-data/processed
-data/cache  
+.hypothesis/
+.pytest_cache/
+.ruff_cache/
+.checkpoints/
+data/data_chr22/
+data/data_mini/
 train/runs

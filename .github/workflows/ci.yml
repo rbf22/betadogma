@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:  # Allow manual workflow runs
   push:
     branches: [main, develop]
   pull_request:
@@ -8,9 +9,6 @@ on:
   schedule:
     # Weekly run on Sunday to catch dependency updates
     - cron: '0 0 * * 0'
-
-# Allow manual workflow runs
-workflow_dispatch:
 
 # Cancel in-progress runs when new commits are pushed
 concurrency:
