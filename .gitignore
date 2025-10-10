@@ -16,3 +16,5 @@ dist/
 data/data_chr22/
 data/data_mini/
 train/runs
+poetry.lock
+
