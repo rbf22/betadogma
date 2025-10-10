@@ -1,47 +1,49 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-Config-only training entrypoint (lives inside train/).
+# -*- coding: utf-8 -
+"""Config-only training entrypoint (lives inside train/).
 
 Now supports two tasks:
-  - task: "structural"  -> trains Betadogma heads on Parquet shards from prepare_gencode.py
+  - task: "structural"  -> trains Betadogma heads on Parquet shard from prepare_gencode.py
   - task: "jsonl"       -> legacy JSONL binary classifier (Tiny model or user-supplied)
-
 It resolves paths in the config relative to the config file, and uses PyTorch Lightning
 for logging and checkpointing.
 """
+from __future__ import annotations
 
-import os
-import sys
-import json
-import random
+# Standard library imports
 import importlib
 import inspect
+import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Optional, Union
 
-# ---------- Project paths ----------
-THIS_FILE = Path(__file__).resolve()
-TRAIN_DIR = THIS_FILE.parent                    # .../train
-PROJECT_ROOT = TRAIN_DIR.parent                 # repo root
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))           # make betadogma importable
-
-DEFAULT_CFG = TRAIN_DIR / "configs" / "train.base.yaml"
-
-# ---------- Torch / Lightning ----------
-import torch
-from torch import nn
-from torch.utils.data import Dataset, DataLoader
+# Third-party imports
+import numpy as np
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
-from pytorch_lightning.loggers import TensorBoardLogger
+import torch
+import torch.nn as nn
+import yaml
+from pytorch_lightning.callbacks import (
+    EarlyStopping,
+    LearningRateMonitor,
+    ModelCheckpoint,
+)
+from torch.utils.data import DataLoader, Dataset
 from torchmetrics.classification import BinaryAUROC
 
-# ---------- YAML loader ----------
-def load_config(path: Path) -> Dict[str, Any]:
-    import yaml
+# Local imports
+from betadogma.data.dataset import JsonlSeqDataset, collate_structural_batch as collate_batch
+
+def load_config(path: Union[str, Path]) -> dict[str, Any]:
+    """Load a YAML configuration file.
+    
+    Args:
+        path: Path to the YAML configuration file (string or Path object)
+        
+    Returns:
+        Dictionary containing the configuration
+    """
+    path = Path(path) if isinstance(path, str) else path
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
     with path.open("r") as f:
@@ -49,11 +51,17 @@ def load_config(path: Path) -> Dict[str, Any]:
     cfg["_config_dir"] = str(path.parent)   # keep for relative path resolution
     return cfg
 
-# ---------- Repro ----------
-def set_seed(seed: int):
-    import numpy as np
-    random.seed(seed); np.random.seed(seed)
-    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+def set_seed(seed: int) -> None:
+    """Set random seed for reproducibility.
+    
+    Args:
+        seed: Random seed value
+    """
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -70,46 +78,6 @@ def encode_seq(seq: str, max_len: int, pad_value: int = 0) -> torch.LongTensor:
     if len(ids) < max_len:
         ids += [pad_value] * (max_len - len(ids))
     return torch.tensor(ids, dtype=torch.long)
-
-# ---------- Dataset: JSONL (legacy) ----------
-class JsonlSeqDataset(Dataset):
-    def __init__(self, path: Path, max_len: int, use_strand: bool, revcomp_minus: bool):
-        if not path.exists():
-            raise FileNotFoundError(f"Dataset file not found: {path}")
-        self.max_len = int(max_len)
-        self.use_strand = bool(use_strand)
-        self.revcomp_minus = bool(revcomp_minus)
-        self._lines: List[str] = [ln.strip() for ln in path.read_text().splitlines() if ln.strip()]
-        if not self._lines:
-            raise ValueError(f"No records found in JSONL: {path}")
-
-    def __len__(self) -> int:
-        return len(self._lines)
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        try:
-            ex = json.loads(self._lines[idx])
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Line {idx} is not valid JSON.") from e
-        if "sequence" not in ex or "label" not in ex:
-            raise KeyError("Each JSONL line must contain 'sequence' and 'label'.")
-        seq = ex["sequence"]
-        if not isinstance(seq, str) or not seq:
-            raise ValueError("`sequence` must be a non-empty string.")
-        if self.use_strand and ex.get("strand") == "-" and self.revcomp_minus:
-            seq = revcomp(seq)
-        x = encode_seq(seq, self.max_len)  # [L]
-        y = ex["label"]
-        if isinstance(y, bool):
-            y = int(y)
-        if y not in (0, 1):
-            raise ValueError("`label` must be 0 or 1.")
-        return {"x": x, "y": torch.tensor(float(y), dtype=torch.float32)}
-
-def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    x = torch.stack([b["x"] for b in batch], dim=0)         # [B, L]
-    y = torch.stack([b["y"] for b in batch], dim=0).float() # [B]
-    return {"x": x, "y": y}
 
 # ---------- Tiny fallback model (legacy) ----------
 class TinySeqModel(nn.Module):
@@ -128,7 +96,7 @@ class TinySeqModel(nn.Module):
     def forward(self, x_long: torch.LongTensor) -> torch.Tensor:
         emb = self.embed(x_long).permute(0, 2, 1)  # [B,E,L]
         feat = self.encoder(emb)                    # [B,H,1]
-        logits = self.head(feat).squeeze(1)         # [B]
+        logits = self.head(feat)                    # [B,1]
         return logits
 
 # ---------- LightningModule: JSONL ----------
@@ -174,9 +142,9 @@ class StructuralParquetDataset(Dataset):
     """
     Each row has: chrom, start, end, seq, bin_size, donor, acceptor, tss, polya
     """
-    def __init__(self, paths: List[Path]):
+    def __init__(self, paths: list[Path]):
         import pandas as pd
-        self._rows: List[Dict[str, Any]] = []
+        self._rows: list[dict[str, Any]] = []
         for p in paths:
             df = pd.read_parquet(p)
             req = {"seq", "donor", "acceptor", "tss", "polya"}
@@ -197,7 +165,7 @@ class StructuralParquetDataset(Dataset):
             "polya": torch.tensor(r["polya"], dtype=torch.float32),
         }
 
-def structural_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+def structural_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     import torch.nn.functional as F
     max_Lr = max(len(b["donor"]) for b in batch)
 
@@ -212,7 +180,7 @@ def structural_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 # LightningModule: Structural (NTEncoder + BetaDogmaModel)
 class LitStructural(pl.LightningModule):
-    def __init__(self, model_cfg: Dict[str, Any], lr: float, weight_decay: float):
+    def __init__(self, model_cfg: dict[str, Any], lr: float, weight_decay: float):
         super().__init__()
         from betadogma.model import BetaDogmaModel
         from betadogma.core.encoder_nt import NTEncoder
@@ -347,7 +315,7 @@ class LitStructural(pl.LightningModule):
 
 # DataModule: Structural
 class StructuralDataModule(pl.LightningDataModule):
-    def __init__(self, dcfg: Dict[str, Any], cfg_dir: Path):
+    def __init__(self, dcfg: dict[str, Any], cfg_dir: Path):
         super().__init__()
         self.cfg = dcfg
         self.cfg_dir = cfg_dir
@@ -357,7 +325,7 @@ class StructuralDataModule(pl.LightningDataModule):
         # Enable persistent workers if using multiple workers
         self.persistent_workers = self.num_workers > 0
 
-    def _resolve_glob(self, pat: str) -> List[Path]:
+    def _resolve_glob(self, pat: str) -> list[Path]:
         from glob import glob
         p = Path(pat)
         if not p.is_absolute():
@@ -424,7 +392,7 @@ class StructuralDataModule(pl.LightningDataModule):
 
 
 # ---------- Helpers ----------
-def _maybe_load_yaml_or_dict(value: Union[Dict[str, Any], str, Path], cfg_dir: Path) -> Dict[str, Any]:
+def _maybe_load_yaml_or_dict(value: Union[dict[str, Any], str, Path], cfg_dir: Path) -> dict[str, Any]:
     """Accept dicts as-is; load strings/paths as YAML; resolve relative to CONFIG file."""
     if isinstance(value, dict):
         return value
@@ -440,7 +408,17 @@ def _maybe_load_yaml_or_dict(value: Union[Dict[str, Any], str, Path], cfg_dir: P
     raise TypeError("model.kwargs.config must be a dict or a path to a YAML file.")
 
 # ---------- Model factory (legacy/jsonl path) ----------
-def build_model(mcfg: Dict[str, Any], max_len: int, cfg_dir: Path) -> nn.Module:
+def build_model(mcfg: dict[str, Any], max_len: int, cfg_dir: Path) -> nn.Module:
+    """Build a model from configuration.
+    
+    Args:
+        mcfg: Model configuration dictionary
+        max_len: Maximum sequence length
+        cfg_dir: Directory containing the configuration file
+        
+    Returns:
+        Configured PyTorch model
+    """
     # Toy path
     if mcfg.get("toy", False):
         return TinySeqModel(
@@ -469,14 +447,16 @@ def build_model(mcfg: Dict[str, Any], max_len: int, cfg_dir: Path) -> nn.Module:
             pass
         model = fn(**kwargs)
         if not isinstance(model, nn.Module):
-            raise TypeError(f"Factory '{factory}' must return a torch.nn.Module.")
+            err_msg = f"Factory '{factory}' must return a torch.nn.Module."
+            raise TypeError(err_msg)
         return model
 
     # Class path route
     class_path = mcfg.get("class_path")
     class_name = mcfg.get("class_name")
     if not class_path:
-        raise ValueError("model.class_path (or model.factory) is required unless model.toy is true.")
+        err_msg = "model.class_path (or model.factory) is required unless model.toy is true."
+        raise ValueError(err_msg)
     if "." in class_path and class_path.split(".")[-1][:1].isupper() and not class_name:
         module_name, cls_name = class_path.rsplit(".", 1)
     else:
@@ -509,14 +489,27 @@ def build_model(mcfg: Dict[str, Any], max_len: int, cfg_dir: Path) -> nn.Module:
     return obj(**kwargs)
 
 # ---------- Trainer from config ----------
-def build_trainer(tcfg: Dict[str, Any], cfg_dir: Path) -> pl.Trainer:
+def build_trainer(tcfg: dict[str, Any], cfg_dir: Path) -> pl.Trainer:
+    """Build and configure a PyTorch Lightning Trainer from a config.
+
+    Args:
+        tcfg: Trainer configuration dictionary
+        cfg_dir: Directory containing the configuration file
+
+    Returns:
+        Configured PyTorch Lightning Trainer
+
+    """
     logdir   = Path(tcfg.get("logdir", "runs/betadogma"))
     ckpt_dir = Path(tcfg.get("ckpt_dir", "checkpoints/betadogma"))
-    if not logdir.is_absolute():   logdir   = cfg_dir / logdir
-    if not ckpt_dir.is_absolute(): ckpt_dir = cfg_dir / ckpt_dir
+    if not logdir.is_absolute():
+        logdir = cfg_dir / logdir
+    if not ckpt_dir.is_absolute():
+        ckpt_dir = cfg_dir / ckpt_dir
     logdir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    from pytorch_lightning.loggers import TensorBoardLogger
     logger = TensorBoardLogger(save_dir=str(logdir), name="", version=None, default_hp_metric=False)
     callbacks = [
         ModelCheckpoint(dirpath=str(ckpt_dir), filename="{epoch:02d}-{val_loss:.4f}",
@@ -524,12 +517,12 @@ def build_trainer(tcfg: Dict[str, Any], cfg_dir: Path) -> pl.Trainer:
                         save_top_k=int(tcfg.get("save_top_k", 2)), save_last=True),
         LearningRateMonitor(logging_interval="step"),
     ]
-    pat = tcfg.get("early_stopping_patience", None)
+    pat = tcfg.get("early_stopping_patience")
     if pat is not None:
         callbacks.append(EarlyStopping(monitor="val/loss", mode="min", patience=int(pat)))
 
     precision = tcfg.get("precision", "32-true")
-    
+
     # Determine accelerator
     if torch.cuda.is_available():
         accelerator = "gpu"
@@ -553,17 +546,23 @@ def build_trainer(tcfg: Dict[str, Any], cfg_dir: Path) -> pl.Trainer:
         check_val_every_n_epoch=1,
         deterministic=True,
         enable_progress_bar=True,
-        limit_train_batches=tcfg.get("limit_train_batches", None),
-        limit_val_batches=tcfg.get("limit_val_batches", None),
+        limit_train_batches=tcfg.get("limit_train_batches"),
+        limit_val_batches=tcfg.get("limit_val_batches"),
     )
 
 # ---------- MAIN ----------
-def main():
+
+def main() -> None:
+    """Run the main training function.
+    
+    Handles configuration, model setup, and training loop.
+    """
     # 1) Config
     cfg_env = os.environ.get("TRAIN_CONFIG", "")
-    cfg_path = Path(cfg_env).resolve() if cfg_env else DEFAULT_CFG
+    configs_dir = Path(__file__).parent.parent / "configs"
+    cfg_path = Path(cfg_env).resolve() if cfg_env else configs_dir / "train.base.yaml"
     if not cfg_path.is_absolute():
-        cfg_path = (TRAIN_DIR / cfg_path).resolve()
+        cfg_path = (Path(__file__).parent / cfg_path).resolve()
     cfg = load_config(cfg_path)
     cfg_dir = Path(cfg["_config_dir"]).resolve()
 
@@ -585,9 +584,15 @@ def main():
         # Data
         dm = StructuralDataModule(dcfg, cfg_dir=cfg_dir)
         # Model (uses BetaDogmaModel + NTEncoder, losses from cfg.model.loss)
-        if "encoder" not in mcfg or "heads" not in mcfg or "loss" not in mcfg:
-            raise ValueError("For task=structural, model.encoder, model.heads, and model.loss must be in config.")
-        lit = LitStructural(model_cfg=mcfg, lr=float(ocfg.get("lr", 2e-4)), weight_decay=float(ocfg.get("weight_decay", 0.01)))
+        required = ["encoder", "heads", "loss"]
+        missing = [f"model.{k}" for k in required if k not in mcfg]
+        if missing:
+            msg = f"Missing required config keys: {', '.join(missing)}"
+            raise ValueError(msg)
+        
+        lr = float(ocfg.get("lr", 2e-4))
+        weight_decay = float(ocfg.get("weight_decay", 0.01))
+        lit = LitStructural(model_cfg=mcfg, lr=lr, weight_decay=weight_decay)
         # Train
         trainer.fit(lit, datamodule=dm)
 
@@ -596,43 +601,74 @@ def main():
         if not mcfg.get("toy", False):
             for key in ("train", "val", "max_len"):
                 if key not in dcfg or dcfg[key] in (None, ""):
-                    raise ValueError(f"Non-toy training requires data.{key}. Missing in {cfg_path}.")
+                    msg = f"Non-toy training requires data.{key}. Missing in {cfg_path}."
+                    raise ValueError(msg)
         # Data + model
         dm = SeqDataModule(dcfg, cfg_dir=cfg_dir)
         _model_kwargs = mcfg.get("kwargs") or {}
         max_len = int(dcfg.get("max_len", _model_kwargs.get("max_len", 0)))
         model = build_model(mcfg, max_len=max_len, cfg_dir=cfg_dir)
-        lit = LitSeq(model=model, lr=float(ocfg.get("lr", 3e-4)), weight_decay=float(ocfg.get("weight_decay", 0.01)))
+        lr = float(ocfg.get("lr", 3e-4))
+        weight_decay = float(ocfg.get("weight_decay", 0.01))
+        lit = LitSeq(model=model, lr=lr, weight_decay=weight_decay)
         # Train
         trainer.fit(lit, datamodule=dm)
 
     else:
-        raise ValueError(f"Unknown task: {task}. Use 'structural' or 'jsonl'.")
+        msg = f"Unknown task: {task}. Use 'structural' or 'jsonl'."
+        raise ValueError(msg)
 
 # ---------- DataModule (legacy/jsonl) ----------
 class SeqDataModule(pl.LightningDataModule):
-    def __init__(self, dcfg: Dict[str, Any], cfg_dir: Path):
+    """DataModule for sequence data.
+
+    This handles loading and preparing sequence data for training and validation.
+
+    Args:
+        dcfg: Data configuration dictionary
+        cfg_dir: Directory containing the configuration file
+
+    """
+    
+    def __init__(self, dcfg: dict[str, Any], cfg_dir: Path) -> None:
+        """Initialize the SeqDataModule.
+
+        Args:
+            dcfg: Data configuration dictionary
+            cfg_dir: Directory containing the configuration file
+
+        """
         super().__init__()
         self.cfg = dcfg
         self.cfg_dir = cfg_dir  # for resolving relative paths in the config
-        self.pin_memory = (torch.cuda.is_available() if dcfg.get("pin_memory", "auto") == "auto"
-                           else bool(dcfg.get("pin_memory")))
+        self.pin_memory = (
+            torch.cuda.is_available()
+            if dcfg.get("pin_memory", "auto") == "auto"
+            else bool(dcfg.get("pin_memory"))
+        )
 
-    def _resolve(self, p: Optional[str]) -> Optional[Path]:
+    def _resolve(self, p: str | None) -> Path | None:
         if p in (None, "", False):
             return None
         pp = Path(p)
         return (self.cfg_dir / pp) if not pp.is_absolute() else pp
 
-    def setup(self, stage: Optional[str] = None):
+    def setup(self, _stage: str | None = None) -> None:
+        """Set up the data module.
+
+        Args:
+            stage: Optional; 'fit', 'validate', 'test', or 'predict'.
+
+        """
         if self.cfg.get("toy", False):
-            self.train_ds = self._toy_ds(n=512, L=int(self.cfg["max_len"]))
-            self.val_ds   = self._toy_ds(n=128, L=int(self.cfg["max_len"]))
+            self.train_ds = self._toy_ds(n=512, seq_len=int(self.cfg["max_len"]))
+            self.val_ds = self._toy_ds(n=128, seq_len=int(self.cfg["max_len"]))
         else:
             req = ("train", "val", "max_len")
             missing = [k for k in req if k not in self.cfg or self.cfg[k] in (None, "")]
             if missing:
-                raise ValueError(f"Missing data config keys: {missing}")
+                error_msg = f"Missing data config keys: {missing}"
+                raise ValueError(error_msg)
             train_path = self._resolve(self.cfg["train"])
             val_path   = self._resolve(self.cfg["val"])
             self.train_ds = JsonlSeqDataset(
@@ -644,24 +680,54 @@ class SeqDataModule(pl.LightningDataModule):
                 self.cfg.get("reverse_complement_minus", True),
             )
 
-    def train_dataloader(self):
-        return DataLoader(self.train_ds, batch_size=int(self.cfg.get("batch_size", 32)), shuffle=True,
-                          num_workers=int(self.cfg.get("num_workers", 2)), pin_memory=self.pin_memory,
-                          drop_last=True, collate_fn=collate_batch)
+    def train_dataloader(self) -> DataLoader:
+        """Create and return the training DataLoader.
 
-    def val_dataloader(self):
-        return DataLoader(self.val_ds, batch_size=int(self.cfg.get("batch_size", 32)), shuffle=False,
-                          num_workers=int(self.cfg.get("num_workers", 2)), pin_memory=self.pin_memory,
-                          collate_fn=collate_batch)
+        Returns:
+            DataLoader: Configured DataLoader for training data
+
+        """
+        batch_size = int(self.cfg.get("batch_size", 32))
+        num_workers = int(self.cfg.get("num_workers", 2))
+        return DataLoader(
+            self.train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=self.pin_memory,
+            drop_last=True,
+            collate_fn=collate_batch,
+        )
+
+    def val_dataloader(self) -> DataLoader:
+        """Create and return the validation DataLoader.
+
+        Returns:
+            DataLoader: Configured DataLoader for validation data
+
+        """
+        batch_size = int(self.cfg.get("batch_size", 32))
+        num_workers = int(self.cfg.get("num_workers", 2))
+        return DataLoader(
+            self.val_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=self.pin_memory,
+            collate_fn=collate_batch,
+        )
 
     @staticmethod
-    def _toy_ds(n: int, L: int):
+    def _toy_ds(n: int, seq_len: int) -> Dataset:
         class _Toy(Dataset):
-            def __len__(self): return n
-            def __getitem__(self, i):
-                x = torch.randint(low=0, high=6, size=(L,), dtype=torch.long)
+            def __len__(self) -> int:
+                return n
+
+            def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+                x = torch.randint(low=0, high=6, size=(seq_len,), dtype=torch.long)
                 y = torch.tensor(float((x.sum() % 2)==0))
                 return {"x": x, "y": y}
+
         return _Toy()
 
 if __name__ == "__main__":

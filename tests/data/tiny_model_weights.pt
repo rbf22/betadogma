@@ -1,0 +1,16 @@
+# This is a placeholder for model weights
+# In a real test, this would contain actual model weights
+# For now, we'll use a simple dictionary
+import torch
+
+model_state = {
+    'embed.weight': torch.randn(6, 64),  # vocab_size=6, embed_dim=64
+    'encoder.0.weight': torch.randn(128, 64, 7),  # Conv1d weights
+    'encoder.0.bias': torch.randn(128),  # Conv1d bias
+    'encoder.2.weight': torch.randn(128, 128, 7),  # Second Conv1d weights
+    'encoder.2.bias': torch.randn(128),  # Second Conv1d bias
+    'head.2.weight': torch.randn(1, 128),  # Final Linear weights
+    'head.2.bias': torch.randn(1),  # Final Linear bias
+}
+
+torch.save(model_state, 'tests/data/tiny_model_weights.pt')

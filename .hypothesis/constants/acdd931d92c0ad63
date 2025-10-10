@@ -1,0 +1,4 @@
+# file: /Users/robert_fenwick/SWE/betadogma/src/betadogma/decoder/isoform_decoder.py
+# hypothesis_version: 6.140.3
+
+[-0.5, 0.0, 1e-09, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0, 2.0, 10000, 500000, '+', '-', 'A', 'AG', 'ATG', 'C', 'G', 'IsoformDecoder', 'IsoformEnumerator', 'IsoformScorer', 'N', 'SpliceGraph', 'SpliceGraphBuilder', 'T', 'TAA', 'TAG', 'TGA', '_get_spliced_cDNA', '_score_orf', 'acceptor', 'allow_unanchored', 'beam_size', 'cpu', 'decoder', 'donor', 'exon', 'frame', 'junction', 'kozak_bonus', 'max_candidates', 'max_cds_len_aa', 'max_ends', 'max_intron_len', 'max_start_candidates', 'max_starts', 'min_cds_len_aa', 'min_exon_len', 'orf', 'orf_alpha', 'orf_beta', 'orf_gamma', 'polya', 'priors', 'score', 'scoring', 'splice', 'start', 'stop', 'thresholds', 'tss', 'tss_pa_window', 'use_orf_head', 'w_len', 'w_orf', 'w_pa', 'w_spl', 'w_tss']

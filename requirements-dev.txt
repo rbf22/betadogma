@@ -1,0 +1,21 @@
+# Development dependencies
+-r requirements.txt
+
+# Testing
+pytest>=8.1.1
+pytest-cov>=4.1.0
+pytest-mock>=3.12.0
+pytest-xdist>=3.5.0
+hypothesis>=6.97.0
+
+# Linting and formatting
+ruff>=0.5.3
+black>=24.1.1
+isort>=5.13.2
+mypy>=1.8.0
+types-PyYAML>=6.0.12.12
+types-requests>=2.31.0.20240125
+
+# CI/CD
+codecov>=2.1.13
+pre-commit>=3.6.0

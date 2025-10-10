@@ -1,0 +1,53 @@
+repos:
+  - repo: https://github.com/psf/black
+    rev: 24.1.1
+    hooks:
+      - id: black
+        language_version: python3
+        args: [--line-length=100]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.5.3
+    hooks:
+      - id: ruff
+        args: [--fix, --show-fixes]
+        types_or: [python, pyi]
+
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        name: isort (python)
+        args: [--profile=black, --line-length=100]
+        types: [python]
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.8.0
+    hooks:
+      - id: mypy
+        additional_dependencies: [types-PyYAML, types-requests]
+        args: [--strict, --ignore-missing-imports]
+        exclude: ^tests/
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-added-large-files
+        args: [--maxkb=5000]
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-json
+      - id: check-toml
+      - id: check-ast
+      - id: debug-statements
+      - id: requirements-txt-fixer
+
+  - repo: https://github.com/commitizen-tools/commitizen
+    rev: 3.21.1
+    hooks:
+      - id: commitizen
+        stages: [commit-msg]
+        args: [--retry, --retry-code, 3]

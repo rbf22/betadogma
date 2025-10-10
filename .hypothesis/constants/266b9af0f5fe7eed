@@ -1,0 +1,4 @@
+# file: /Users/robert_fenwick/SWE/betadogma/src/betadogma/model.py
+# hypothesis_version: 6.140.3
+
+[0.0, 0.1, 768, '+', ',', '-', 'BetaDogmaModel', 'DEL', 'INDEL', 'INS', 'N', 'SNP', 'alt', 'chrom', 'decoder', 'dropout', 'embeddings', 'encoder', 'end', 'end must be > start', 'heads', 'hidden', 'hidden_size', 'in_window_idx', 'input_ids', 'nmd', 'orf', 'polya', 'pos', 'r', 'ref', 'seq', 'splice', 'start', 'tss', 'type', 'use_conv']

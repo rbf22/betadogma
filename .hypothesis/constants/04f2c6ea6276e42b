@@ -1,0 +1,4 @@
+# file: /Users/robert_fenwick/SWE/betadogma/src/betadogma/data/io.py
+# hypothesis_version: 6.140.3
+
+['#', ',', '.', 'N', 'alt', 'chrom', 'filter', 'id', 'info', 'pos', 'qual', 'r', 'ref', 'utf-8']
