@@ -235,7 +235,7 @@ class LitStructural(pl.LightningModule):
         self.model = BetaDogmaModel(d_in=d_in, config=model_cfg)
 
         pos_w = torch.tensor(model_cfg["loss"]["pos_weight"])
-        self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+        self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_w, reduction='none')
         self.lr = float(lr)
         self.weight_decay = float(weight_decay)
         self.save_hyperparameters({"lr": self.lr, "weight_decay": self.weight_decay})
@@ -292,10 +292,27 @@ class LitStructural(pl.LightningModule):
         p_log, p_lab = cut(p_logits, polya)
 
         w = self.cfg["loss"]
-        loss_d = self.criterion(d_log, d_lab) * float(w["w_splice"])
-        loss_a = self.criterion(a_log, a_lab) * float(w["w_splice"])
-        loss_t = self.criterion(t_log, t_lab) * float(w["w_tss"])
-        loss_p = self.criterion(p_log, p_lab) * float(w["w_polya"])
+
+        def _masked_loss(logits, labels, weight):
+            # Calculate loss per element. `labels` can contain NaNs.
+            loss_elements = self.criterion(logits, labels)
+
+            # Create a mask to select only non-NaN labels
+            mask = ~torch.isnan(labels)
+
+            # If there are no valid labels, loss is 0 for this head
+            if not mask.any():
+                return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+
+            # Take the mean of the loss over only the valid (non-NaN) labels
+            loss = loss_elements[mask].mean()
+            return loss * float(weight)
+
+        loss_d = _masked_loss(d_log, d_lab, w["w_splice"])
+        loss_a = _masked_loss(a_log, a_lab, w["w_splice"])
+        loss_t = _masked_loss(t_log, t_lab, w["w_tss"])
+        loss_p = _masked_loss(p_log, p_lab, w["w_polya"])
+
         total = loss_d + loss_a + loss_t + loss_p
         logs = {
             "loss/total": total,
