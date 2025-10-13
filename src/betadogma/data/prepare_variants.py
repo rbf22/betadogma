@@ -6,7 +6,9 @@ Usage:
     --vcf data/variants/cohort.vcf.gz \
     --windows "data/cache/gencode_v44_structural_base/*.parquet" \
     --out data/cache/variants_aligned \
-    [--apply-alt] [--max-per-window 100] [--seed 42]
+    [--apply-alt] [--max-per-window 100] [--seed 42] \
+    [--min-af 0.005] [--max-af 0.995] \
+    [--min-qual 20] [--filter-pass] [--n-jobs -1]
 
 Outputs: Parquet shards in <out>/shard_*.parquet with rows:
   chrom, start, end, bin_size, seq (REF window), seq_alt (if --apply-alt),
@@ -25,9 +27,34 @@ from typing import Dict, Any, List, Optional, Tuple, Set
 import logging
 import numpy as np
 import pandas as pd
+from pathlib import Path
+import sys
 
-# local helpers
-from .encode import encode_variant, apply_variants_to_sequence, build_variant_channels, rescue_insertion_variant
+# =============================================================================
+# Handle imports for both script and module execution
+# =============================================================================
+
+# Add parent directory to path if needed (for script execution)
+_current_file = Path(__file__).resolve()
+_package_root = _current_file.parent.parent.parent
+if str(_package_root) not in sys.path:
+    sys.path.insert(0, str(_package_root))
+
+# Now import from the package
+try:
+    from betadogma.data.encode import (
+        encode_variant,
+        apply_variants_to_sequence,
+        build_variant_channels,
+        rescue_insertion_variant
+    )
+except ImportError as e:
+    print(f"Error importing encode module: {e}", file=sys.stderr)
+    print(f"Python path: {sys.path}", file=sys.stderr)
+    print(f"Current file: {_current_file}", file=sys.stderr)
+    print(f"Package root: {_package_root}", file=sys.stderr)
+    raise
+
 
 # Try to import psutil for memory monitoring
 try:
@@ -49,6 +76,19 @@ def parse_args():
                     help="Rows per output shard.")
     ap.add_argument("--seed", type=int, default=42, help="Random seed for variant selection reproducibility.")
     ap.add_argument("--debug", action="store_true", help="Enable debug output.")
+    
+    # VCF filtering options
+    ap.add_argument("--min-af", type=float, default=0.0, 
+                    help="Minimum allele frequency (default: 0.0, no filter)")
+    ap.add_argument("--max-af", type=float, default=1.0, 
+                    help="Maximum allele frequency (default: 1.0, no filter)")
+    ap.add_argument("--min-qual", type=float, default=0.0, 
+                    help="Minimum variant quality score (default: 0.0, no filter)")
+    ap.add_argument("--filter-pass", action="store_true", 
+                    help="Only include variants with FILTER=PASS")
+    ap.add_argument("--n-jobs", type=int, default=1, 
+                    help="Number of parallel jobs (currently not used, reserved for future)")
+    
     return ap.parse_args()
 
 
@@ -69,15 +109,56 @@ def get_memory_usage():
     return 0
 
 
-def _iter_vcf(path: str, logger=None):
+def parse_info_field(info_str: str) -> Dict[str, str]:
+    """Parse VCF INFO field into a dictionary."""
+    info_dict = {}
+    if info_str and info_str != '.':
+        for item in info_str.split(';'):
+            if '=' in item:
+                key, value = item.split('=', 1)
+                info_dict[key] = value
+            else:
+                info_dict[item] = True
+    return info_dict
+
+
+def get_allele_frequency(info_str: str) -> Optional[float]:
+    """Extract allele frequency from INFO field."""
+    info = parse_info_field(info_str)
+    
+    # Try common AF tags
+    for tag in ['AF', 'MAF', 'FREQ']:
+        if tag in info:
+            try:
+                af_str = info[tag]
+                # Handle comma-separated values (multiple alternates)
+                if ',' in af_str:
+                    af_str = af_str.split(',')[0]
+                return float(af_str)
+            except (ValueError, TypeError):
+                continue
+    
+    return None
+
+
+def _iter_vcf(path: str, min_qual: float = 0.0, filter_pass: bool = False, logger=None):
     """
     Minimal VCF parser that yields dicts:
       chrom, pos (1-based), id, ref, alt (list[str]), qual, filter, info, samples...
+    
+    Args:
+        path: Path to VCF file
+        min_qual: Minimum quality score (variants below this are skipped)
+        filter_pass: If True, only include variants with FILTER=PASS
+        logger: Optional logger
     """
     opener = open
     if path.endswith(".gz"):
         import gzip
         opener = gzip.open
+    
+    filtered_qual = 0
+    filtered_pass = 0
     
     with opener(path, "rt", encoding="utf-8", errors="ignore") as f:
         # Read and parse header
@@ -102,9 +183,26 @@ def _iter_vcf(path: str, logger=None):
             chrom, pos, vid, ref, alt, qual, flt, info = t[:8]
             samples = t[8:]
             
+            # Apply quality filter
+            if min_qual > 0.0 and qual != '.':
+                try:
+                    if float(qual) < min_qual:
+                        filtered_qual += 1
+                        continue
+                except ValueError:
+                    pass
+            
+            # Apply FILTER field filter
+            if filter_pass and flt != 'PASS':
+                filtered_pass += 1
+                continue
+            
+            # Normalize chromosome name (strip 'chr' prefix if present)
+            normalized_chrom = chrom[3:] if chrom.startswith('chr') else chrom
+            
             # Create variant dict
             variant = {
-                "chrom": chrom,
+                "chrom": normalized_chrom,
                 "pos": int(pos),
                 "id": None if vid == "." else vid,
                 "ref": ref,
@@ -120,23 +218,43 @@ def _iter_vcf(path: str, logger=None):
                 v = variant.copy()
                 v['alt'] = [alt_allele]
                 yield v
+    
+    if logger and (filtered_qual > 0 or filtered_pass > 0):
+        logger.info(f"  Filtered {filtered_qual:,} variants by quality and {filtered_pass:,} by FILTER field")
 
 
-def _read_vcf_glob(vcf_glob: str, logger=None) -> List[Dict[str, Any]]:
+def _read_vcf_glob(vcf_glob: str, min_af: float = 0.0, max_af: float = 1.0, 
+                   min_qual: float = 0.0, filter_pass: bool = False, 
+                   logger=None) -> List[Dict[str, Any]]:
     """Read VCF files and return a list of variant dictionaries."""
     paths = sorted(glob(vcf_glob)) if not os.path.isfile(vcf_glob) else [vcf_glob]
     assert paths, f"No VCF files matched: {vcf_glob}"
     
     out: List[Dict[str, Any]] = []
     variant_type_counts = {"SNP": 0, "INS": 0, "DEL": 0}
+    filtered_af = 0
     
     logger.info(f"Processing VCF files: {paths}")
+    if min_af > 0.0 or max_af < 1.0:
+        logger.info(f"  Allele frequency filter: {min_af} <= AF <= {max_af}")
+    if min_qual > 0.0:
+        logger.info(f"  Minimum quality: {min_qual}")
+    if filter_pass:
+        logger.info(f"  Requiring FILTER=PASS")
     
     for p in paths:
         logger.info(f"Reading variants from: {p}")
         file_variants = 0
         
-        for r in _iter_vcf(p, logger):
+        for r in _iter_vcf(p, min_qual=min_qual, filter_pass=filter_pass, logger=logger):
+            # Apply allele frequency filter
+            if min_af > 0.0 or max_af < 1.0:
+                af = get_allele_frequency(r['info'])
+                if af is not None:
+                    if af < min_af or af > max_af:
+                        filtered_af += 1
+                        continue
+            
             alt_str = ",".join(r['alt'])
             spec = f"{r['chrom']}:{r['pos']}{r['ref']}>{alt_str}"
             
@@ -167,6 +285,8 @@ def _read_vcf_glob(vcf_glob: str, logger=None) -> List[Dict[str, Any]]:
     # Print statistics
     total_variants = len(out)
     logger.info(f"\nTotal variants: {total_variants:,}")
+    if filtered_af > 0:
+        logger.info(f"  Filtered by allele frequency: {filtered_af:,}")
     logger.info("Variant types:")
     for var_type, count in sorted(variant_type_counts.items()):
         pct = count / total_variants * 100 if total_variants > 0 else 0
@@ -440,13 +560,18 @@ def write_shard(rows: List[Dict], shard_idx: int, output_dir: str, logger) -> in
 
 def run(vcf: str, windows: str, out: str, apply_alt: bool = False, 
         max_per_window: int = 100, shard_size: int = 1000, seed: int = 42, 
-        debug: bool = False):
+        debug: bool = False, min_af: float = 0.0, max_af: float = 1.0,
+        min_qual: float = 0.0, filter_pass: bool = False, n_jobs: int = 1):
     """Main function to prepare variant data with natural distributions."""
     
     start_time = time.time()
     logger = setup_logging(debug)
     os.makedirs(out, exist_ok=True)
     random.seed(seed)
+    
+    # Note about n_jobs
+    if n_jobs != 1:
+        logger.info(f"Note: --n-jobs={n_jobs} specified but parallel processing not yet implemented")
     
     # Track memory at start
     initial_mem = get_memory_usage()
@@ -482,7 +607,9 @@ def run(vcf: str, windows: str, out: str, apply_alt: bool = False,
 
     # Read VCF
     logger.info("Reading VCF files...")
-    variants = _read_vcf_glob(vcf, logger)
+    variants = _read_vcf_glob(vcf, min_af=min_af, max_af=max_af, 
+                              min_qual=min_qual, filter_pass=filter_pass, 
+                              logger=logger)
     stats["total_vcf_variants"] = len(variants)
     
     vcf_mem = get_memory_usage()
@@ -561,11 +688,15 @@ def run(vcf: str, windows: str, out: str, apply_alt: bool = False,
             )
             last_log_time = time.time()
         
-        # Get variants in window
-        hits = [
-            v for v in variants_by_chr.get(chrom, []) 
-            if w0 <= (v["pos"] - 1) < w1
-        ]
+        # Normalize chromosome name for matching (strip 'chr' prefix if present)
+        norm_chrom = chrom[3:] if chrom.startswith('chr') else chrom
+        
+        # Get variants in window, checking both original and normalized chromosome names
+        hits = []
+        for v in variants_by_chr.get(chrom, []) + variants_by_chr.get(norm_chrom, []):
+            # Skip if we've already processed this variant (in case both chrom and norm_chrom exist)
+            if w0 <= (v["pos"] - 1) < w1 and v not in hits:
+                hits.append(v)
         
         if not hits:
             continue
@@ -816,12 +947,19 @@ def main():
         shard_size=int(args.shard_size),
         seed=args.seed,
         debug=args.debug,
+        min_af=args.min_af,
+        max_af=args.max_af,
+        min_qual=args.min_qual,
+        filter_pass=args.filter_pass,
+        n_jobs=args.n_jobs,
     )
 
 
 def prepare_variants(vcf: str, windows: str, out: str, apply_alt: bool = False, 
                     max_per_window: int = 100, shard_size: int = 1000, 
-                    seed: int = 42, debug: bool = False) -> None:
+                    seed: int = 42, debug: bool = False, min_af: float = 0.0,
+                    max_af: float = 1.0, min_qual: float = 0.0,
+                    filter_pass: bool = False, n_jobs: int = 1) -> None:
     """
     Prepare variant data for Betadogma training.
     
@@ -834,6 +972,11 @@ def prepare_variants(vcf: str, windows: str, out: str, apply_alt: bool = False,
         shard_size: Number of rows per output shard (default 1000 for memory management)
         seed: Random seed for reproducibility
         debug: Enable debug logging
+        min_af: Minimum allele frequency (0.0 = no filter)
+        max_af: Maximum allele frequency (1.0 = no filter)
+        min_qual: Minimum variant quality score (0.0 = no filter)
+        filter_pass: Only include variants with FILTER=PASS
+        n_jobs: Number of parallel jobs (reserved for future use)
     """
     run(
         vcf=vcf,
@@ -844,6 +987,11 @@ def prepare_variants(vcf: str, windows: str, out: str, apply_alt: bool = False,
         shard_size=shard_size,
         seed=seed,
         debug=debug,
+        min_af=min_af,
+        max_af=max_af,
+        min_qual=min_qual,
+        filter_pass=filter_pass,
+        n_jobs=n_jobs,
     )
 
 

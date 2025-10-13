@@ -13,8 +13,8 @@ dist/
 .pytest_cache/
 .ruff_cache/
 .checkpoints/
-data/data_chr22/
-data/data_mini/
+data/raw/
+data/cache/
 train/runs
 poetry.lock
 ./poetry.lock

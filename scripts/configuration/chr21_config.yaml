@@ -1,0 +1,335 @@
+# =============================================================================
+# BetaDogma Chromosome 21 Data Pipeline Configuration
+# =============================================================================
+# Fast single-chromosome configuration for testing and development
+#
+# This config processes only chr21 (~47 Mb, ~1.5% of genome)
+# Expected runtime: 1-3 hours (vs 3-5 days for whole genome)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# COMMON SETTINGS
+# -----------------------------------------------------------------------------
+name: "chr21_fast"
+genome_build: GRCh38
+chromosome: "chr21"  # Process only chromosome 21 (with 'chr' prefix to match windows format)
+seed: 42
+
+# -----------------------------------------------------------------------------
+# DIRECTORIES (relative to this config file)
+# -----------------------------------------------------------------------------
+paths:
+  # Raw downloaded data (shared with whole genome)
+  raw: "../../data/raw"
+  
+  # Intermediate processed data (much smaller for chr21)
+  cache: "../../data/cache/chr21"
+  
+  # Final training-ready data
+  output: "../../data/processed/chr21"
+
+# -----------------------------------------------------------------------------
+# DOWNLOAD CONFIGURATION (used by download_data.py)
+# -----------------------------------------------------------------------------
+download:
+  skip_existing: true
+  max_retries: 5
+  timeout: 600
+  chunk_size: 8388608  # 8MB chunks
+  
+  sources:
+    # Reference genome (whole genome - can't download just chr21)
+    genome:
+      base_url: "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44"
+      files:
+        - filename: "GRCh38.primary_assembly.genome.fa.gz"
+          checksum: "e9a2d5a5cd225293646ae298998ad4ea8c11e8f22729bc2d6f5c3dcfefbf8ef8"
+          output_path: "genome/GRCh38.primary_assembly.genome.fa.gz"
+          size_bytes: 938553757  # ~895 MB
+          decompress: true
+          create_index: true
+    
+    # GENCODE annotations
+    gencode:
+      release: 44
+      base_url: "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44"
+      files:
+        - filename: "gencode.v44.annotation.gtf.gz"
+          checksum: "01f817afed65feee863361b4baf30a95e722ee5c5d508ff77b04106ef7ba20d3"
+          output_path: "gencode/gencode.v44.annotation.gtf.gz"
+          size_bytes: 49442327  # ~47 MB
+          decompress: true
+    
+    # GTEx expression data
+    gtex:
+      base_url: "https://storage.googleapis.com/adult-gtex"
+      files:
+        - filename: "GTEx_Analysis_2017-06-05_v8_STARv2.5.3a_junctions.gct.gz"
+          url_path: "bulk-gex/v8/rna-seq/GTEx_Analysis_2017-06-05_v8_STARv2.5.3a_junctions.gct.gz"
+          checksum: "d3b09e46856a33f390ec59c1d2bc7b65589cf50f20dabf1d0759093966d3a602"
+          output_path: "gtex/junctions/GTEx_junctions.gct.gz"
+          size_bytes: 2400000000  # ~2.4 GB (filters to chr21 during processing)
+        
+        - filename: "GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_tpm.gct.gz"
+          url_path: "bulk-gex/v8/rna-seq/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_tpm.gct.gz"
+          checksum: "ec783825ebebb8ba8525b73cb7ff9577162bc0d2e8a7fdc408283b7639c306fb"
+          output_path: "gtex/expression/GTEx_gene_tpm.gct.gz"
+          size_bytes: 126000000  # ~126 MB
+        
+        - filename: "GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt"
+          url_path: "annotations/v8/metadata-files/GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt"
+          checksum: "74f6ab4c34ed2648d708a0ae6e6dff324f6c86ea723ae7d1c37d76f5221148f0"
+          output_path: "gtex/metadata/GTEx_samples.txt"
+          size_bytes: 8800000  # ~8.8 MB
+    
+    # Variant data (filters to chr21 during processing)
+    variants:
+      base_url: "https://ftp.ensembl.org/pub/current_variation/vcf/homo_sapiens"
+      files:
+        - filename: "1000GENOMES-phase_3.vcf.gz"
+          checksum: "b54f496abcab3ab11f9b4991751f48c142b723a834d66a039772236824476928"
+          output_path: "variants/1000GENOMES-phase_3.vcf.gz"
+          size_bytes: 2500000000  # ~2.5 GB (but only chr21 is read)
+        
+        - filename: "1000GENOMES-phase_3.vcf.gz.csi"
+          checksum: null
+          output_path: "variants/1000GENOMES-phase_3.vcf.gz.csi"
+          required: false
+          size_bytes: 500000
+
+# -----------------------------------------------------------------------------
+# PROCESSING CONFIGURATION (used by prepare_training_data.py)
+# -----------------------------------------------------------------------------
+processing:
+  
+  # Step 1: Prepare GENCODE windows (chr21 only)
+  gencode:
+    enabled: true
+    kwargs:
+      fasta: "{paths.raw}/genome/GRCh38.primary_assembly.genome.fa"
+      gtf: "{paths.raw}/gencode/gencode.v44.annotation.gtf"
+      out: "{paths.cache}/gencode_windows_base"
+      window: 131072        # 128k windows (2^17)
+      stride: 131072        # Non-overlapping
+      bin_size: 1           # Base-resolution labels
+      chroms: "chr21"       # ⭐ ONLY CHROMOSOME 21
+      max_shard_bases: 50000000  # 50 MB per shard (smaller for single chr)
+      smoke: false
+  
+  # Step 2: Prepare GTEx junction data (chr21 only)
+  gtex:
+    enabled: true
+    kwargs:
+      junctions: "{paths.raw}/gtex/junctions/GTEx_junctions.gct.gz"
+      gtf: "{paths.raw}/gencode/gencode.v44.annotation.gtf"
+      out: "{paths.cache}/gtex_psi"
+      chroms: "chr21"       # ⭐ ONLY CHROMOSOME 21
+      
+      # Relaxed thresholds for faster processing (chr21 is smaller)
+      min_count: 3          # Lower threshold (3 vs 5)
+      min_total: 20         # Lower threshold (20 vs 50)
+      min_samples: 5        # Lower threshold (5 vs 10)
+      
+      # Quality filters
+      max_intron_length: 500000
+      min_intron_length: 20
+      
+      # Performance
+      smoke: false
+      n_jobs: -1
+  
+  # Step 3: Add variants to base windows (chr21 only)
+  variants:
+    enabled: true
+    kwargs:
+      vcf: "{paths.raw}/variants/1000GENOMES-phase_3.vcf.gz"
+      windows: "{paths.cache}/gencode_windows_base/*.parquet"
+      out: "{paths.cache}/variants_base"
+      
+      # Variant settings
+      apply_alt: true
+      
+      # More permissive filtering for chr21
+      max_per_window: 100   # Allow more variants (100 vs 50)
+      min_af: 0.005         # Lower threshold (0.5% vs 1%)
+      max_af: 0.995         # Higher threshold
+      
+      # Performance settings
+      shard_size: 10000     # Smaller shards for faster iteration
+      n_jobs: -1
+      
+      # Quality filters
+      min_qual: 20          # Lower threshold (20 vs 30)
+      filter_pass: false    # Don't require FILTER=PASS
+      
+      seed: "{seed}"
+      debug: false
+  
+  # Step 4: Create overlapping windows
+  overlapping_windows:
+    enabled: true
+    kwargs:
+      base_windows: "{paths.cache}/variants_base"
+      out: "{paths.cache}/variants_overlapping"
+      stride: 65536         # 64k stride = 50% overlap
+      
+      reuse_variants: true
+      
+      shard_size: 10000
+      n_jobs: -1
+      
+      seed: "{seed}"
+      debug: false
+  
+  # Step 5: Aggregate all data
+  aggregate:
+    enabled: true
+    kwargs:
+      input_dir: "{paths.cache}/gencode_windows_base"
+      output_dir: "{paths.output}"
+      gtex_dir: "{paths.cache}/gtex_psi"
+      variant_dir: "{paths.cache}/variants_overlapping"
+      
+      # Output format
+      write_index: true
+      split_by: "chrom"     # Will create chr21.parquet
+      format: "parquet"
+      compression: "snappy"
+      
+      # Column selection
+      keep_columns:
+        - chrom
+        - start
+        - end
+        - seq
+        - donor
+        - acceptor
+        - tss
+        - polya
+        - psi
+        - variant_mask
+        - variant_info
+      
+      # Relaxed filtering
+      max_variants_per_window: 0
+      min_coverage: 0.3     # Lower threshold (30% vs 50%)
+      
+      # Quality control
+      validate: true
+      write_stats: true
+      
+      n_jobs: -1
+
+# -----------------------------------------------------------------------------
+# RESOURCE MANAGEMENT (much smaller for chr21)
+# -----------------------------------------------------------------------------
+resources:
+  # Expected disk space requirements
+  disk_space:
+    raw: "10 GB"           # Same as whole genome (shared)
+    cache: "10 GB"         # ⭐ Much smaller (10 GB vs 500 GB)
+    output: "5 GB"         # ⭐ Much smaller (5 GB vs 200 GB)
+    total: "25 GB"         # ⭐ Total: 25 GB vs 710 GB
+  
+  # Expected memory requirements per step
+  memory:
+    gencode: "4 GB"        # ⭐ Much less memory needed
+    gtex: "8 GB"           # ⭐ GTEx filters early to chr21
+    variants: "4 GB"
+    overlapping: "2 GB"
+    aggregate: "8 GB"
+  
+  # Recommended CPU cores (can run on laptop)
+  cpus: 4                  # ⭐ Works fine with 4 cores
+  
+  # Expected runtime (on 4-core machine)
+  estimated_time:
+    download: "2-4 hours"  # Same (if files not already downloaded)
+    gencode: "5-10 min"    # ⭐ Very fast
+    gtex: "20-40 min"      # ⭐ Fast (filters to chr21 early)
+    variants: "30-60 min"  # ⭐ Much faster
+    overlapping: "10-20 min"
+    aggregate: "10-20 min"
+    total: "1.5-3 hours"   # ⭐ TOTAL: ~2 hours vs 3-5 days!
+
+# -----------------------------------------------------------------------------
+# VALIDATION
+# -----------------------------------------------------------------------------
+validation:
+  expected_outputs:
+    download:
+      - "{paths.raw}/genome/GRCh38.primary_assembly.genome.fa"
+      - "{paths.raw}/genome/GRCh38.primary_assembly.genome.fa.fai"
+      - "{paths.raw}/gencode/gencode.v44.annotation.gtf"
+      - "{paths.raw}/gtex/junctions/GTEx_junctions.gct.gz"
+      - "{paths.raw}/variants/1000GENOMES-phase_3.vcf.gz"
+    
+    gencode:
+      - "{paths.cache}/gencode_windows_base/shard_*.parquet"
+      - "{paths.cache}/gencode_windows_base/metadata.json"
+    
+    gtex:
+      - "{paths.cache}/gtex_psi/junction_psi.parquet"
+      - "{paths.cache}/gtex_psi/gene_psi_summary.parquet"
+    
+    variants:
+      - "{paths.cache}/variants_base/shard_*.parquet"
+      - "{paths.cache}/variants_base/metadata.json"
+    
+    overlapping_windows:
+      - "{paths.cache}/variants_overlapping/shard_*.parquet"
+      - "{paths.cache}/variants_overlapping/metadata.json"
+    
+    aggregate:
+      - "{paths.output}/chr21.parquet"  # ⭐ Single file for chr21
+      - "{paths.output}/index.json"
+      - "{paths.output}/statistics.json"
+  
+  # Minimum expected counts (scaled to chr21 size)
+  minimum_counts:
+    gencode_windows: 300      # ⭐ chr21 is ~47 Mb / 128kb ≈ 367 windows
+    gtex_junctions: 1000      # ⭐ Fewer junctions on chr21
+    variants: 150000          # ⭐ chr21 has ~1.5% of genome variants
+    final_windows: 600        # ⭐ With 50% overlap = ~2x base windows
+
+# -----------------------------------------------------------------------------
+# LOGGING AND MONITORING
+# -----------------------------------------------------------------------------
+logging:
+  level: "INFO"
+  file: "{paths.output}/pipeline.log"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+  progress_bar: true
+  checkpoint_frequency: 500  # More frequent for smaller dataset
+  
+  track_memory: true
+  track_time: true
+  profile: false
+
+# -----------------------------------------------------------------------------
+# CHECKPOINTING
+# -----------------------------------------------------------------------------
+checkpoints:
+  enabled: true
+  dir: "{paths.cache}/checkpoints"
+  save_frequency: 1000
+  auto_resume: true
+  validate_on_resume: true
+
+# -----------------------------------------------------------------------------
+# EXPERIMENTAL / ADVANCED OPTIONS
+# -----------------------------------------------------------------------------
+advanced:
+  augmentation:
+    enabled: false
+    reverse_complement: true
+    random_shift: 0
+  
+  additional_genomes: []
+  custom_labels: []
+  
+  distributed:
+    enabled: false
+    backend: "dask"
+    scheduler: null

@@ -202,11 +202,11 @@ def apply_variants_to_sequence(sequence: str, variants: List[Dict[str, Any]],
             overlap = i - pos_0
             if var_type == "INS":
                 ins_failed += 1
-                logger.debug(f"Insertion at {pos_1} failed: overlaps with previous variant")
-            raise VariantError(
-                f"Variant at position {pos_1} overlaps with previous variant by {overlap} base(s)",
-                variant=v
-            )
+                logger.warning(f"Skipping overlapping variant at position {pos_1} (overlaps previous variant by {overlap} base(s))")
+                continue
+            else:
+                logger.warning(f"Skipping overlapping variant at position {pos_1} (overlaps previous variant by {overlap} base(s))")
+                continue
         
         # Add sequence up to this variant
         result.append(sequence[i:pos_0])

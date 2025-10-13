@@ -5,7 +5,7 @@ This avoids redundant variant conflict checking by reusing variants from
 base windows and only checking conflicts at window boundaries.
 
 Usage:
-  python -m betadogma.data.create_overlapping_windows \
+  python -m betadogma.data.prepare_overlapping \
     --base-windows data/cache/variants_base \
     --out data/cache/variants_overlapping \
     --stride 65536 \
@@ -38,6 +38,10 @@ def parse_args():
     ap.add_argument("--stride", type=int, default=65536, help="Stride for overlapping windows")
     ap.add_argument("--shard-size", type=int, default=1000, help="Rows per output shard (for memory management)")
     ap.add_argument("--seed", type=int, default=42, help="Random seed")
+    ap.add_argument("--reuse-variants", action="store_true", 
+                    help="Reuse variants from base windows (enabled by default, flag kept for compatibility)")
+    ap.add_argument("--n-jobs", type=int, default=1,
+                    help="Number of parallel jobs (currently not used, reserved for future)")
     ap.add_argument("--debug", action="store_true", help="Enable debug output")
     return ap.parse_args()
 
@@ -105,7 +109,19 @@ def stream_base_shards(base_windows_dir: str, logger):
     base_files = sorted(glob(os.path.join(base_windows_dir, "shard_*.parquet")))
     
     if not base_files:
-        raise ValueError(f"No base window files found in {base_windows_dir}")
+        # Check if directory exists
+        if not os.path.exists(base_windows_dir):
+            raise ValueError(f"Base windows directory does not exist: {base_windows_dir}")
+        
+        # List what files are actually there
+        all_files = os.listdir(base_windows_dir) if os.path.isdir(base_windows_dir) else []
+        if all_files:
+            logger.error(f"Directory exists but no shard_*.parquet files found.")
+            logger.error(f"Files in directory: {all_files[:10]}")  # Show first 10 files
+        else:
+            logger.error(f"Directory exists but is empty: {base_windows_dir}")
+        
+        raise ValueError(f"No base window files (shard_*.parquet) found in {base_windows_dir}")
     
     logger.info(f"Found {len(base_files)} base window shards")
     
@@ -264,6 +280,8 @@ def create_overlapping_windows(
     stride: int = 65536,
     shard_size: int = 1000,
     seed: int = 42,
+    reuse_variants: bool = True,
+    n_jobs: int = 1,
     debug: bool = False
 ):
     """
@@ -274,10 +292,26 @@ def create_overlapping_windows(
     2. Maintain a sliding buffer of base windows per chromosome
     3. Generate overlapping windows as soon as we have enough data
     4. Write output immediately to keep memory usage low
+    
+    Args:
+        base_windows_dir: Directory with base variant windows
+        output_dir: Output directory for overlapping windows
+        stride: Stride for overlapping windows
+        shard_size: Rows per output shard
+        seed: Random seed
+        reuse_variants: Whether to reuse variants (always True, kept for compatibility)
+        n_jobs: Number of parallel jobs (reserved for future use)
+        debug: Enable debug output
     """
     logger = setup_logging(debug)
     os.makedirs(output_dir, exist_ok=True)
     random.seed(seed)
+    
+    # Note about unused parameters
+    if not reuse_variants:
+        logger.warning("--reuse-variants=False is not supported, variants will be reused")
+    if n_jobs != 1:
+        logger.info(f"Note: --n-jobs={n_jobs} specified but parallel processing not yet implemented")
     
     start_time = time.time()
     initial_mem = get_memory_usage()
@@ -285,12 +319,28 @@ def create_overlapping_windows(
     
     # Get window size from first shard
     logger.info(f"Loading base windows from: {base_windows_dir}")
+    
+    # Check directory exists
+    if not os.path.exists(base_windows_dir):
+        raise ValueError(f"Base windows directory does not exist: {base_windows_dir}")
+    
     base_files = sorted(glob(os.path.join(base_windows_dir, "shard_*.parquet")))
     
     if not base_files:
-        raise ValueError(f"No base window files found in {base_windows_dir}")
+        # List what files are actually there
+        all_files = os.listdir(base_windows_dir) if os.path.isdir(base_windows_dir) else []
+        logger.error(f"No shard_*.parquet files found in {base_windows_dir}")
+        if all_files:
+            logger.error(f"Files in directory ({len(all_files)} total): {all_files[:20]}")
+        else:
+            logger.error(f"Directory is empty")
+        raise ValueError(f"No base window files (shard_*.parquet) found in {base_windows_dir}")
     
     first_df = pd.read_parquet(base_files[0])
+    
+    if first_df.empty:
+        raise ValueError(f"First shard file is empty: {base_files[0]}")
+    
     window_size = first_df.iloc[0]['end'] - first_df.iloc[0]['start']
     del first_df
     gc.collect()
@@ -525,6 +575,8 @@ def main():
         stride=args.stride,
         shard_size=args.shard_size,
         seed=args.seed,
+        reuse_variants=args.reuse_variants,
+        n_jobs=args.n_jobs,
         debug=args.debug
     )
 
