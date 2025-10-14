@@ -34,11 +34,13 @@ except ImportError:
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-windows", required=True, help="Directory with base (non-overlapping) variant windows")
+    ap.add_argument("--fallback-windows", dest="fallback_windows", default=None,
+                    help="Alternative base windows directory to use if the primary base windows fail to generate overlapping windows")
     ap.add_argument("--out", required=True, help="Output directory for overlapping windows")
     ap.add_argument("--stride", type=int, default=65536, help="Stride for overlapping windows")
     ap.add_argument("--shard-size", type=int, default=1000, help="Rows per output shard (for memory management)")
     ap.add_argument("--seed", type=int, default=42, help="Random seed")
-    ap.add_argument("--reuse-variants", action="store_true", 
+    ap.add_argument("--reuse-variants", action="store_true",
                     help="Reuse variants from base windows (enabled by default, flag kept for compatibility)")
     ap.add_argument("--n-jobs", type=int, default=1,
                     help="Number of parallel jobs (currently not used, reserved for future)")
@@ -569,16 +571,40 @@ def create_overlapping_windows(
 
 def main():
     args = parse_args()
-    create_overlapping_windows(
-        base_windows_dir=args.base_windows,
-        output_dir=args.out,
-        stride=args.stride,
-        shard_size=args.shard_size,
-        seed=args.seed,
-        reuse_variants=args.reuse_variants,
-        n_jobs=args.n_jobs,
-        debug=args.debug
-    )
+    try:
+        create_overlapping_windows(
+            base_windows_dir=args.base_windows,
+            output_dir=args.out,
+            stride=args.stride,
+            shard_size=args.shard_size,
+            seed=args.seed,
+            reuse_variants=args.reuse_variants,
+            n_jobs=args.n_jobs,
+            debug=args.debug
+        )
+    except Exception as e:
+        # Log the failure of the primary run
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.exception("Primary base windows processing failed with error: %s", e)
+
+        # If a fallback is provided, retry with it
+        fallback = getattr(args, "fallback_windows", None)
+        if fallback:
+            logger.info("Attempting fallback with alternative base windows: %s", fallback)
+            create_overlapping_windows(
+                base_windows_dir=fallback,
+                output_dir=args.out,
+                stride=args.stride,
+                shard_size=args.shard_size,
+                seed=args.seed,
+                reuse_variants=args.reuse_variants,
+                n_jobs=args.n_jobs,
+                debug=args.debug
+            )
+        else:
+            # No fallback provided; re-raise to fail fast
+            raise
 
 
 if __name__ == "__main__":
