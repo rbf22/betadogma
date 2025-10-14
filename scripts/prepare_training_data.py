@@ -49,6 +49,7 @@ class TrainingDataPreparer:
         "gencode",
         "gtex",
         "variants",
+        "splice_variants",  # UPDATED: was "pathogenic_variants"
         "overlapping_windows",
         "aggregate"
     ]
@@ -298,6 +299,7 @@ class TrainingDataPreparer:
             'gencode': ['fasta', 'gtf'],
             'gtex': ['junctions', 'gtf'],
             'variants': ['vcf'],
+            'splice_variants': ['splicevar_vcf', 'gtf'],  # UPDATED: renamed from pathogenic_variants
             'overlapping_windows': [],  # Only uses intermediate outputs
             'aggregate': []  # Only uses intermediate outputs
         }
@@ -325,8 +327,8 @@ class TrainingDataPreparer:
                         else:
                             self.logger.info(f"  ✓ Found FASTA index: {fai_path.name}")
                     
-                    # Special handling for VCF files - check/create index
-                    elif key == 'vcf':
+                    # Special handling for VCF files (including splicevar_vcf) - check/create index
+                    elif key in ['vcf', 'splicevar_vcf', 'clinvar_vcf']:  # UPDATED: added splicevar_vcf
                         tbi_path = Path(str(path) + '.tbi')
                         csi_path = Path(str(path) + '.csi')
                         
@@ -612,6 +614,7 @@ class TrainingDataPreparer:
             'gencode': 'src/betadogma/data/prepare_gencode.py',
             'gtex': 'src/betadogma/data/prepare_gtex.py',
             'variants': 'src/betadogma/data/prepare_variants.py',
+            'splice_variants': 'src/betadogma/data/prepare_splice_variants.py',  # UPDATED: renamed
             'overlapping_windows': 'src/betadogma/data/prepare_overlapping.py',
             'aggregate': 'src/betadogma/data/aggregate_data.py',
         }
@@ -832,27 +835,22 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Processing Steps (in order):
-  1. gencode    - Create genomic windows with structural annotations
-  2. gtex       - Process GTEx junction data and calculate PSI values
-  3. variants   - Add genetic variants to base windows
-  4. overlapping - Create overlapping windows from base windows
-  5. aggregate  - Merge all data sources into final training format
+  1. gencode           - Create genomic windows with structural annotations
+  2. gtex              - Process GTEx junction data and calculate PSI values
+  3. variants          - Add genetic variants to base windows
+  4. splice_variants   - Add experimentally validated splice variants (SpliceVarDB)
+  5. overlapping_windows - Create overlapping windows from base windows
+  6. aggregate         - Merge all data sources into final training format
 
 Examples:
   # Run full pipeline
   python scripts/prepare_training_data.py --config configs/data.whole_genome.yaml
   
-  # Resume from specific step
-  python scripts/prepare_training_data.py --config configs/data.whole_genome.yaml --from-step variants
+  # Resume from splice variants step
+  python scripts/prepare_training_data.py --config configs/data.whole_genome.yaml --from-step splice_variants
   
   # Force re-run from specific step
   python scripts/prepare_training_data.py --config configs/data.whole_genome.yaml --from-step gtex --force
-  
-  # Enable debug logging
-  python scripts/prepare_training_data.py --config configs/data.whole_genome.yaml --debug
-  
-  # Validate outputs only
-  python scripts/prepare_training_data.py --config configs/data.whole_genome.yaml --validate-only
         """
     )
     

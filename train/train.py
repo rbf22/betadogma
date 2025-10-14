@@ -158,7 +158,11 @@ class StructuralParquetDataset(Dataset):
     def __getitem__(self, idx):
         r = self._rows[idx]
         return {
-            "seq": r["seq"],
+            "seq": r["seq"],           # Reference sequence
+            "seq_alt": r.get("seq_alt"),  # Variant sequence (if exists)
+            "variant_type": r.get("variant_type"),  # SNP/INS/DEL
+            "variant_af": r.get("variant_af", 1.0),  # Allele frequency
+            "is_pathogenic": r.get("is_pathogenic", False),  # Label
             "donor": torch.tensor(r["donor"], dtype=torch.float32),
             "acceptor": torch.tensor(r["acceptor"], dtype=torch.float32),
             "tss": torch.tensor(r["tss"], dtype=torch.float32),
@@ -172,11 +176,27 @@ def structural_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     def pad1d(x, L): return F.pad(x, (0, L - len(x)))
 
     seqs = [b["seq"] for b in batch]
-    donor   = torch.stack([pad1d(b["donor"],   max_Lr) for b in batch])
-    acceptor= torch.stack([pad1d(b["acceptor"],max_Lr) for b in batch])
-    tss     = torch.stack([pad1d(b["tss"],     max_Lr) for b in batch])
-    polya   = torch.stack([pad1d(b["polya"],   max_Lr) for b in batch])
-    return {"seqs": seqs, "donor": donor, "acceptor": acceptor, "tss": tss, "polya": polya}
+    seqs_alt = [b.get("seq_alt") for b in batch]  # NEW
+    has_variant = [s is not None for s in seqs_alt]  # NEW
+    variant_afs = [b.get("variant_af", 1.0) for b in batch]  # NEW
+    is_pathogenic = [b.get("is_pathogenic", False) for b in batch]  # NEW
+    
+    donor = torch.stack([pad1d(b["donor"], max_Lr) for b in batch])
+    acceptor = torch.stack([pad1d(b["acceptor"], max_Lr) for b in batch])
+    tss = torch.stack([pad1d(b["tss"], max_Lr) for b in batch])
+    polya = torch.stack([pad1d(b["polya"], max_Lr) for b in batch])
+    
+    return {
+        "seqs": seqs,
+        "seqs_alt": seqs_alt,  # NEW
+        "has_variant": torch.tensor(has_variant, dtype=torch.bool),  # NEW
+        "variant_afs": torch.tensor(variant_afs, dtype=torch.float32),  # NEW
+        "is_pathogenic": torch.tensor(is_pathogenic, dtype=torch.bool),  # NEW
+        "donor": donor,
+        "acceptor": acceptor,
+        "tss": tss,
+        "polya": polya,
+    }
 
 # LightningModule: Structural (NTEncoder + BetaDogmaModel)
 class LitStructural(pl.LightningModule):
@@ -207,6 +227,9 @@ class LitStructural(pl.LightningModule):
         self.lr = float(lr)
         self.weight_decay = float(weight_decay)
         self.save_hyperparameters({"lr": self.lr, "weight_decay": self.weight_decay})
+        # NEW: Variant effect prediction weights
+        self.w_consistency = float(model_cfg.get("loss", {}).get("w_consistency", 0.1))
+        self.w_disruption = float(model_cfg.get("loss", {}).get("w_disruption", 0.5))
 
     def _get_embeddings(self, seqs: Union[List[str], torch.Tensor]) -> torch.Tensor:
         """Extract embeddings tensor from encoder output (encoder runs on CPU).
@@ -404,55 +427,155 @@ class LitStructural(pl.LightningModule):
         except Exception as e:
             raise RuntimeError(f"Error in _compute_loss: {str(e)}") from e
 
-    def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        """Training step for the model.
+    def _compute_variant_effect_loss(
+        self,
+        outputs_ref: Dict[str, Dict[str, torch.Tensor]],
+        outputs_alt: Dict[str, Dict[str, torch.Tensor]],
+        batch: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute loss for variant effect prediction.
         
-        Args:
-            batch: Dictionary containing the input batch
-            batch_idx: Index of the current batch
-            
-        Returns:
-            The computed loss for this batch
+        Two components:
+        1. Consistency: Common variants should have similar predictions (small Δ)
+        2. Disruption: Pathogenic variants should have different predictions (large Δ)
         """
-        # Compute embeddings on CPU, then move to device
-        emb = self._get_embeddings(batch["seqs"])
+        # Extract predictions
+        def extract_preds(outs):
+            return {
+                'donor': outs["splice"]["donor"].squeeze(-1),
+                'acceptor': outs["splice"]["acceptor"].squeeze(-1),
+                'tss': outs["tss"]["tss"].squeeze(-1),
+                'polya': outs["polya"]["polya"].squeeze(-1),
+            }
         
-        outs = self.model(embeddings=emb)
-        loss, logs = self._compute_loss(outs, batch)
+        preds_ref = extract_preds(outputs_ref)
+        preds_alt = extract_preds(outputs_alt)
+        
+        has_variant = batch["has_variant"]  # [B]
+        variant_afs = batch["variant_afs"]  # [B]
+        is_pathogenic = batch["is_pathogenic"]  # [B]
+        
+        # Only compute for samples with variants
+        if not has_variant.any():
+            return torch.tensor(0.0, device=self.device), {}
+        
+        # Compute deltas for each task
+        deltas = {}
+        for task in ['donor', 'acceptor', 'tss', 'polya']:
+            ref = preds_ref[task][has_variant]  # [N, L]
+            alt = preds_alt[task][has_variant]  # [N, L]
+            # Align lengths
+            L = min(ref.shape[1], alt.shape[1])
+            deltas[task] = torch.abs(ref[:, :L] - alt[:, :L])  # [N, L]
+        
+        # Stack all deltas: [N, L, 4]
+        delta_stack = torch.stack([deltas[k] for k in ['donor', 'acceptor', 'tss', 'polya']], dim=-1)
+        delta_magnitude = delta_stack.mean(dim=-1)  # [N, L] - average across tasks
+        
+        # 1. CONSISTENCY LOSS: Benign (common) variants should have small Δ
+        #    Target: Δ ≈ 0 for high AF variants
+        benign_mask = has_variant & ~is_pathogenic  # [B]
+        if benign_mask.any():
+            # Weight by AF: higher AF = stronger consistency requirement
+            af_weights = variant_afs[benign_mask].unsqueeze(-1)  # [N_benign, 1]
+            benign_deltas = delta_magnitude[benign_mask[has_variant]]  # [N_benign, L]
+            
+            # Loss: weighted L2 norm of deltas (we want them close to 0)
+            consistency_loss = (af_weights * benign_deltas.pow(2)).mean()
+        else:
+            consistency_loss = torch.tensor(0.0, device=self.device)
+        
+        # 2. DISRUPTION LOSS: Pathogenic variants should have large Δ
+        #    For splice variants, delta should be large specifically at splice sites
+        pathogenic_mask = has_variant & is_pathogenic  # [B]
+        if pathogenic_mask.any():
+            path_deltas = delta_magnitude[pathogenic_mask[has_variant]]  # [N_path, L]
+            
+            # We want LARGE deltas for pathogenic variants
+            # Loss: negative log of delta magnitude (encourages large deltas)
+            # Add small epsilon to avoid log(0)
+            epsilon = 1e-6
+            disruption_loss = -torch.log(path_deltas + epsilon).mean()
+        else:
+            disruption_loss = torch.tensor(0.0, device=self.device)
+        
+        # Combine losses
+        total_variant_loss = (
+            self.w_consistency * consistency_loss +
+            self.w_disruption * disruption_loss
+        )
+        
+        logs = {
+            "variant/consistency": consistency_loss.detach(),
+            "variant/disruption": disruption_loss.detach(),
+            "variant/total": total_variant_loss.detach(),
+            "variant/mean_delta": delta_magnitude.mean().detach(),
+        }
+        
+        return total_variant_loss, logs
+
+    def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        # 1. Primary task: predict splicing from reference sequence
+        emb_ref = self._get_embeddings(batch["seqs"])
+        outs_ref = self.model(embeddings=emb_ref)
+        loss_primary, logs_primary = self._compute_loss(outs_ref, batch)
+        
+        # 2. Variant effect task (if variants present in batch)
+        loss_variant = torch.tensor(0.0, device=self.device)
+        logs_variant = {}
+        
+        if batch["has_variant"].any():
+            # Get variant sequences (only for samples with variants)
+            seqs_alt = [s for s, has in zip(batch["seqs_alt"], batch["has_variant"]) if has]
+            
+            if seqs_alt:
+                # Compute predictions for variant sequences
+                emb_alt = self._get_embeddings(batch["seqs_alt"])
+                outs_alt = self.model(embeddings=emb_alt)
+                
+                # Compute variant effect loss
+                loss_variant, logs_variant = self._compute_variant_effect_loss(
+                    outs_ref, outs_alt, batch
+                )
+        
+        # 3. Combine losses
+        total_loss = loss_primary + loss_variant
+        
+        # 4. Logging
         self.log_dict(
-            {f"train/{k}": v for k, v in logs.items()},
-            on_epoch=True, 
-            prog_bar=True, 
+            {f"train/{k}": v for k, v in {**logs_primary, **logs_variant}.items()},
+            on_epoch=True,
+            prog_bar=True,
             batch_size=len(batch["seqs"])
         )
-        return loss
+        self.log("train/loss_total", total_loss, on_epoch=True, prog_bar=True)
+        
+        return total_loss
 
     def validation_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        """Validation step for the model.
+        # Same modifications as training_step
+        emb_ref = self._get_embeddings(batch["seqs"])
+        outs_ref = self.model(embeddings=emb_ref)
+        loss_primary, logs_primary = self._compute_loss(outs_ref, batch)
         
-        Args:
-            batch: Dictionary containing the input batch
-            batch_idx: Index of the current batch
-            
-        Returns:
-            The computed loss for this batch
-        """
-        emb = self._get_embeddings(batch["seqs"])
-        outs = self.model(embeddings=emb)
-        loss, logs = self._compute_loss(outs, batch)
-        self.log(
-            "val/loss", 
-            loss, 
-            on_epoch=True, 
-            prog_bar=True, 
-            batch_size=len(batch["seqs"])
-        )
-        self.log_dict(
-            {f"val/{k}": v for k, v in logs.items()}, 
-            on_epoch=True, 
-            prog_bar=False
-        )
-        return loss
+        loss_variant = torch.tensor(0.0, device=self.device)
+        logs_variant = {}
+        
+        if batch["has_variant"].any():
+            seqs_alt = [s for s, has in zip(batch["seqs_alt"], batch["has_variant"]) if has]
+            if seqs_alt:
+                emb_alt = self._get_embeddings(batch["seqs_alt"])
+                outs_alt = self.model(embeddings=emb_alt)
+                loss_variant, logs_variant = self._compute_variant_effect_loss(
+                    outs_ref, outs_alt, batch
+                )
+        
+        total_loss = loss_primary + loss_variant
+        
+        self.log("val/loss", total_loss, on_epoch=True, prog_bar=True, batch_size=len(batch["seqs"]))
+        self.log_dict({f"val/{k}": v for k, v in {**logs_primary, **logs_variant}.items()}, on_epoch=True)
+        
+        return total_loss
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
         """Configure the optimizer for training.

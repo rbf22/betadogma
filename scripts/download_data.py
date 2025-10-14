@@ -6,12 +6,12 @@ This script downloads reference genomes, annotations, expression data, and varia
 from public repositories with checksum verification, automatic decompression, and
 index generation.
 
-Supports both CSI (modern) and TBI (legacy) index formats for VCF files.
+Also handles LOCAL data processing (e.g., converting SpliceVarDB TSV to VCF).
 
 Usage:
     python scripts/download_data.py --config configs/data.whole_genome.yaml
     python scripts/download_data.py --config configs/data.whole_genome.yaml --force
-    python scripts/download_data.py --config configs/data.whole_genome.yaml --verify-only
+    python scripts/download_data.py --config configs/data.whole_genome.yaml --process-local
 """
 
 import sys
@@ -65,6 +65,7 @@ class DataDownloader:
             'skipped': 0,
             'failed': 0,
             'verified': 0,
+            'processed': 0,
             'total_bytes': 0
         }
     
@@ -166,6 +167,235 @@ class DataDownloader:
         
         return self.stats['failed'] == 0
     
+    def process_local_data(self) -> bool:
+        """Process local data files (e.g., convert formats).
+        
+        Returns:
+            True if all processing succeeded
+        """
+        print("=" * 80)
+        print("🔧 Processing Local Data Files")
+        print("=" * 80)
+        print(f"📝 Config: {self.config_path}")
+        print(f"📂 Output: {self.raw_data_dir}")
+        print("=" * 80)
+        print()
+        
+        local_data = self.config.get('local_data', {})
+        
+        if not local_data:
+            print("ℹ️  No local data processing configured")
+            return True
+        
+        success = True
+        
+        for data_name, data_config in local_data.items():
+            print(f"\n{'─' * 80}")
+            print(f"📦 Processing: {data_name}")
+            print(f"{'─' * 80}")
+            
+            if data_name == 'splicevar':
+                if not self._process_splicevar(data_config):
+                    success = False
+            else:
+                print(f"⚠️  Unknown local data type: {data_name}")
+        
+        # Print summary
+        print("\n" + "=" * 80)
+        print("📊 Local Data Processing Summary")
+        print("=" * 80)
+        print(f"  Processed:   {self.stats['processed']} files")
+        print(f"  Failed:      {self.stats['failed']} files")
+        print("=" * 80)
+        
+        if success:
+            print("✅ All local data processed successfully!")
+        else:
+            print("❌ Some processing failed. Check logs above.")
+        
+        return success
+    
+    def _process_splicevar(self, config: Dict[str, Any]) -> bool:
+        """Process SpliceVarDB data (convert TSV to VCF).
+        
+        Args:
+            config: Configuration for SpliceVarDB processing
+        
+        Returns:
+            True if processing succeeded
+        """
+        # Get paths
+        original_tsv = self._resolve_path(config.get('original_tsv', ''))
+        output_vcf_gz = self._resolve_path(config.get('vcf', ''))
+        output_vcf = output_vcf_gz.with_suffix('')  # Remove .gz
+        converter_script = self._resolve_path(config.get('converter_script', 'scripts/convert_splicevar_to_vcf.py'))
+        
+        # Check if conversion is enabled
+        if not config.get('convert', False):
+            print("  ℹ️  Conversion disabled, checking if VCF exists...")
+            if output_vcf_gz.exists():
+                print(f"  ✓ {output_vcf_gz.name} (already exists)")
+                self.stats['skipped'] += 1
+                return True
+            else:
+                print(f"  ✗ {output_vcf_gz.name} (missing)")
+                print(f"    Enable 'convert: true' to auto-convert")
+                self.stats['failed'] += 1
+                return False
+        
+        # Check if already processed
+        if output_vcf_gz.exists() and self.skip_existing:
+            print(f"  ✓ {output_vcf_gz.name} (already exists)")
+            
+            # Check index
+            index_path = self._resolve_path(config.get('index', str(output_vcf_gz) + '.tbi'))
+            if index_path.exists():
+                print(f"  ✓ {index_path.name} (index exists)")
+                self.stats['skipped'] += 1
+                return True
+            else:
+                print(f"  ⚠️  Index missing, will create...")
+        
+        # Check if original TSV exists
+        if not original_tsv.exists():
+            print(f"  ✗ Original TSV not found: {original_tsv}")
+            print(f"\n  💡 Setup instructions:")
+            print(f"     1. Download SpliceVarDB TSV file")
+            print(f"     2. Place at: {original_tsv}")
+            print(f"     3. Re-run this script")
+            self.stats['failed'] += 1
+            return False
+        
+        print(f"  📄 Original TSV: {original_tsv.name}")
+        print(f"  📄 Output VCF:   {output_vcf_gz.name}")
+        
+        # Check if converter script exists
+        if not converter_script.exists():
+            print(f"  ✗ Converter script not found: {converter_script}")
+            self.stats['failed'] += 1
+            return False
+        
+        # Get conversion parameters
+        build = config.get('build', 'hg38')
+        include_effects = config.get('include_effects', ['STRONG', 'MILD', 'NONE'])
+        
+        print(f"  🔄 Converting TSV to VCF (build={build})...")
+        
+        # Create output directory
+        output_vcf.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Build conversion command
+        cmd = [
+            sys.executable,
+            str(converter_script),
+            str(original_tsv),
+            str(output_vcf),
+            '--build', build
+        ]
+        
+        # Add filters if specified
+        if 'STRONG' not in include_effects or 'MILD' not in include_effects or 'NONE' not in include_effects:
+            # Custom filtering needed
+            if include_effects == ['STRONG']:
+                cmd.append('--only-strong')
+            elif set(include_effects) == {'STRONG', 'NONE'}:
+                cmd.append('--skip-mild')
+        
+        try:
+            # Run converter
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
+            
+            if result.returncode != 0:
+                print(f"  ✗ Conversion failed:")
+                print(result.stderr)
+                self.stats['failed'] += 1
+                return False
+            
+            # Check output
+            if not output_vcf.exists():
+                print(f"  ✗ VCF file not created: {output_vcf}")
+                self.stats['failed'] += 1
+                return False
+            
+            print(f"  ✓ Converted to VCF")
+            
+            # Compress with bgzip
+            print(f"  📦 Compressing with bgzip...")
+            if not self._bgzip_file(output_vcf, output_vcf_gz):
+                return False
+            
+            # Create index
+            print(f"  🔖 Creating index...")
+            if not self._create_vcf_index(output_vcf_gz):
+                print(f"  ⚠️  Index creation failed, but VCF is usable")
+                # Don't fail - index can be created manually
+            
+            self.stats['processed'] += 1
+            print(f"  ✅ SpliceVarDB processing complete")
+            return True
+            
+        except subprocess.TimeoutExpired:
+            print(f"  ✗ Conversion timed out")
+            self.stats['failed'] += 1
+            return False
+        except Exception as e:
+            print(f"  ✗ Conversion error: {e}")
+            self.stats['failed'] += 1
+            return False
+    
+    def _bgzip_file(self, input_file: Path, output_file: Path) -> bool:
+        """Compress a file with bgzip.
+        
+        Args:
+            input_file: Uncompressed file
+            output_file: Output .gz file
+        
+        Returns:
+            True if successful
+        """
+        # Try bgzip first (from htslib)
+        try:
+            result = subprocess.run(
+                ['bgzip', '-c', str(input_file)],
+                stdout=open(output_file, 'wb'),
+                stderr=subprocess.PIPE,
+                timeout=300
+            )
+            
+            if result.returncode == 0 and output_file.exists():
+                # Remove uncompressed file
+                input_file.unlink()
+                return True
+            
+        except FileNotFoundError:
+            print(f"    ⚠️  bgzip not found, trying gzip...")
+        except Exception as e:
+            print(f"    ⚠️  bgzip failed: {e}")
+        
+        # Fall back to gzip (not block-compressed, but works)
+        try:
+            with open(input_file, 'rb') as f_in:
+                with gzip.open(output_file, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+            
+            # Remove uncompressed file
+            input_file.unlink()
+            
+            print(f"    ⚠️  Used gzip instead of bgzip")
+            print(f"    ⚠️  For better performance, install bgzip:")
+            print(f"       conda install -c bioconda htslib")
+            
+            return True
+            
+        except Exception as e:
+            print(f"    ✗ Compression failed: {e}")
+            return False
+    
     def _process_source(self, source_name: str, source_config: Dict[str, Any]) -> None:
         """Process all files from a single source.
         
@@ -173,7 +403,65 @@ class DataDownloader:
             source_name: Name of the source (e.g., 'genome', 'gencode')
             source_config: Configuration for this source
         """
-        base_url = source_config.get('base_url', '')
+        # Check if this is a local source (copy files) or remote (download)
+        is_local = source_config.get('local', False)
+        
+        if is_local:
+            # LOCAL SOURCE: Copy files from local path
+            self._process_local_source(source_name, source_config)
+        else:
+            # REMOTE SOURCE: Download from URL
+            base_url = source_config.get('base_url', '')
+            files = source_config.get('files', [])
+            
+            for file_info in files:
+                # Check if file should be processed
+                if not self._should_process_file(file_info):
+                    continue
+                
+                # Get file details
+                filename = file_info['filename']
+                output_path = self.raw_data_dir / file_info['output_path']
+                
+                # Construct URL
+                if 'url_path' in file_info:
+                    url = urljoin(base_url + '/', file_info['url_path'])
+                else:
+                    url = urljoin(base_url + '/', filename)
+                
+                checksum = file_info.get('checksum')
+                required = file_info.get('required', True)
+                
+                # Download the file
+                success = self._download_file(
+                    url=url,
+                    output_path=output_path,
+                    checksum=checksum,
+                    required=required
+                )
+                
+                if success:
+                    # Post-processing
+                    if file_info.get('decompress', False):
+                        self._decompress_file(output_path)
+                    
+                    if file_info.get('create_index', False):
+                        self._create_fasta_index(output_path)
+                    
+                    # Special handling for VCF files - create index if needed
+                    if (filename.endswith('.vcf.gz') and 
+                        not filename.endswith('.tbi') and 
+                        not filename.endswith('.csi')):
+                        self._create_vcf_index(output_path)
+
+    def _process_local_source(self, source_name: str, source_config: Dict[str, Any]) -> None:
+        """Process files from a local source (copy instead of download).
+        
+        Args:
+            source_name: Name of the source (e.g., 'splicevar')
+            source_config: Configuration for this source
+        """
+        base_path = source_config.get('base_path', '')
         files = source_config.get('files', [])
         
         for file_info in files:
@@ -183,38 +471,81 @@ class DataDownloader:
             
             # Get file details
             filename = file_info['filename']
-            output_path = self.raw_data_dir / file_info['output_path']
             
-            # Construct URL
-            if 'url_path' in file_info:
-                url = urljoin(base_url + '/', file_info['url_path'])
+            # Construct source path from base_path + source_path
+            if base_path:
+                source_path = self._resolve_path(base_path) / file_info['source_path']
             else:
-                url = urljoin(base_url + '/', filename)
+                # Fall back to absolute source_path if no base_path
+                source_path = self._resolve_path(file_info['source_path'])
             
-            checksum = file_info.get('checksum')
+            output_path = self.raw_data_dir / file_info['output_path']
             required = file_info.get('required', True)
+            checksum = file_info.get('checksum')
             
-            # Download the file
-            success = self._download_file(
-                url=url,
-                output_path=output_path,
-                checksum=checksum,
-                required=required
-            )
+            # Check if output already exists
+            if output_path.exists() and self.skip_existing:
+                # Verify checksum if provided
+                if checksum and checksum != "" and checksum is not None:
+                    if self._verify_checksum(output_path, checksum):
+                        print(f"  ✓ {filename} (already exists, checksum valid)")
+                        self.stats['skipped'] += 1
+                        continue
+                    else:
+                        print(f"  ⚠ {filename} (exists but checksum mismatch, will re-copy)")
+                else:
+                    print(f"  ✓ {filename} (already exists)")
+                    self.stats['skipped'] += 1
+                    continue
             
-            if success:
+            # Check if source file exists
+            if not source_path.exists():
+                if required:
+                    print(f"  ✗ {filename} (source not found: {source_path})")
+                    print(f"    💡 Expected at: {source_path}")
+                    self.stats['failed'] += 1
+                else:
+                    print(f"  ⊘ {filename} (optional, source not found)")
+                continue
+            
+            # Copy the file
+            try:
+                print(f"  📋 Copying {filename}...")
+                print(f"    From: {source_path}")
+                print(f"    To:   {output_path}")
+                
+                # Create parent directory
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Copy file
+                shutil.copy2(source_path, output_path)
+                
+                # Get file size for stats
+                file_size = output_path.stat().st_size
+                self.stats['total_bytes'] += file_size
+                
+                # Verify checksum if provided
+                if checksum and checksum != "" and checksum is not None:
+                    print(f"    Verifying checksum...")
+                    if not self._verify_checksum(output_path, checksum):
+                        output_path.unlink()
+                        raise ValueError("Checksum verification failed")
+                    print(f"    ✓ Checksum valid")
+                
+                print(f"  ✓ {filename} (copied successfully, {file_size / (1024**2):.1f} MB)")
+                self.stats['downloaded'] += 1  # Count as "downloaded" in stats
+                
                 # Post-processing
-                if file_info.get('decompress', False):
-                    self._decompress_file(output_path)
-                
                 if file_info.get('create_index', False):
-                    self._create_fasta_index(output_path)
+                    if filename.endswith('.vcf.gz'):
+                        self._create_vcf_index(output_path)
+                    elif filename.endswith(('.fa', '.fasta', '.fa.gz', '.fasta.gz')):
+                        self._create_fasta_index(output_path)
                 
-                # Special handling for VCF files - create index if needed
-                if (filename.endswith('.vcf.gz') and 
-                    not filename.endswith('.tbi') and 
-                    not filename.endswith('.csi')):
-                    self._create_vcf_index(output_path)
+            except Exception as e:
+                print(f"  ✗ {filename} (copy failed: {e})")
+                if required:
+                    self.stats['failed'] += 1
     
     def _should_process_file(self, file_info: Dict[str, Any]) -> bool:
         """Check if a file should be processed based on config.
@@ -365,7 +696,10 @@ class DataDownloader:
                 sha256.update(chunk)
         
         actual_checksum = sha256.hexdigest()
-        return actual_checksum == expected_checksum
+        if actual_checksum != expected_checksum:
+            print(f"Checksum verification failed for {file_path}. \nExpected: {expected_checksum}, \nActual: {actual_checksum}")
+            return False
+        return True
     
     def _decompress_file(self, file_path: Path) -> bool:
         """Decompress a .gz file.
@@ -527,7 +861,6 @@ class DataDownloader:
                 # Check what was created
                 if csi_path.exists():
                     print(f"    ✓ CSI index created: {csi_path.name}")
-                    print(f"       (CSI format is recommended for large VCFs)")
                     return True
                 elif tbi_path.exists():
                     print(f"    ✓ TBI index created: {tbi_path.name}")
@@ -589,10 +922,6 @@ class DataDownloader:
         print(f"    💡 Manual creation (choose one):")
         print(f"       bcftools index {vcf_path}  # Creates .csi (recommended)")
         print(f"       tabix -p vcf {vcf_path}     # Creates .tbi")
-        print(f"    💡 Or install tools:")
-        print(f"       conda install -c bioconda bcftools")
-        print(f"       conda install -c bioconda tabix")
-        print(f"       pip install pysam")
         return False
     
     def _print_summary(self) -> None:
@@ -610,7 +939,11 @@ class DataDownloader:
         if self.stats['failed'] == 0:
             print("✅ All files downloaded and verified successfully!")
             print()
-            print("📌 Next step:")
+            print("📌 Next steps:")
+            print(f"   # Process local data (SpliceVarDB)")
+            print(f"   python scripts/download_data.py --config {self.config_path} --process-local")
+            print()
+            print(f"   # Run pipeline")
             print(f"   python scripts/prepare_training_data.py --config {self.config_path}")
             print()
         else:
@@ -627,8 +960,10 @@ class DataDownloader:
         print("🔍 Verifying Prerequisites")
         print("=" * 80)
         
-        sources = self.config['download']['sources']
         all_valid = True
+        
+        # Check downloaded files
+        sources = self.config['download']['sources']
         
         for source_name, source_config in sources.items():
             print(f"\n📦 {source_name}:")
@@ -667,7 +1002,6 @@ class DataDownloader:
                         print(f"  {'✓ OK':20} {tbi_path.name} (TBI index)")
                     else:
                         print(f"  {'⚠ WARNING':20} No index found (.csi or .tbi)")
-                        print(f"     Processing will be slow without an index")
                 
                 # Check for FASTA index
                 if output_path.name.endswith('.fa') or output_path.name.endswith('.fasta'):
@@ -677,13 +1011,42 @@ class DataDownloader:
                     else:
                         print(f"  {'⚠ WARNING':20} No FASTA index found (.fai)")
         
+        # Check local data
+        local_data = self.config.get('local_data', {})
+        if local_data:
+            print(f"\n📦 Local Data:")
+            for data_name, data_config in local_data.items():
+                vcf_path = self._resolve_path(data_config.get('vcf', ''))
+                index_path = self._resolve_path(data_config.get('index', str(vcf_path) + '.tbi'))
+                
+                if vcf_path.exists():
+                    print(f"  {'✓ OK':20} {vcf_path.name}")
+                    
+                    if index_path.exists():
+                        print(f"  {'✓ OK':20} {index_path.name}")
+                    else:
+                        # Check for alternate index
+                        alt_index = Path(str(vcf_path) + '.csi')
+                        if alt_index.exists():
+                            print(f"  {'✓ OK':20} {alt_index.name}")
+                        else:
+                            print(f"  {'⚠ WARNING':20} No index found")
+                else:
+                    if data_config.get('convert', False):
+                        print(f"  {'ℹ INFO':20} {vcf_path.name} (will be generated)")
+                    else:
+                        print(f"  {'✗ MISSING':20} {vcf_path.name}")
+                        if data_config.get('required', True):
+                            all_valid = False
+        
         print("\n" + "=" * 80)
         if all_valid:
             print("✅ All required files present and valid")
         else:
             print("❌ Some required files are missing or invalid")
-            print("\n💡 Run download script to fetch missing files:")
+            print("\n💡 To fix:")
             print(f"   python scripts/download_data.py --config {self.config_path}")
+            print(f"   python scripts/download_data.py --config {self.config_path} --process-local")
         print("=" * 80)
         
         return all_valid
@@ -697,6 +1060,9 @@ def main():
 Examples:
   # Download all files specified in config
   python scripts/download_data.py --config configs/data.whole_genome.yaml
+  
+  # Process local data (convert SpliceVarDB TSV to VCF)
+  python scripts/download_data.py --config configs/data.whole_genome.yaml --process-local
   
   # Force re-download even if files exist
   python scripts/download_data.py --config configs/data.whole_genome.yaml --force
@@ -729,6 +1095,11 @@ Examples:
         action="store_true",
         help="Check prerequisites and exit (no download)"
     )
+    parser.add_argument(
+        "--process-local",
+        action="store_true",
+        help="Process local data files (e.g., convert SpliceVarDB TSV to VCF)"
+    )
     
     args = parser.parse_args()
     
@@ -748,13 +1119,15 @@ Examples:
         # Run appropriate mode
         if args.check:
             success = downloader.verify_prerequisites()
+        elif args.process_local:
+            success = downloader.process_local_data()
         else:
             success = downloader.download_all()
         
         sys.exit(0 if success else 1)
         
     except KeyboardInterrupt:
-        print(f"\n⚠️  Download interrupted by user")
+        print(f"\n⚠️  Interrupted by user")
         sys.exit(130)
         
     except Exception as e:

@@ -21,6 +21,9 @@ model:
     w_splice: 1.0
     w_tss: 0.5
     w_polya: 0.5
+    # NEW: Variant effect prediction weights
+    w_consistency: 0.1   # Weight for benign variant consistency
+    w_disruption: 0.5    # Weight for pathogenic variant disruption
   decoder: {}  # optional; not used during structural training loss
 
 optim:

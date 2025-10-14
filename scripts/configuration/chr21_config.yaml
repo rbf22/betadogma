@@ -1,55 +1,60 @@
 # =============================================================================
-# BetaDogma Chromosome 21 Data Pipeline Configuration
+# BetaDogma Chromosome 21 Configuration with SpliceVarDB
 # =============================================================================
-# Fast single-chromosome configuration for testing and development
+# Training data pipeline using experimentally validated splice variants
 #
-# This config processes only chr21 (~47 Mb, ~1.5% of genome)
-# Expected runtime: 1-3 hours (vs 3-5 days for whole genome)
+# SpliceVarDB provides:
+#   - STRONG (25%): High-confidence splice-altering variants
+#   - MILD (50%): Weak evidence of splicing effects
+#   - NONE (25%): Normal splicing (negative controls)
+#
+# Key Feature: Includes deep intronic variants (5.6% of dataset)
+#              that are >50bp from exons but experimentally proven to affect splicing
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# COMMON SETTINGS
+# METADATA
 # -----------------------------------------------------------------------------
-name: "chr21_fast"
-genome_build: GRCh38
-chromosome: "chr21"  # Process only chromosome 21 (with 'chr' prefix to match windows format)
+name: "chr21_splicevar"
+description: "Chr21 training data with experimentally validated splice variants"
+version: "2.0"
+genome_build: "GRCh38"
+chromosome: "chr21"
 seed: 42
+created: "2025-01-13"
 
 # -----------------------------------------------------------------------------
-# DIRECTORIES (relative to this config file)
+# DIRECTORY STRUCTURE (relative to this config file)
 # -----------------------------------------------------------------------------
 paths:
-  # Raw downloaded data (shared with whole genome)
   raw: "../../data/raw"
-  
-  # Intermediate processed data (much smaller for chr21)
   cache: "../../data/cache/chr21"
-  
-  # Final training-ready data
   output: "../../data/processed/chr21"
+  logs: "../../logs"
 
 # -----------------------------------------------------------------------------
-# DOWNLOAD CONFIGURATION (used by download_data.py)
+# DOWNLOAD CONFIGURATION
 # -----------------------------------------------------------------------------
 download:
   skip_existing: true
   max_retries: 5
   timeout: 600
-  chunk_size: 8388608  # 8MB chunks
+  chunk_size: 8388608  # 8MB
+  verify_checksums: true
   
   sources:
-    # Reference genome (whole genome - can't download just chr21)
+    # Reference genome
     genome:
       base_url: "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44"
       files:
         - filename: "GRCh38.primary_assembly.genome.fa.gz"
           checksum: "e9a2d5a5cd225293646ae298998ad4ea8c11e8f22729bc2d6f5c3dcfefbf8ef8"
           output_path: "genome/GRCh38.primary_assembly.genome.fa.gz"
-          size_bytes: 938553757  # ~895 MB
+          size_bytes: 938553757
           decompress: true
           create_index: true
     
-    # GENCODE annotations
+    # Gene annotations
     gencode:
       release: 44
       base_url: "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44"
@@ -57,213 +62,414 @@ download:
         - filename: "gencode.v44.annotation.gtf.gz"
           checksum: "01f817afed65feee863361b4baf30a95e722ee5c5d508ff77b04106ef7ba20d3"
           output_path: "gencode/gencode.v44.annotation.gtf.gz"
-          size_bytes: 49442327  # ~47 MB
+          size_bytes: 49442327
           decompress: true
     
-    # GTEx expression data
+    # GTEx expression and junction data
     gtex:
       base_url: "https://storage.googleapis.com/adult-gtex"
       files:
+        # Junction data
         - filename: "GTEx_Analysis_2017-06-05_v8_STARv2.5.3a_junctions.gct.gz"
           url_path: "bulk-gex/v8/rna-seq/GTEx_Analysis_2017-06-05_v8_STARv2.5.3a_junctions.gct.gz"
           checksum: "d3b09e46856a33f390ec59c1d2bc7b65589cf50f20dabf1d0759093966d3a602"
           output_path: "gtex/junctions/GTEx_junctions.gct.gz"
-          size_bytes: 2400000000  # ~2.4 GB (filters to chr21 during processing)
+          size_bytes: 2400000000
         
+        # Gene expression
         - filename: "GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_tpm.gct.gz"
           url_path: "bulk-gex/v8/rna-seq/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_tpm.gct.gz"
           checksum: "ec783825ebebb8ba8525b73cb7ff9577162bc0d2e8a7fdc408283b7639c306fb"
           output_path: "gtex/expression/GTEx_gene_tpm.gct.gz"
-          size_bytes: 126000000  # ~126 MB
+          size_bytes: 126000000
         
+        # Sample metadata
         - filename: "GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt"
           url_path: "annotations/v8/metadata-files/GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt"
           checksum: "74f6ab4c34ed2648d708a0ae6e6dff324f6c86ea723ae7d1c37d76f5221148f0"
           output_path: "gtex/metadata/GTEx_samples.txt"
-          size_bytes: 8800000  # ~8.8 MB
+          size_bytes: 8800000
     
-    # Variant data (filters to chr21 during processing)
+    # Population variants (benign/common)
     variants:
       base_url: "https://ftp.ensembl.org/pub/current_variation/vcf/homo_sapiens"
       files:
+        # 1000 Genomes Phase 3
         - filename: "1000GENOMES-phase_3.vcf.gz"
           checksum: "b54f496abcab3ab11f9b4991751f48c142b723a834d66a039772236824476928"
           output_path: "variants/1000GENOMES-phase_3.vcf.gz"
-          size_bytes: 2500000000  # ~2.5 GB (but only chr21 is read)
+          size_bytes: 2500000000
         
+        # Index (will be created if missing)
         - filename: "1000GENOMES-phase_3.vcf.gz.csi"
           checksum: null
           output_path: "variants/1000GENOMES-phase_3.vcf.gz.csi"
           required: false
           size_bytes: 500000
+    
+    # SpliceVarDB - local files (copy from original to raw)
+    splicevar:
+      local: true  # This indicates it's a local source, not a download
+      base_path: "../../data/splicevar/"  # Where your files are
+      files:
+        - filename: "splicevar_hg38.vcf.gz"
+          source_path: "splicevar_hg38.vcf.gz"
+          output_path: "variants/splicevar_hg38.vcf.gz"
+          checksum: ""
+          required: true
+          create_index: true
+        
+        - filename: "splicevar_hg38.vcf.gz.tbi"
+          source_path: "splicevar_hg38.vcf.gz.tbi"
+          output_path: "variants/splicevar_hg38.vcf.gz.tbi"
+          checksum: null
+          required: false
+
 
 # -----------------------------------------------------------------------------
-# PROCESSING CONFIGURATION (used by prepare_training_data.py)
+# PROCESSING PIPELINE
 # -----------------------------------------------------------------------------
 processing:
   
-  # Step 1: Prepare GENCODE windows (chr21 only)
+  # -------------------------------------------------------------------------
+  # Step 1: Create base genomic windows
+  # -------------------------------------------------------------------------
   gencode:
     enabled: true
+    description: "Create non-overlapping 128kb windows with sequence and annotations"
     kwargs:
       fasta: "{paths.raw}/genome/GRCh38.primary_assembly.genome.fa"
       gtf: "{paths.raw}/gencode/gencode.v44.annotation.gtf"
       out: "{paths.cache}/gencode_windows_base"
-      window: 131072        # 128k windows (2^17)
-      stride: 131072        # Non-overlapping
-      bin_size: 1           # Base-resolution labels
-      chroms: "chr21"       # ⭐ ONLY CHROMOSOME 21
-      max_shard_bases: 50000000  # 50 MB per shard (smaller for single chr)
+      window: 131072          # 128kb = 2^17
+      stride: 131072          # Non-overlapping
+      bin_size: 1             # 1bp resolution
+      chroms: "chr21"
+      max_shard_bases: 50000000
       smoke: false
+      shard_size: 1000
   
-  # Step 2: Prepare GTEx junction data (chr21 only)
+  # -------------------------------------------------------------------------
+  # Step 2: Process GTEx junction data
+  # -------------------------------------------------------------------------
   gtex:
     enabled: true
+    description: "Calculate PSI values from GTEx junction data"
     kwargs:
       junctions: "{paths.raw}/gtex/junctions/GTEx_junctions.gct.gz"
       gtf: "{paths.raw}/gencode/gencode.v44.annotation.gtf"
       out: "{paths.cache}/gtex_psi"
-      chroms: "chr21"       # ⭐ ONLY CHROMOSOME 21
+      chroms: "chr21"
       
-      # Relaxed thresholds for faster processing (chr21 is smaller)
-      min_count: 3          # Lower threshold (3 vs 5)
-      min_total: 20         # Lower threshold (20 vs 50)
-      min_samples: 5        # Lower threshold (5 vs 10)
-      
-      # Quality filters
+      # Junction filtering
+      min_count: 3            # Minimum reads per junction
+      min_total: 20           # Minimum total reads at site
+      min_samples: 5          # Must appear in 5+ samples
       max_intron_length: 500000
       min_intron_length: 20
       
-      # Performance
       smoke: false
       n_jobs: -1
+      shard_size: 1000
   
-  # Step 3: Add variants to base windows (chr21 only)
+  # -------------------------------------------------------------------------
+  # Step 3: Add common/benign variants
+  # -------------------------------------------------------------------------
   variants:
     enabled: true
+    description: "Add common population variants (assumed benign for splicing)"
     kwargs:
       vcf: "{paths.raw}/variants/1000GENOMES-phase_3.vcf.gz"
       windows: "{paths.cache}/gencode_windows_base/*.parquet"
       out: "{paths.cache}/variants_base"
       
-      # Variant settings
-      apply_alt: true
-      
-      # More permissive filtering for chr21
-      max_per_window: 100   # Allow more variants (100 vs 50)
-      min_af: 0.005         # Lower threshold (0.5% vs 1%)
-      max_af: 0.995         # Higher threshold
-      
-      # Performance settings
-      shard_size: 10000     # Smaller shards for faster iteration
-      n_jobs: -1
+      # Variant selection
+      apply_alt: true         # Generate alternate sequences
+      max_per_window: 100     # Limit variants per window
+      min_af: 0.005           # Common variants only (>0.5% AF)
+      max_af: 0.995           # Not fixed
       
       # Quality filters
-      min_qual: 20          # Lower threshold (20 vs 30)
-      filter_pass: false    # Don't require FILTER=PASS
+      min_qual: 20
+      filter_pass: false      # Accept all FILTER values
       
+      shard_size: 1000
+      n_jobs: -1
       seed: "{seed}"
-      debug: false
+      debug: true
   
-  # Step 4: Create overlapping windows
+  # -------------------------------------------------------------------------
+  # Step 4: Add experimentally validated splice variants
+  # -------------------------------------------------------------------------
+  splice_variants:
+    enabled: true
+    description: "Add SpliceVarDB experimentally validated splice variants"
+    kwargs:
+      # Input files
+      splicevar_vcf: "{paths.raw}/variants/splicevar_hg38.vcf.gz"
+      gtf: "{paths.raw}/gencode/gencode.v44.annotation.gtf"
+      base_windows: "{paths.cache}/variants_base/*.parquet"
+      out: "{paths.cache}/splice_variants"
+      chroms: "chr21"
+    
+      # Variant selection
+      include_effects: ["STRONG", "MILD", "NONE"]
+      min_qual: 0.0
+    
+      # Processing
+      shard_size: 1000
+      n_jobs: -1
+      debug: true
+  
+  # -------------------------------------------------------------------------
+  # Step 5: Create overlapping windows for training
+  # -------------------------------------------------------------------------
   overlapping_windows:
     enabled: true
+    description: "Create overlapping 128kb windows with 64kb stride"
     kwargs:
-      base_windows: "{paths.cache}/variants_base"
+      # Use splice-merged windows, fallback to base windows
+      base_windows: "{paths.cache}/splice_variants/merged_windows"
+      fallback_windows: "{paths.cache}/variants_base"
       out: "{paths.cache}/variants_overlapping"
-      stride: 65536         # 64k stride = 50% overlap
       
-      reuse_variants: true
+      stride: 65536          # 64kb = 128kb/2 (50% overlap)
+      reuse_variants: true   # Keep variant assignments from base windows
       
-      shard_size: 10000
+      shard_size: 1000
       n_jobs: -1
-      
       seed: "{seed}"
       debug: false
   
-  # Step 5: Aggregate all data
+  # -------------------------------------------------------------------------
+  # Step 6: Aggregate all data sources
+  # -------------------------------------------------------------------------
   aggregate:
     enabled: true
+    description: "Combine windows, variants, expression, and splice data"
     kwargs:
+      # Input directories
       input_dir: "{paths.cache}/gencode_windows_base"
-      output_dir: "{paths.output}"
       gtex_dir: "{paths.cache}/gtex_psi"
       variant_dir: "{paths.cache}/variants_overlapping"
+      splice_dir: "{paths.cache}/splice_variants"
       
-      # Output format
-      write_index: true
-      split_by: "chrom"     # Will create chr21.parquet
+      # Output
+      output_dir: "{paths.output}"
+      split_by: "chrom"
       format: "parquet"
       compression: "snappy"
+      write_index: true
+      write_stats: true
       
-      # Column selection
+      # Columns to keep in final output
       keep_columns:
+        # Window metadata
         - chrom
         - start
         - end
-        - seq
-        - donor
-        - acceptor
-        - tss
-        - polya
-        - psi
-        - variant_mask
-        - variant_info
+        - window_id
+        - strand
+        
+        # Sequences
+        - seq              # Reference sequence
+        - seq_alt          # Alternate sequence (with variants)
+        
+        # Genomic features (binned)
+        - donor            # Donor splice sites
+        - acceptor         # Acceptor splice sites
+        - tss              # Transcription start sites
+        - polya            # Polyadenylation sites
+        - exon             # Exonic regions
+        - utr5             # 5' UTR
+        - utr3             # 3' UTR
+        - cds              # Coding sequence
+        
+        # Expression data
+        - psi              # Junction PSI values
+        - gene_expression  # Gene-level TPM
+        
+        # Common variants (benign)
+        - variant_mask     # Binary mask of variant positions
+        - variant_info     # Variant details (AF, type, etc.)
+        - num_variants     # Count of variants in window
+        - has_variant      # Boolean: contains any variant
+        
+        # Splice variants (experimentally validated)
+        - has_splice_variant        # Boolean: contains splice variant
+        - splice_effect             # STRONG/MILD/NONE
+        - splice_score              # 1.0/0.5/0.0
+        - splice_method             # RT-PCR/RNA-Seq/MaPSy/MFASS
+        - splice_location           # Exonic/Intronic (from TSV)
+        - splice_distance_to_exon   # Distance to nearest exon boundary
+        - splice_site_type          # canonical/near_splice/splice_region/deep_intronic/exonic
+        - splice_gene               # Affected gene(s)
+        - splice_hgvs               # HGVS notation
+        - num_splice_variants       # Count of splice variants
+        
+        # Derived flags
+        - is_splice_altering        # Boolean: STRONG or MILD effect
+        - is_canonical_site         # Boolean: ±2bp from donor/acceptor
+        - is_deep_intronic          # Boolean: >50bp from any exon
+        - is_exonic                 # Boolean: within exon
+        
+        # Training labels (computed)
+        - training_label            # "benign" / "splice_strong" / "splice_mild" / "splice_none" / "unlabeled"
+        - training_weight           # Weight for loss function
       
-      # Relaxed filtering
-      max_variants_per_window: 0
-      min_coverage: 0.3     # Lower threshold (30% vs 50%)
+      # Filters
+      max_variants_per_window: 0   # 0 = no limit
+      min_coverage: 0.3            # Minimum non-N coverage
       
-      # Quality control
+      # Validation
       validate: true
-      write_stats: true
-      
       n_jobs: -1
 
 # -----------------------------------------------------------------------------
-# RESOURCE MANAGEMENT (much smaller for chr21)
+# TRAINING CONFIGURATION
+# -----------------------------------------------------------------------------
+training:
+  
+  # Variant effect prediction strategy
+  variant_effect:
+    
+    # Common/benign variants (from 1000 Genomes)
+    benign:
+      source: "1000_genomes"
+      min_af: 0.005
+      max_af: 0.995
+      assumption: "Common variants are unlikely to severely disrupt splicing"
+      loss_weight: 0.1            # Weak consistency loss
+      max_per_window: 50
+    
+    # Experimentally validated splice variants (from SpliceVarDB)
+    splice:
+      source: "splicevar_db"
+      
+      # Which effects to use
+      use_strong: true   # High confidence disruption
+      use_mild: true     # Weak evidence of effect
+      use_none: true     # Normal splicing (negative control)
+      
+      # Loss weights by effect strength
+      loss_weights:
+        STRONG: 1.0      # Primary training signal
+        MILD: 0.5        # Secondary signal (weak evidence)
+        NONE: 0.2        # Consistency loss (should match reference)
+      
+      # Location weighting (all equal - trust experimental validation)
+      location_weights:
+        canonical: 1.0
+        near_splice: 1.0
+        splice_region: 1.0
+        deep_intronic: 1.0  # Same weight! Experimentally proven.
+        exonic: 1.0
+      
+      # Method confidence (optional - weight by experimental method)
+      method_weights:
+        "RNA-Seq": 1.0      # Direct measurement
+        "RT-PCR": 1.0       # Direct validation
+        "MaPSy": 0.9        # High-throughput
+        "MFASS": 0.9        # High-throughput
+        "default": 0.8
+      use_method_weights: false  # Set true to weight by method
+  
+  # Data balancing
+  balance:
+    strategy: "weighted_sampling"  # or "oversampling", "undersampling"
+    
+    # Target distribution
+    target_ratio:
+      benign_only: 0.35        # Windows with only benign variants
+      splice_strong: 0.20      # Windows with STRONG variants
+      splice_mild: 0.20        # Windows with MILD variants
+      splice_none: 0.10        # Windows with NONE variants
+      unlabeled: 0.15          # Windows with no variants
+    
+    # Minimum counts (ensure adequate representation)
+    min_counts:
+      benign: 1000
+      splice_strong: 50
+      splice_mild: 100
+      splice_none: 50
+    
+    # Sampling strategy
+    oversample_rare: true        # Oversample rare STRONG variants
+    balance_by_gene: false       # Balance within each gene
+    balance_by_location: false   # Balance by genomic location
+  
+  # Multi-task learning (optional)
+  tasks:
+    primary:
+      name: "splice_prediction"
+      type: "regression"
+      target: "psi"
+      weight: 1.0
+    
+    auxiliary:
+      - name: "variant_effect"
+        type: "classification"
+        classes: ["benign", "strong", "mild", "none"]
+        weight: 0.5
+      
+      - name: "location_prediction"
+        type: "classification"  
+        classes: ["canonical", "near_splice", "splice_region", "deep_intronic", "exonic"]
+        weight: 0.2
+
+# -----------------------------------------------------------------------------
+# RESOURCE REQUIREMENTS
 # -----------------------------------------------------------------------------
 resources:
-  # Expected disk space requirements
   disk_space:
-    raw: "10 GB"           # Same as whole genome (shared)
-    cache: "10 GB"         # ⭐ Much smaller (10 GB vs 500 GB)
-    output: "5 GB"         # ⭐ Much smaller (5 GB vs 200 GB)
-    total: "25 GB"         # ⭐ Total: 25 GB vs 710 GB
+    raw: "10 GB"
+    cache: "15 GB"
+    output: "6 GB"
+    total: "31 GB"
   
-  # Expected memory requirements per step
   memory:
-    gencode: "4 GB"        # ⭐ Much less memory needed
-    gtex: "8 GB"           # ⭐ GTEx filters early to chr21
+    gencode: "4 GB"
+    gtex: "8 GB"
     variants: "4 GB"
+    splice_variants: "4 GB"
     overlapping: "2 GB"
     aggregate: "8 GB"
+    peak: "12 GB"
   
-  # Recommended CPU cores (can run on laptop)
-  cpus: 4                  # ⭐ Works fine with 4 cores
+  cpus:
+    recommended: 8
+    minimum: 4
   
-  # Expected runtime (on 4-core machine)
   estimated_time:
-    download: "2-4 hours"  # Same (if files not already downloaded)
-    gencode: "5-10 min"    # ⭐ Very fast
-    gtex: "20-40 min"      # ⭐ Fast (filters to chr21 early)
-    variants: "30-60 min"  # ⭐ Much faster
+    download: "2-4 hours"
+    gencode: "5-10 min"
+    gtex: "20-40 min"
+    variants: "30-60 min"
+    splice_variants: "15-30 min"
     overlapping: "10-20 min"
-    aggregate: "10-20 min"
-    total: "1.5-3 hours"   # ⭐ TOTAL: ~2 hours vs 3-5 days!
+    aggregate: "15-30 min"
+    total: "3-4 hours"
 
 # -----------------------------------------------------------------------------
 # VALIDATION
 # -----------------------------------------------------------------------------
 validation:
-  expected_outputs:
-    download:
+  
+  # Required input files
+  required_inputs:
+    downloaded:
       - "{paths.raw}/genome/GRCh38.primary_assembly.genome.fa"
       - "{paths.raw}/genome/GRCh38.primary_assembly.genome.fa.fai"
       - "{paths.raw}/gencode/gencode.v44.annotation.gtf"
       - "{paths.raw}/gtex/junctions/GTEx_junctions.gct.gz"
       - "{paths.raw}/variants/1000GENOMES-phase_3.vcf.gz"
     
+    local:
+      - "{paths.raw}/variants/splicevar_hg38.vcf.gz"
+      - "{paths.raw}/variants/splicevar_hg38.vcf.gz.tbi"  # or .csi
+  
+  # Expected outputs by stage
+  expected_outputs:
     gencode:
       - "{paths.cache}/gencode_windows_base/shard_*.parquet"
       - "{paths.cache}/gencode_windows_base/metadata.json"
@@ -271,41 +477,81 @@ validation:
     gtex:
       - "{paths.cache}/gtex_psi/junction_psi.parquet"
       - "{paths.cache}/gtex_psi/gene_psi_summary.parquet"
+      - "{paths.cache}/gtex_psi/metadata.json"
     
     variants:
       - "{paths.cache}/variants_base/shard_*.parquet"
       - "{paths.cache}/variants_base/metadata.json"
+    
+    splice_variants:
+      - "{paths.cache}/splice_variants/splice_variants.parquet"
+      - "{paths.cache}/splice_variants/merged_windows/shard_*.parquet"
+      - "{paths.cache}/splice_variants/metadata.json"
+      - "{paths.cache}/splice_variants/location_stats.json"
     
     overlapping_windows:
       - "{paths.cache}/variants_overlapping/shard_*.parquet"
       - "{paths.cache}/variants_overlapping/metadata.json"
     
     aggregate:
-      - "{paths.output}/chr21.parquet"  # ⭐ Single file for chr21
+      - "{paths.output}/chr21.parquet"
       - "{paths.output}/index.json"
       - "{paths.output}/statistics.json"
   
-  # Minimum expected counts (scaled to chr21 size)
+  # Minimum data counts
   minimum_counts:
-    gencode_windows: 300      # ⭐ chr21 is ~47 Mb / 128kb ≈ 367 windows
-    gtex_junctions: 1000      # ⭐ Fewer junctions on chr21
-    variants: 150000          # ⭐ chr21 has ~1.5% of genome variants
-    final_windows: 600        # ⭐ With 50% overlap = ~2x base windows
+    gencode_windows: 300
+    gtex_junctions: 1000
+    benign_variants: 100000
+    splice_variants:
+      total: 50                # Total splice variants on chr21
+      strong: 10               # High confidence
+      mild: 20                 # Weak evidence
+      none: 10                 # Normal controls
+      deep_intronic: 2         # At least some deep intronic
+    final_windows: 600
+  
+  # Data quality checks
+  quality_checks:
+    # Sequence quality
+    max_n_content: 0.1         # Max 10% N's per window
+    min_gc_content: 0.3
+    max_gc_content: 0.7
+    
+    # Coverage
+    min_windows_with_variants: 0.3
+    min_windows_with_expression: 0.5
+    
+    # Splice variant distribution
+    check_location_distribution: true
+    expected_deep_intronic_fraction: [0.03, 0.10]  # 3-10% of splice variants
 
 # -----------------------------------------------------------------------------
-# LOGGING AND MONITORING
+# LOGGING
 # -----------------------------------------------------------------------------
 logging:
   level: "INFO"
-  file: "{paths.output}/pipeline.log"
+  file: "{paths.logs}/pipeline_{name}.log"
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
   
-  progress_bar: true
-  checkpoint_frequency: 500  # More frequent for smaller dataset
+  console:
+    enabled: true
+    level: "INFO"
+    color: true
   
-  track_memory: true
-  track_time: true
-  profile: false
+  progress:
+    enabled: true
+    style: "tqdm"
+  
+  tracking:
+    track_memory: true
+    track_time: true
+    track_gpu: false
+    checkpoint_frequency: 500
+  
+  profiling:
+    enabled: false
+    output: "{paths.logs}/profile_{name}.prof"
 
 # -----------------------------------------------------------------------------
 # CHECKPOINTING
@@ -316,20 +562,17 @@ checkpoints:
   save_frequency: 1000
   auto_resume: true
   validate_on_resume: true
+  keep_last_n: 3
 
 # -----------------------------------------------------------------------------
-# EXPERIMENTAL / ADVANCED OPTIONS
+# EXPERIMENTAL FEATURES
 # -----------------------------------------------------------------------------
-advanced:
-  augmentation:
-    enabled: false
-    reverse_complement: true
-    random_shift: 0
+experimental:
+  # Use deep intronic variants for branch point prediction
+  branch_point_prediction: false
   
-  additional_genomes: []
-  custom_labels: []
+  # Predict cryptic splice site activation
+  cryptic_site_prediction: false
   
-  distributed:
-    enabled: false
-    backend: "dask"
-    scheduler: null
+  # RNA structure prediction for deep intronic variants
+  rna_structure: false
