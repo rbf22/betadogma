@@ -566,9 +566,8 @@ Examples:
     # Filtering
     parser.add_argument('--chroms', nargs='+',
                         help='Chromosomes to process (e.g., chr21)')
-    parser.add_argument('--include-effects', nargs='+',
-                        default=['STRONG', 'MILD', 'NONE'],
-                        choices=['STRONG', 'MILD', 'NONE'],
+    parser.add_argument('--include-effects', action='append',
+                        default=[], choices=['STRONG', 'MILD', 'NONE'],
                         help='Splice effects to include (default: all)')
     parser.add_argument('--min-qual', type=float, default=0.0,
                         help='Minimum variant quality (default: 0.0)')
