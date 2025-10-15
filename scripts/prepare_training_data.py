@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
 """
-prepare_training_data.py - Process raw genomic data into training format.
+Data preparation pipeline for BetaDogma training data.
 
-This script processes downloaded genomic data (GENCODE, GTEx, variants) through
-multiple stages to create training-ready datasets for BetaDogma.
+This module provides a comprehensive pipeline for processing raw genomic data into
+training-ready datasets for the BetaDogma model. It handles multiple data sources
+including GENCODE annotations, GTEx junction data, and genetic variants to create
+richly annotated training examples for splice prediction.
 
-Processing steps:
-    1. gencode    - Create genomic windows with structural annotations
-    2. gtex       - Process GTEx junction data and calculate PSI values
-    3. variants   - Add genetic variants to base windows
-    4. overlapping - Create overlapping windows from base windows
-    5. aggregate  - Merge all data sources into final training format
+Processing Steps:
+    1. gencode           - Create genomic windows with structural annotations
+    2. gtex              - Process GTEx junction data and calculate PSI values
+    3. variants          - Add common genetic variants to base windows
+    4. splice_variants   - Add experimentally validated splice variants (SpliceVarDB)
+    5. overlapping_windows - Create overlapping windows from base windows
+    6. aggregate         - Merge all data sources into final training format
 
-Usage:
+Example Usage:
     # Run full pipeline
     python scripts/prepare_training_data.py --config configs/data.whole_genome.yaml
     
     # Resume from specific step
-    python scripts/prepare_training_data.py --config configs/data.whole_genome.yaml --from-step variants
+    python scripts/prepare_training_data.py --config configs/data.whole_genome.yaml --from-step splice_variants
     
     # Force re-run specific steps
     python scripts/prepare_training_data.py --config configs/data.whole_genome.yaml --from-step gtex --force
+    
+    # Validate existing outputs
+    python scripts/prepare_training_data.py --config configs/data.whole_genome.yaml --validate-only
 """
 
 import sys
@@ -42,16 +48,38 @@ sys.path.insert(0, str(ROOT / "src"))
 
 
 class TrainingDataPreparer:
-    """Prepares training data through multiple processing steps."""
+    """Orchestrates the end-to-end training data preparation pipeline.
+    
+    This class manages the complete workflow for processing raw genomic data into
+    training examples. It handles data loading, processing, validation, and
+    checkpointing across multiple processing steps.
+    
+    The pipeline is designed to be resumable and supports running specific steps
+    independently. It also includes validation and logging capabilities.
+    
+    Attributes:
+        config_path (Path): Path to the YAML configuration file
+        config (dict): Loaded configuration parameters
+        from_step (str, optional): Step to start from (if resuming)
+        force (bool): Whether to force re-run of steps
+        debug (bool): Whether to enable debug logging
+        logger (logging.Logger): Configured logger instance
+        paths (dict): Resolved file and directory paths
+        checkpoint_dir (Path, optional): Directory for saving checkpoints
+        stats (dict): Pipeline execution statistics
+        
+    Class Attributes:
+        STEPS (list): Ordered list of processing step names
+    """
     
     # Define processing steps in order
     STEPS = [
-        "gencode",
-        "gtex",
-        "variants",
-        "splice_variants",  # UPDATED: was "pathogenic_variants"
-        "overlapping_windows",
-        "aggregate"
+        "gencode",           # Create genomic windows with annotations
+        "gtex",              # Process GTEx junction data
+        "variants",          # Add common genetic variants
+        "splice_variants",   # Add experimentally validated splice variants
+        "overlapping_windows",  # Create overlapping windows
+        "aggregate"          # Merge all data sources
     ]
     
     def __init__(
@@ -616,7 +644,7 @@ class TrainingDataPreparer:
             'variants': 'src/betadogma/data/prepare_variants.py',
             'splice_variants': 'src/betadogma/data/prepare_splice_variants.py',  # UPDATED: renamed
             'overlapping_windows': 'src/betadogma/data/prepare_overlapping.py',
-            'aggregate': 'src/betadogma/data/aggregate_data.py',
+            'aggregate': 'src/betadogma/data/prepare_aggregate.py',
         }
         
         if step_name not in STEP_SCRIPTS:

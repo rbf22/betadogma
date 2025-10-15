@@ -1,0 +1,64 @@
+{
+  "timestamp": "2025-10-15T17:04:45.834287",
+  "total_windows": 356,
+  "train_windows": 284,
+  "test_windows": 72,
+  "test_fraction": 0.20224719101123595,
+  "train_stats": {
+    "positives": 41,
+    "negatives": 243,
+    "positive_rate": 0.1443661971830986,
+    "chromosomes": [
+      "chr21"
+    ]
+  },
+  "test_stats": {
+    "positives": 10,
+    "negatives": 62,
+    "positive_rate": 0.1388888888888889,
+    "chromosomes": [
+      "chr21"
+    ]
+  },
+  "columns": [
+    "chrom",
+    "start",
+    "end",
+    "seq",
+    "seq_alt",
+    "donor",
+    "acceptor",
+    "tss",
+    "polya",
+    "variant_mask",
+    "variant_info",
+    "num_variants",
+    "has_variant",
+    "has_splice_variant",
+    "splice_effect",
+    "splice_score",
+    "splice_method",
+    "splice_location",
+    "splice_distance_to_exon",
+    "splice_site_type",
+    "splice_gene",
+    "splice_hgvs",
+    "num_splice_variants",
+    "is_splice_altering",
+    "is_canonical_site",
+    "is_deep_intronic",
+    "is_exonic",
+    "training_label",
+    "training_weight"
+  ],
+  "splice_variant_stats": {
+    "train_with_splice": 54,
+    "test_with_splice": 12
+  },
+  "variant_stats": {
+    "train_with_variants": 36,
+    "test_with_variants": 11,
+    "train_total_variants": 3262,
+    "test_total_variants": 1038
+  }
+}
