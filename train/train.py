@@ -13,9 +13,45 @@ from __future__ import annotations
 # Standard library imports
 import importlib
 import inspect
+import logging
 import os
+import sys
 from pathlib import Path
 from typing import Any, Optional, Union
+
+# Configure logging to write to both console and file
+def setup_logging():
+    """Set up logging to write to both console and file."""
+    # Create logs directory if it doesn't exist
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    
+    # Create logger
+    logger = logging.getLogger("betadogma_training")
+    logger.setLevel(logging.DEBUG)
+    
+    # Remove existing handlers to avoid duplicates
+    logger.handlers.clear()
+    
+    # Console handler (INFO level and above)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(console_formatter)
+    logger.addHandler(console_handler)
+    
+    # File handler (DEBUG level and above)
+    log_file = log_dir / "training_debug.log"
+    file_handler = logging.FileHandler(log_file, mode='w')
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s')
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+    
+    return logger
+
+# Set up logging at module level
+logger = setup_logging()
 
 # Third-party imports
 import numpy as np
@@ -372,15 +408,15 @@ class LitStructural(pl.LightningModule):
             # Check for NaN in model outputs early
             if torch.isnan(d_logits).any() or torch.isnan(a_logits).any() or \
                torch.isnan(t_logits).any() or torch.isnan(p_logits).any():
-                print("[DEBUG] NaN detected in model outputs!")
+                logger.warning("NaN detected in model outputs!")
                 if torch.isnan(d_logits).any():
-                    print(f"[DEBUG] NaN in donor logits: {torch.isnan(d_logits).sum()} positions")
+                    logger.warning(f"NaN in donor logits: {torch.isnan(d_logits).sum()} positions")
                 if torch.isnan(a_logits).any():
-                    print(f"[DEBUG] NaN in acceptor logits: {torch.isnan(a_logits).sum()} positions")
+                    logger.warning(f"NaN in acceptor logits: {torch.isnan(a_logits).sum()} positions")
                 if torch.isnan(t_logits).any():
-                    print(f"[DEBUG] NaN in tss logits: {torch.isnan(t_logits).sum()} positions")
+                    logger.warning(f"NaN in tss logits: {torch.isnan(t_logits).sum()} positions")
                 if torch.isnan(p_logits).any():
-                    print(f"[DEBUG] NaN in polya logits: {torch.isnan(p_logits).sum()} positions")
+                    logger.warning(f"NaN in polya logits: {torch.isnan(p_logits).sum()} positions")
 
             # Move labels to the correct device and ensure float32 dtype for loss computation
             def prepare_label(tensor: torch.Tensor) -> torch.Tensor:
@@ -440,8 +476,8 @@ class LitStructural(pl.LightningModule):
 
                 # Check for NaN in loss elements
                 if torch.isnan(loss_elements).any():
-                    print(f"[DEBUG] NaN in loss_elements before masking: {torch.isnan(loss_elements).sum()} positions")
-                    print(f"[DEBUG] Loss elements range: [{loss_elements.min().item():.4f}, {loss_elements.max().item():.4f}]")
+                    logger.debug(f"NaN in loss_elements before masking: {torch.isnan(loss_elements).sum()} positions")
+                    logger.debug(f"Loss elements range: [{loss_elements.min().item():.4f}, {loss_elements.max().item():.4f}]")
 
                 # Create mask for valid (non-NaN) labels
                 mask = ~torch.isnan(labels)
@@ -455,7 +491,7 @@ class LitStructural(pl.LightningModule):
 
                 # Check for NaN in final loss
                 if torch.isnan(loss):
-                    print(f"[DEBUG] NaN in final masked loss (weight={weight})")
+                    logger.warning(f"NaN in final masked loss (weight={weight})")
 
                 return loss * weight
 
@@ -596,9 +632,22 @@ class LitStructural(pl.LightningModule):
         
         # Check for NaN in embeddings immediately after encoder
         if torch.isnan(emb_ref).any():
-            print(f"[DEBUG] NaN in encoder embeddings: {torch.isnan(emb_ref).sum()} positions")
-            print(f"[DEBUG] Embeddings range: [{emb_ref.min().item():.4f}, {emb_ref.max().item():.4f}]")
-            print(f"[DEBUG] Embeddings shape: {emb_ref.shape}")
+            logger.warning(f"NaN in encoder embeddings: {torch.isnan(emb_ref).sum()} positions")
+            logger.debug(f"Embeddings range: [{emb_ref.min().item():.4f}, {emb_ref.max().item():.4f}]")
+            logger.debug(f"Embeddings shape: {emb_ref.shape}")
+        
+        # Check input data for potential issues
+        for key, value in batch.items():
+            if torch.is_tensor(value):
+                if torch.isnan(value).any():
+                    logger.warning(f"NaN in batch.{key}: {torch.isnan(value).sum()} positions")
+                if torch.isinf(value).any():
+                    logger.warning(f"Inf in batch.{key}: {torch.isinf(value).sum()} positions")
+                # Check for extreme values that might cause numerical issues
+                if value.numel() > 0:
+                    val_range = (value.min().item(), value.max().item())
+                    if abs(val_range[0]) > 1e6 or abs(val_range[1]) > 1e6:
+                        logger.warning(f"Extreme values in batch.{key}: range {val_range}")
         
         outs_ref = self.model(embeddings=emb_ref)
         
@@ -609,7 +658,58 @@ class LitStructural(pl.LightningModule):
                 nan_params_before.append(name)
         
         if nan_params_before:
-            print(f"[DEBUG] NaN in parameters BEFORE backward: {nan_params_before}")
+            logger.debug(f"NaN in parameters BEFORE backward: {nan_params_before}")
+        
+        # Debug model outputs before loss computation
+        logger.debug("Model outputs shapes:")
+        if isinstance(outs_ref, dict):
+            for task, outputs in outs_ref.items():
+                if isinstance(outputs, dict):
+                    # Expected nested structure: task -> head -> tensor
+                    logger.debug(f"  {task}:")
+                    for head, logits in outputs.items():
+                        if torch.is_tensor(logits):
+                            logger.debug(f"    {head}: {logits.shape}")
+                        else:
+                            logger.debug(f"    {head}: {type(logits)}")
+                elif torch.is_tensor(outputs):
+                    # Direct tensor output (fallback)
+                    logger.debug(f"  {task}: {outputs.shape}")
+                else:
+                    logger.debug(f"  {task}: {type(outputs)}")
+        else:
+            logger.debug(f"Unexpected outs_ref type: {type(outs_ref)}")
+
+        # Safe iteration for NaN checking
+        def check_tensor_nans(task_name, head_name, tensor):
+            if torch.is_tensor(tensor):
+                if torch.isnan(tensor).any():
+                    logger.warning(f"NaN in {task_name}.{head_name} logits: {torch.isnan(tensor).sum()} positions")
+                else:
+                    logger.debug(f"{task_name}.{head_name} logits range: [{tensor.min().item():.4f}, {tensor.max().item():.4f}]")
+                    logger.debug(f"{task_name}.{head_name} logits mean: {tensor.mean().item():.4f}")
+
+        if isinstance(outs_ref, dict):
+            for task, outputs in outs_ref.items():
+                if isinstance(outputs, dict):
+                    # Expected nested structure
+                    for head, logits in outputs.items():
+                        check_tensor_nans(task, head, logits)
+                elif torch.is_tensor(outputs):
+                    # Direct tensor output - treat as single head
+                    check_tensor_nans(task, task, outputs)
+        
+        # Debug ground truth labels
+        logger.debug("Ground truth label shapes:")
+        for label_name in ['donor', 'acceptor', 'tss', 'polya']:
+            if label_name in batch:
+                label = batch[label_name]
+                logger.debug(f"  {label_name}: {label.shape}")
+                logger.debug(f"  {label_name} labels range: [{label.min().item():.4f}, {label.max().item():.4f}]")
+                logger.debug(f"  {label_name} labels mean: {label.mean().item():.4f}")
+                nan_count = torch.isnan(label).sum().item()
+                if nan_count > 0:
+                    logger.warning(f"{label_name} has {nan_count} NaN values")
         
         loss_primary, logs_primary = self._compute_loss(outs_ref, batch)
         
@@ -634,32 +734,6 @@ class LitStructural(pl.LightningModule):
         # 3. Combine losses
         total_loss = loss_primary + loss_variant
 
-        # Check gradients before backward pass
-        grad_nan_before = []
-        for name, param in self.model.named_parameters():
-            if param.grad is not None and torch.isnan(param.grad).any():
-                grad_nan_before.append(name)
-        
-        if grad_nan_before:
-            print(f"[DEBUG] NaN in gradients BEFORE backward: {grad_nan_before}")
-        
-        # Backward pass
-        self.manual_backward(total_loss)
-        
-        # Check gradients after backward pass
-        grad_nan_after = []
-        for name, param in self.model.named_parameters():
-            if param.grad is not None and torch.isnan(param.grad).any():
-                grad_nan_after.append(name)
-        
-        if grad_nan_after:
-            print(f"[DEBUG] NaN in gradients AFTER backward: {grad_nan_after}")
-            # Show gradient statistics for debugging
-            for name in grad_nan_after:
-                param = dict(self.model.named_parameters())[name]
-                if param.grad is not None:
-                    print(f"[DEBUG] Gradient stats for {name}: min={param.grad.min().item():.6f}, max={param.grad.max().item():.6f}, mean={param.grad.mean().item():.6f}")
-        
         # 4. Track NaN occurrences for debugging
         if not hasattr(self, '_nan_debug_info'):
             self._nan_debug_info = {
@@ -687,9 +761,7 @@ class LitStructural(pl.LightningModule):
                 if torch.isnan(value):
                     nan_sources.append(f"logs.{key}")
 
-            self._nan_debug_info['nan_locations'].extend(nan_sources)
-
-            print(f"[DEBUG] NaN detected in training step {batch_idx} from: {nan_sources}")
+            logger.debug(f"NaN detected in training step {batch_idx} from: {nan_sources}")
 
         # 5. Logging
         self.log_dict(
@@ -751,7 +823,7 @@ class LitStructural(pl.LightningModule):
 
             self._val_nan_debug_info['nan_locations'].extend(nan_sources)
 
-            print(f"[DEBUG] NaN detected in validation step {batch_idx} from: {nan_sources}")
+            logger.debug(f"[DEBUG] NaN detected in validation step {batch_idx} from: {nan_sources}")
 
         self.log("val/loss", total_loss, on_epoch=True, prog_bar=True, batch_size=len(batch["seqs"]))
         self.log_dict({f"val/{k}": v for k, v in {**logs_primary, **logs_variant}.items()}, on_epoch=True)

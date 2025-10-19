@@ -77,6 +77,7 @@ class TrainingDataPreparer:
         "gencode",           # Create genomic windows with annotations
         "gtex",              # Process GTEx junction data
         "variants",          # Add common genetic variants
+        "pathogenic_variants",  # Add pathogenic variants from ClinVar
         "splice_variants",   # Add experimentally validated splice variants
         "overlapping_windows",  # Create overlapping windows
         "aggregate"          # Merge all data sources
@@ -327,6 +328,7 @@ class TrainingDataPreparer:
             'gencode': ['fasta', 'gtf'],
             'gtex': ['junctions', 'gtf'],
             'variants': ['vcf'],
+            'pathogenic_variants': ['clinvar_vcf', 'gtf'],
             'splice_variants': ['splicevar_vcf', 'gtf'],  # UPDATED: renamed from pathogenic_variants
             'overlapping_windows': [],  # Only uses intermediate outputs
             'aggregate': []  # Only uses intermediate outputs
@@ -642,6 +644,7 @@ class TrainingDataPreparer:
             'gencode': 'src/betadogma/data/prepare_gencode.py',
             'gtex': 'src/betadogma/data/prepare_gtex.py',
             'variants': 'src/betadogma/data/prepare_variants.py',
+            'pathogenic_variants': 'src/betadogma/data/prepare_pathogenic_variants.py',
             'splice_variants': 'src/betadogma/data/prepare_splice_variants.py',  # UPDATED: renamed
             'overlapping_windows': 'src/betadogma/data/prepare_overlapping.py',
             'aggregate': 'src/betadogma/data/prepare_aggregate.py',

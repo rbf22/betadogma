@@ -107,23 +107,26 @@ download:
           required: false
           size_bytes: 500000
     
-    # SpliceVarDB - local files (copy from original to raw)
-    splicevar:
-      local: true  # This indicates it's a local source, not a download
-      base_path: "../../data/splicevar/"  # Where your files are
+    # ClinVar pathogenic variants
+    clinvar:
+      base_url: "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38"
       files:
-        - filename: "splicevar_hg38.vcf.gz"
-          source_path: "splicevar_hg38.vcf.gz"
-          output_path: "variants/splicevar_hg38.vcf.gz"
-          checksum: ""
-          required: true
-          create_index: true
+        - filename: "clinvar_20251013.vcf.gz"
+          checksum: "8027cc605e98371984f899814b6332c3e500b0ea888b953bb1b432c242f3ab3c"  # MD5 checksum provided by user
+          output_path: "variants/clinvar_20251013.vcf.gz"
+          size_bytes: 5000000000  # Approximate size
         
-        - filename: "splicevar_hg38.vcf.gz.tbi"
-          source_path: "splicevar_hg38.vcf.gz.tbi"
-          output_path: "variants/splicevar_hg38.vcf.gz.tbi"
+        - filename: "clinvar_20251013.vcf.gz.tbi"
           checksum: null
+          output_path: "variants/clinvar_20251013.vcf.gz.tbi"
           required: false
+          size_bytes: 1000000
+        
+        - filename: "clinvar_20251013.vcf.gz.md5"
+          checksum: null
+          output_path: "variants/clinvar_20251013.vcf.gz.md5"
+          required: false
+          size_bytes: 1000
 
 
 # -----------------------------------------------------------------------------
@@ -182,16 +185,48 @@ processing:
       vcf: "{paths.raw}/variants/1000GENOMES-phase_3.vcf.gz"
       windows: "{paths.cache}/gencode_windows_base/*.parquet"
       out: "{paths.cache}/variants_base"
-      
-      # Variant selection
-      apply_alt: true         # Generate alternate sequences
+
+      # Variant selection - store as pools for on-the-fly application
+      apply_alt: false         # Don't pre-apply, store variant pools instead
       max_per_window: 100     # Limit variants per window
       min_af: 0.005           # Common variants only (>0.5% AF)
       max_af: 0.995           # Not fixed
-      
+
       # Quality filters
       min_qual: 20
       filter_pass: false      # Accept all FILTER values
+
+      shard_size: 1000
+      n_jobs: -1
+      seed: "{seed}"
+      debug: true
+
+  # -------------------------------------------------------------------------
+  # Step 3b: Add pathogenic variants from ClinVar
+  # -------------------------------------------------------------------------
+  pathogenic_variants:
+    enabled: true
+    description: "Add pathogenic variants from ClinVar for splice disruption training"
+    kwargs:
+      clinvar_vcf: "{paths.raw}/variants/clinvar_20251013.vcf.gz"
+      gtf: "{paths.raw}/gencode/gencode.v44.annotation.gtf"
+      windows: "{paths.cache}/gencode_windows_base/*.parquet"
+      out: "{paths.cache}/pathogenic_variants"
+      
+      # ClinVar filtering - focus on pathogenic splice variants
+      clinvar_filter: "pathogenic"
+      significance: ["Pathogenic", "Likely_pathogenic"]
+      review_status: ["criteria_provided", "reviewed_by_expert_panel"]
+      
+      # Variant selection
+      apply_alt: false         # Don't pre-apply, store variant pools instead
+      max_per_window: 50      # Fewer than benign variants
+      min_af: 0.0             # Include rare pathogenic variants
+      max_af: 0.01            # Very rare
+      
+      # Quality filters
+      min_qual: 0             # ClinVar variants may not have quality scores
+      filter_pass: false
       
       shard_size: 1000
       n_jobs: -1
@@ -253,6 +288,7 @@ processing:
       gtex_dir: "{paths.cache}/gtex_psi"
       variant_dir: "{paths.cache}/variants_overlapping"
       splice_dir: "{paths.cache}/splice_variants"
+      pathogenic_dir: "{paths.cache}/pathogenic_variants"
       
       # Output
       output_dir: "{paths.output}"
@@ -463,6 +499,7 @@ validation:
       - "{paths.raw}/gencode/gencode.v44.annotation.gtf"
       - "{paths.raw}/gtex/junctions/GTEx_junctions.gct.gz"
       - "{paths.raw}/variants/1000GENOMES-phase_3.vcf.gz"
+      - "{paths.raw}/variants/clinvar_20251013.vcf.gz"
     
     local:
       - "{paths.raw}/variants/splicevar_hg38.vcf.gz"
@@ -482,6 +519,10 @@ validation:
     variants:
       - "{paths.cache}/variants_base/shard_*.parquet"
       - "{paths.cache}/variants_base/metadata.json"
+    
+    pathogenic_variants:
+      - "{paths.cache}/pathogenic_variants/shard_*.parquet"
+      - "{paths.cache}/pathogenic_variants/metadata.json"
     
     splice_variants:
       - "{paths.cache}/splice_variants/splice_variants.parquet"
@@ -503,6 +544,7 @@ validation:
     gencode_windows: 300
     gtex_junctions: 1000
     benign_variants: 100000
+    pathogenic_variants: 1000
     splice_variants:
       total: 50                # Total splice variants on chr21
       strong: 10               # High confidence

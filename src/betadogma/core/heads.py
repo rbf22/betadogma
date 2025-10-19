@@ -14,10 +14,61 @@ Heads API (what BetaDogmaModel/decoder expect):
 - ORFHead.forward   -> {"start": (B,L,1), "stop": (B,L,1), "frame": (B,L,3)}
 """
 
+from __future__ import annotations
+
+import logging
 from typing import Dict
 import torch
 import torch.nn as nn
 import torch.nn.init as init
+
+# Import logger from train module
+try:
+    from ...train.train import logger
+except ImportError:
+    # Fallback logger if import fails
+    logger = logging.getLogger("betadogma_heads")
+
+
+class StableLayerNorm(nn.LayerNorm):
+    """LayerNorm with enhanced numerical stability."""
+    
+    def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True):
+        super().__init__(normalized_shape, eps=eps, elementwise_affine=elementwise_affine)
+        self.stability_eps = 1e-6  # Additional epsilon for extreme cases
+        
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        # Check for NaN/inf in input
+        if torch.isnan(input).any() or torch.isinf(input).any():
+            logger.warning("NaN/Inf in LayerNorm input - replacing with zeros")
+            return torch.zeros_like(input)
+            
+        # Compute mean and variance with stability
+        mean = input.mean(dim=-1, keepdim=True)
+        var = input.var(dim=-1, keepdim=True, unbiased=False)
+        
+        # Debug: Check computed statistics
+        if torch.isnan(mean).any() or torch.isnan(var).any():
+            logger.debug(f"LayerNorm stats: mean={mean}, var={var}")
+            logger.debug(f"LayerNorm input range: [{input.min().item():.4f}, {input.max().item():.4f}]")
+            logger.debug(f"LayerNorm input mean: {input.mean().item():.4f}")
+        
+        # Add stability epsilon to prevent division by zero
+        var = var + self.stability_eps
+        
+        # Check for NaN in computed statistics
+        if torch.isnan(mean).any() or torch.isnan(var).any():
+            logger.warning("NaN in LayerNorm statistics - using identity")
+            return input
+            
+        # Normalize
+        input = (input - mean) / torch.sqrt(var)
+        
+        # Scale and shift if affine
+        if self.elementwise_affine:
+            input = input * self.weight + self.bias
+            
+        return input
 
 
 class _ConvHead(nn.Module):
@@ -32,7 +83,7 @@ class _ConvHead(nn.Module):
         self.use_conv = use_conv
 
         if use_conv:
-            self.norm = nn.LayerNorm(d_in)
+            self.norm = StableLayerNorm(d_in)  # Use stable LayerNorm
             self.net = nn.Sequential(
                 nn.Conv1d(d_in, d_in, kernel_size=11, groups=d_in, padding=5),               # depthwise
                 nn.GELU(),
@@ -45,7 +96,7 @@ class _ConvHead(nn.Module):
             )
         else:
             self.net = nn.Sequential(
-                nn.LayerNorm(d_in),
+                StableLayerNorm(d_in),  # Use stable LayerNorm
                 nn.Linear(d_in, d_hidden),
                 nn.GELU(),
                 nn.Dropout(dropout),
@@ -63,54 +114,58 @@ class _ConvHead(nn.Module):
                 init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None:
                     init.zeros_(module.bias)
-                print(f"[DEBUG] Initialized {type(module).__name__} with std=0.02")
-            elif isinstance(module, nn.LayerNorm):
-                init.ones_(module.weight)
-                init.zeros_(module.bias)
-                print(f"[DEBUG] Initialized {type(module).__name__} with ones/zeros")
+                logger.debug(f"Initialized {type(module).__name__} with std=0.02")
+            elif isinstance(module, (nn.LayerNorm, StableLayerNorm)):
+                if hasattr(module, 'weight') and module.weight is not None:
+                    init.ones_(module.weight)
+                if hasattr(module, 'bias') and module.bias is not None:
+                    init.zeros_(module.bias)
+                logger.debug(f"Initialized {type(module).__name__} with ones/zeros")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, L, D)
         if self.use_conv:
-            # Add numerical stability check before LayerNorm
+            # Check for NaN in input before LayerNorm
             if torch.isnan(x).any():
-                print(f"[ERROR] NaN in input to LayerNorm!")
-                return torch.zeros_like(x)  # Return zeros to prevent NaN propagation
+                logger.error("NaN in input to LayerNorm!")
+                return torch.zeros_like(x)
             
-            x = self.norm(x)          # (B, L, D)
+            x = self.norm(x)          # (B, L, D) - StableLayerNorm handles NaN internally
             
-            # Check for NaN after LayerNorm and handle it
+            # Check for NaN after LayerNorm
             if torch.isnan(x).any():
-                print(f"[ERROR] NaN after LayerNorm in _ConvHead!")
-                x = torch.zeros_like(x)  # Replace NaN with zeros
+                logger.error("NaN after StableLayerNorm in _ConvHead!")
+                logger.debug(f"Post-LayerNorm range: [{x.min().item():.4f}, {x.max().item():.4f}]")
+                logger.debug(f"Post-LayerNorm mean: {x.mean().item():.4f}")
+                x = torch.zeros_like(x)
             
             x = x.transpose(1, 2)     # (B, D, L)
             if torch.isnan(x).any():
-                print(f"[ERROR] NaN after transpose in _ConvHead!")
+                logger.error("NaN after transpose in _ConvHead!")
                 x = torch.zeros_like(x)
                 
             y = self.net(x)           # (B, out_ch, L)
             if torch.isnan(y).any():
-                print(f"[ERROR] NaN after self.net in _ConvHead!")
+                logger.error("NaN after self.net in _ConvHead!")
                 y = torch.zeros_like(y)
                 
             y = y.transpose(1, 2)     # (B, L, out_ch)
         else:
             # Check for NaN in input to non-conv path
             if torch.isnan(x).any():
-                print(f"[ERROR] NaN in input to non-conv _ConvHead!")
+                logger.error("NaN in input to non-conv _ConvHead!")
                 return torch.zeros_like(x)
                 
             y = self.net(x)           # (B, L, out_ch)
             
             # Check for NaN in non-conv output
             if torch.isnan(y).any():
-                print(f"[ERROR] NaN in non-conv output of _ConvHead!")
+                logger.error("NaN in non-conv output of _ConvHead!")
                 y = torch.zeros_like(y)
         
         # Final check for NaN in output
         if torch.isnan(y).any():
-            print(f"[ERROR] NaN in final output of _ConvHead!")
+            logger.error("NaN in final output of _ConvHead!")
             y = torch.zeros_like(y)
             
         return y
