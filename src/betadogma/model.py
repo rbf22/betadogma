@@ -196,6 +196,18 @@ class BetaDogmaModel(nn.Module):
         # NMD predictor
         self.nmd_model = NMDModel(config=config.get("nmd", {}))
 
+        # Initialize all weights properly
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize model weights with smaller values for numerical stability."""
+        # The heads are already initialized in their constructors
+        # Initialize decoder and NMD model if they have initialization methods
+        if hasattr(self.isoform_decoder, '_init_weights'):
+            self.isoform_decoder._init_weights()
+        if hasattr(self.nmd_model, '_init_weights'):
+            self.nmd_model._init_weights()
+
     def forward(
         self, 
         embeddings: torch.Tensor, 

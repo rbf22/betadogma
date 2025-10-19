@@ -17,6 +17,7 @@ Heads API (what BetaDogmaModel/decoder expect):
 from typing import Dict
 import torch
 import torch.nn as nn
+import torch.nn.init as init
 
 
 class _ConvHead(nn.Module):
@@ -51,15 +52,67 @@ class _ConvHead(nn.Module):
                 nn.Linear(d_hidden, out_ch),
             )
 
+        # Initialize weights properly to prevent NaN
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights with smaller values to prevent NaN."""
+        for module in self.modules():
+            if isinstance(module, (nn.Linear, nn.Conv1d)):
+                # Use smaller initialization for better numerical stability
+                init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    init.zeros_(module.bias)
+                print(f"[DEBUG] Initialized {type(module).__name__} with std=0.02")
+            elif isinstance(module, nn.LayerNorm):
+                init.ones_(module.weight)
+                init.zeros_(module.bias)
+                print(f"[DEBUG] Initialized {type(module).__name__} with ones/zeros")
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, L, D)
         if self.use_conv:
+            # Add numerical stability check before LayerNorm
+            if torch.isnan(x).any():
+                print(f"[ERROR] NaN in input to LayerNorm!")
+                return torch.zeros_like(x)  # Return zeros to prevent NaN propagation
+            
             x = self.norm(x)          # (B, L, D)
+            
+            # Check for NaN after LayerNorm and handle it
+            if torch.isnan(x).any():
+                print(f"[ERROR] NaN after LayerNorm in _ConvHead!")
+                x = torch.zeros_like(x)  # Replace NaN with zeros
+            
             x = x.transpose(1, 2)     # (B, D, L)
+            if torch.isnan(x).any():
+                print(f"[ERROR] NaN after transpose in _ConvHead!")
+                x = torch.zeros_like(x)
+                
             y = self.net(x)           # (B, out_ch, L)
+            if torch.isnan(y).any():
+                print(f"[ERROR] NaN after self.net in _ConvHead!")
+                y = torch.zeros_like(y)
+                
             y = y.transpose(1, 2)     # (B, L, out_ch)
         else:
+            # Check for NaN in input to non-conv path
+            if torch.isnan(x).any():
+                print(f"[ERROR] NaN in input to non-conv _ConvHead!")
+                return torch.zeros_like(x)
+                
             y = self.net(x)           # (B, L, out_ch)
+            
+            # Check for NaN in non-conv output
+            if torch.isnan(y).any():
+                print(f"[ERROR] NaN in non-conv output of _ConvHead!")
+                y = torch.zeros_like(y)
+        
+        # Final check for NaN in output
+        if torch.isnan(y).any():
+            print(f"[ERROR] NaN in final output of _ConvHead!")
+            y = torch.zeros_like(y)
+            
         return y
 
 

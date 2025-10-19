@@ -227,6 +227,16 @@ class LitStructural(pl.LightningModule):
             print("[INFO] Encoder kept on CPU and frozen")
         
         self.model = BetaDogmaModel(d_in=d_in, config=model_cfg)
+        
+        # Ensure model is properly initialized and on the correct device
+        self.model = self.model.to(self.device)
+        print(f"[DEBUG] Model moved to device: {self.device}")
+        
+        # Verify model weights are not NaN after device transfer
+        for name, param in self.model.named_parameters():
+            if torch.isnan(param).any():
+                print(f"[WARNING] NaN detected in model parameter: {name}")
+        
         self.save_hyperparameters({
             "lr": lr, 
             "weight_decay": weight_decay,
@@ -323,15 +333,15 @@ class LitStructural(pl.LightningModule):
         return emb.to(self.device)
 
     def _compute_loss(
-        self, 
-        outputs: Dict[str, Dict[str, torch.Tensor]], 
+        self,
+        outputs: Dict[str, Dict[str, torch.Tensor]],
         batch: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Compute the total loss and individual component losses.
-        
+
         This method computes the loss for each task (donor, acceptor, TSS, polyA) and combines
         them into a total loss with task-specific weights.
-        
+
         Args:
             outputs: Dictionary containing model outputs for each task.
                 Expected structure:
@@ -342,12 +352,12 @@ class LitStructural(pl.LightningModule):
                 }
             batch: Dictionary containing ground truth labels.
                 Expected keys: 'donor', 'acceptor', 'tss', 'polya', each Tensor[B, L]
-                
+
         Returns:
             A tuple of (total_loss, logs_dict) where:
             - total_loss: The weighted sum of all task losses
             - logs_dict: Dictionary containing individual loss components for logging
-            
+
         Raises:
             KeyError: If required keys are missing from inputs
             RuntimeError: If there's a device mismatch between tensors
@@ -358,6 +368,19 @@ class LitStructural(pl.LightningModule):
             a_logits = outputs["splice"]["acceptor"].squeeze(-1)
             t_logits = outputs["tss"]["tss"].squeeze(-1)
             p_logits = outputs["polya"]["polya"].squeeze(-1)
+
+            # Check for NaN in model outputs early
+            if torch.isnan(d_logits).any() or torch.isnan(a_logits).any() or \
+               torch.isnan(t_logits).any() or torch.isnan(p_logits).any():
+                print("[DEBUG] NaN detected in model outputs!")
+                if torch.isnan(d_logits).any():
+                    print(f"[DEBUG] NaN in donor logits: {torch.isnan(d_logits).sum()} positions")
+                if torch.isnan(a_logits).any():
+                    print(f"[DEBUG] NaN in acceptor logits: {torch.isnan(a_logits).sum()} positions")
+                if torch.isnan(t_logits).any():
+                    print(f"[DEBUG] NaN in tss logits: {torch.isnan(t_logits).sum()} positions")
+                if torch.isnan(p_logits).any():
+                    print(f"[DEBUG] NaN in polya logits: {torch.isnan(p_logits).sum()} positions")
 
             # Move labels to the correct device and ensure float32 dtype for loss computation
             def prepare_label(tensor: torch.Tensor) -> torch.Tensor:
@@ -388,20 +411,20 @@ class LitStructural(pl.LightningModule):
             w_polya = float(w["w_polya"])
 
             def _masked_loss(
-                logits: torch.Tensor, 
-                labels: torch.Tensor, 
+                logits: torch.Tensor,
+                labels: torch.Tensor,
                 weight: float
             ) -> torch.Tensor:
                 """Compute masked binary cross-entropy loss with NaN handling.
-                
+
                 Args:
                     logits: Model predictions of shape [B, L]
                     labels: Ground truth labels of shape [B, L] (may contain NaNs)
                     weight: Weight for this loss component
-                    
+
                 Returns:
                     Weighted loss value as a scalar tensor.
-                    
+
                 Note:
                     - NaN values in labels are treated as missing/masked out
                     - Loss is only computed over valid (non-NaN) positions
@@ -411,19 +434,29 @@ class LitStructural(pl.LightningModule):
                     raise RuntimeError(
                         f"Device mismatch: logits on {logits.device}, labels on {labels.device}"
                     )
-                
+
                 # Calculate per-element loss
                 loss_elements = self.criterion(logits, labels)
-                
+
+                # Check for NaN in loss elements
+                if torch.isnan(loss_elements).any():
+                    print(f"[DEBUG] NaN in loss_elements before masking: {torch.isnan(loss_elements).sum()} positions")
+                    print(f"[DEBUG] Loss elements range: [{loss_elements.min().item():.4f}, {loss_elements.max().item():.4f}]")
+
                 # Create mask for valid (non-NaN) labels
                 mask = ~torch.isnan(labels)
-                
+
                 # Return zero loss if no valid labels
                 if not mask.any():
                     return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
-                
+
                 # Compute mean loss over valid positions
                 loss = loss_elements[mask].mean()
+
+                # Check for NaN in final loss
+                if torch.isnan(loss):
+                    print(f"[DEBUG] NaN in final masked loss (weight={weight})")
+
                 return loss * weight
 
             # Compute individual task losses
@@ -434,7 +467,7 @@ class LitStructural(pl.LightningModule):
 
             # Combine losses
             total = loss_d + loss_a + loss_t + loss_p
-            
+
             # Prepare logs with detached tensors to avoid memory leaks
             logs = {
                 "loss/total": total.detach().clone(),
@@ -443,9 +476,9 @@ class LitStructural(pl.LightningModule):
                 "loss/tss": loss_t.detach().clone(),
                 "loss/polya": loss_p.detach().clone(),
             }
-            
+
             return total, logs
-            
+
         except KeyError as e:
             raise KeyError(f"Missing required key in input: {e}")
         except RuntimeError as e:
@@ -499,7 +532,12 @@ class LitStructural(pl.LightningModule):
         # Stack all deltas: [N, L, 4]
         delta_stack = torch.stack([deltas[k] for k in ['donor', 'acceptor', 'tss', 'polya']], dim=-1)
         delta_magnitude = delta_stack.mean(dim=-1)  # [N, L] - average across tasks
-        
+
+        # Check for NaN in delta_magnitude early
+        if torch.isnan(delta_magnitude).any():
+            print(f"[DEBUG] NaN in delta_magnitude: {torch.isnan(delta_magnitude).sum()} positions")
+            print(f"[DEBUG] delta_magnitude range: [{delta_magnitude.min().item():.4f}, {delta_magnitude.max().item():.4f}]")
+
         # 1. CONSISTENCY LOSS: Benign (common) variants should have small Δ
         #    Target: Δ ≈ 0 for high AF variants
         benign_mask = has_variant & ~is_pathogenic  # [B]
@@ -507,45 +545,72 @@ class LitStructural(pl.LightningModule):
             # Weight by AF: higher AF = stronger consistency requirement
             af_weights = variant_afs[benign_mask].unsqueeze(-1)  # [N_benign, 1]
             benign_deltas = delta_magnitude[benign_mask[has_variant]]  # [N_benign, L]
-            
+
             # Loss: weighted L2 norm of deltas (we want them close to 0)
             consistency_loss = (af_weights * benign_deltas.pow(2)).mean()
+
+            if torch.isnan(consistency_loss):
+                print(f"[DEBUG] NaN in consistency_loss: af_weights={af_weights.mean().item():.4f}, benign_deltas={benign_deltas.mean().item():.4f}")
         else:
             consistency_loss = torch.tensor(0.0, device=self.device)
-        
+
         # 2. DISRUPTION LOSS: Pathogenic variants should have large Δ
         #    For splice variants, delta should be large specifically at splice sites
         pathogenic_mask = has_variant & is_pathogenic  # [B]
         if pathogenic_mask.any():
             path_deltas = delta_magnitude[pathogenic_mask[has_variant]]  # [N_path, L]
-            
+
+            # Check for NaN in path_deltas before log
+            if torch.isnan(path_deltas).any():
+                print(f"[DEBUG] NaN in path_deltas before log: {torch.isnan(path_deltas).sum()} positions")
+
             # We want LARGE deltas for pathogenic variants
             # Loss: negative log of delta magnitude (encourages large deltas)
             # Add small epsilon to avoid log(0)
             epsilon = 1e-6
             disruption_loss = -torch.log(path_deltas + epsilon).mean()
+
+            if torch.isnan(disruption_loss):
+                print(f"[DEBUG] NaN in disruption_loss: path_deltas={path_deltas.mean().item():.4f}, epsilon={epsilon}")
         else:
             disruption_loss = torch.tensor(0.0, device=self.device)
-        
+
         # Combine losses
         total_variant_loss = (
             self.w_consistency * consistency_loss +
             self.w_disruption * disruption_loss
         )
-        
+
         logs = {
             "variant/consistency": consistency_loss.detach(),
             "variant/disruption": disruption_loss.detach(),
             "variant/total": total_variant_loss.detach(),
             "variant/mean_delta": delta_magnitude.mean().detach(),
         }
-        
+
         return total_variant_loss, logs
 
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         # 1. Primary task: predict splicing from reference sequence
         emb_ref = self._get_embeddings(batch["seqs"])
+        
+        # Check for NaN in embeddings immediately after encoder
+        if torch.isnan(emb_ref).any():
+            print(f"[DEBUG] NaN in encoder embeddings: {torch.isnan(emb_ref).sum()} positions")
+            print(f"[DEBUG] Embeddings range: [{emb_ref.min().item():.4f}, {emb_ref.max().item():.4f}]")
+            print(f"[DEBUG] Embeddings shape: {emb_ref.shape}")
+        
         outs_ref = self.model(embeddings=emb_ref)
+        
+        # Check if model parameters became NaN during forward pass
+        nan_params_before = []
+        for name, param in self.model.named_parameters():
+            if torch.isnan(param).any():
+                nan_params_before.append(name)
+        
+        if nan_params_before:
+            print(f"[DEBUG] NaN in parameters BEFORE backward: {nan_params_before}")
+        
         loss_primary, logs_primary = self._compute_loss(outs_ref, batch)
         
         # 2. Variant effect task (if variants present in batch)
@@ -568,8 +633,65 @@ class LitStructural(pl.LightningModule):
         
         # 3. Combine losses
         total_loss = loss_primary + loss_variant
+
+        # Check gradients before backward pass
+        grad_nan_before = []
+        for name, param in self.model.named_parameters():
+            if param.grad is not None and torch.isnan(param.grad).any():
+                grad_nan_before.append(name)
         
-        # 4. Logging
+        if grad_nan_before:
+            print(f"[DEBUG] NaN in gradients BEFORE backward: {grad_nan_before}")
+        
+        # Backward pass
+        self.manual_backward(total_loss)
+        
+        # Check gradients after backward pass
+        grad_nan_after = []
+        for name, param in self.model.named_parameters():
+            if param.grad is not None and torch.isnan(param.grad).any():
+                grad_nan_after.append(name)
+        
+        if grad_nan_after:
+            print(f"[DEBUG] NaN in gradients AFTER backward: {grad_nan_after}")
+            # Show gradient statistics for debugging
+            for name in grad_nan_after:
+                param = dict(self.model.named_parameters())[name]
+                if param.grad is not None:
+                    print(f"[DEBUG] Gradient stats for {name}: min={param.grad.min().item():.6f}, max={param.grad.max().item():.6f}, mean={param.grad.mean().item():.6f}")
+        
+        # 4. Track NaN occurrences for debugging
+        if not hasattr(self, '_nan_debug_info'):
+            self._nan_debug_info = {
+                'total_nan_count': 0,
+                'nan_steps': [],
+                'nan_locations': [],
+                'losses_at_nan': []
+            }
+
+        # Check for NaN in total loss
+        if torch.isnan(total_loss):
+            self._nan_debug_info['total_nan_count'] += 1
+            self._nan_debug_info['nan_steps'].append(batch_idx)
+            self._nan_debug_info['losses_at_nan'].append(total_loss.item() if not torch.isnan(total_loss) else 0.0)
+
+            # Check where NaN is coming from
+            nan_sources = []
+            if torch.isnan(loss_primary):
+                nan_sources.append("primary_loss")
+            if torch.isnan(loss_variant):
+                nan_sources.append("variant_loss")
+
+            # Check individual loss components
+            for key, value in {**logs_primary, **logs_variant}.items():
+                if torch.isnan(value):
+                    nan_sources.append(f"logs.{key}")
+
+            self._nan_debug_info['nan_locations'].extend(nan_sources)
+
+            print(f"[DEBUG] NaN detected in training step {batch_idx} from: {nan_sources}")
+
+        # 5. Logging
         self.log_dict(
             {f"train/{k}": v for k, v in {**logs_primary, **logs_variant}.items()},
             on_epoch=True,
@@ -599,11 +721,87 @@ class LitStructural(pl.LightningModule):
                 )
         
         total_loss = loss_primary + loss_variant
-        
+
+        # Track NaN occurrences for debugging in validation
+        if not hasattr(self, '_val_nan_debug_info'):
+            self._val_nan_debug_info = {
+                'total_nan_count': 0,
+                'nan_steps': [],
+                'nan_locations': [],
+                'losses_at_nan': []
+            }
+
+        # Check for NaN in total loss
+        if torch.isnan(total_loss):
+            self._val_nan_debug_info['total_nan_count'] += 1
+            self._val_nan_debug_info['nan_steps'].append(batch_idx)
+            self._val_nan_debug_info['losses_at_nan'].append(total_loss.item() if not torch.isnan(total_loss) else 0.0)
+
+            # Check where NaN is coming from
+            nan_sources = []
+            if torch.isnan(loss_primary):
+                nan_sources.append("primary_loss")
+            if torch.isnan(loss_variant):
+                nan_sources.append("variant_loss")
+
+            # Check individual loss components
+            for key, value in {**logs_primary, **logs_variant}.items():
+                if torch.isnan(value):
+                    nan_sources.append(f"logs.{key}")
+
+            self._val_nan_debug_info['nan_locations'].extend(nan_sources)
+
+            print(f"[DEBUG] NaN detected in validation step {batch_idx} from: {nan_sources}")
+
         self.log("val/loss", total_loss, on_epoch=True, prog_bar=True, batch_size=len(batch["seqs"]))
         self.log_dict({f"val/{k}": v for k, v in {**logs_primary, **logs_variant}.items()}, on_epoch=True)
         
         return total_loss
+
+    def on_train_epoch_end(self) -> None:
+        """Called at the end of each training epoch for debugging."""
+        if hasattr(self, '_nan_debug_info'):
+            debug_info = self._nan_debug_info
+            if debug_info['total_nan_count'] > 0:
+                print("\n=== EPOCH END DEBUG ===")
+                print(f"Total NaN occurrences this epoch: {debug_info['total_nan_count']}")
+                print(f"Steps with NaN: {len(debug_info['nan_steps'])}")
+                if debug_info['nan_steps']:
+                    print(f"First NaN step: {debug_info['nan_steps'][0]}")
+                    print(f"Last NaN step: {debug_info['nan_steps'][-1]}")
+                print(f"Average loss when NaN occurred: {debug_info.get('avg_loss_at_nan', 'N/A')}")
+                print(f"NaN locations: {set(debug_info.get('nan_locations', []))}")
+                print("====================\n")
+
+        # Reset counters for next epoch
+        self._nan_debug_info = {
+            'total_nan_count': 0,
+            'nan_steps': [],
+            'nan_locations': [],
+            'losses_at_nan': []
+        }
+
+    def on_validation_epoch_end(self) -> None:
+        """Called at the end of each validation epoch for debugging."""
+        if hasattr(self, '_val_nan_debug_info'):
+            debug_info = self._val_nan_debug_info
+            if debug_info['total_nan_count'] > 0:
+                print("\n=== VALIDATION EPOCH END DEBUG ===")
+                print(f"Total NaN occurrences in validation: {debug_info['total_nan_count']}")
+                print(f"Validation steps with NaN: {len(debug_info['nan_steps'])}")
+                if debug_info['nan_steps']:
+                    print(f"First NaN step: {debug_info['nan_steps'][0]}")
+                    print(f"Last NaN step: {debug_info['nan_steps'][-1]}")
+                print(f"Average loss when NaN occurred: {debug_info.get('avg_loss_at_nan', 'N/A')}")
+                print("===============================\n")
+
+        # Reset counters for next epoch
+        self._val_nan_debug_info = {
+            'total_nan_count': 0,
+            'nan_steps': [],
+            'nan_locations': [],
+            'losses_at_nan': []
+        }
 
 
 # DataModule: Structural

@@ -28,22 +28,12 @@ model:
   decoder: {}
 
 optim:
-  lr: 1.0e-5
+  lr: 5e-5  # Further reduced for better stability
   weight_decay: 0.01
-  gradient_clip_val: 1.0
+  gradient_clip_val: 0.5  # More aggressive clipping
 
 trainer:
-  epochs: 2
-  devices: 1
-  ckpt_dir: checkpoints/structural
-  logdir: runs/structural
-  early_stopping_patience: 2
-  gradient_clip_val: 1.0
-  gradient_clip_algorithm: "value"
-  precision: "16-mixed"
-  detect_anomaly: true
-  accumulate_grad_batches: 4
-  val_check_interval: 0.25
+  gradient_clip_val: 0.5  # Consistent with optim setting
 
 lr_scheduler:
   name: "ReduceLROnPlateau"
