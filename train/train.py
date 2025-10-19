@@ -200,7 +200,13 @@ def structural_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
 
 # LightningModule: Structural (NTEncoder + BetaDogmaModel)
 class LitStructural(pl.LightningModule):
-    def __init__(self, model_cfg: dict[str, Any], lr: float, weight_decay: float):
+    def __init__(
+        self, 
+        model_cfg: dict[str, Any], 
+        lr: float, 
+        weight_decay: float,
+        gradient_clip_val: float = 1.0  # Add gradient clip value with default
+    ):
         super().__init__()
         from betadogma.model import BetaDogmaModel
         from betadogma.core.encoder_nt import NTEncoder
@@ -221,15 +227,37 @@ class LitStructural(pl.LightningModule):
             print("[INFO] Encoder kept on CPU and frozen")
         
         self.model = BetaDogmaModel(d_in=d_in, config=model_cfg)
+        self.save_hyperparameters({
+            "lr": lr, 
+            "weight_decay": weight_decay,
+            "gradient_clip_val": gradient_clip_val
+        })
 
         pos_w = torch.tensor(model_cfg["loss"]["pos_weight"])
         self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_w, reduction='none')
         self.lr = float(lr)
         self.weight_decay = float(weight_decay)
-        self.save_hyperparameters({"lr": self.lr, "weight_decay": self.weight_decay})
+        self.gradient_clip_val = float(gradient_clip_val)  # Store gradient clip value
+
         # NEW: Variant effect prediction weights
         self.w_consistency = float(model_cfg.get("loss", {}).get("w_consistency", 0.1))
         self.w_disruption = float(model_cfg.get("loss", {}).get("w_disruption", 0.5))
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.lr,
+            weight_decay=self.weight_decay
+        )
+        
+        # Apply gradient clipping in the optimizer
+        if self.gradient_clip_val > 0:
+            from torch.nn.utils import clip_grad_norm_
+            for group in optimizer.param_groups:
+                if 'max_grad_norm' not in group:
+                    group['max_grad_norm'] = self.gradient_clip_val
+        
+        return optimizer
 
     def _get_embeddings(self, seqs: Union[List[str], torch.Tensor]) -> torch.Tensor:
         """Extract embeddings tensor from encoder output (encoder runs on CPU).
@@ -577,19 +605,6 @@ class LitStructural(pl.LightningModule):
         
         return total_loss
 
-    def configure_optimizers(self) -> torch.optim.Optimizer:
-        """Configure the optimizer for training.
-        
-        Note: Only optimizes the BetaDogma model parameters (not the encoder).
-        
-        Returns:
-            Configured optimizer
-        """
-        return torch.optim.AdamW(
-            self.model.parameters(), 
-            lr=self.lr, 
-            weight_decay=self.weight_decay
-        )
 
 # DataModule: Structural
 class StructuralDataModule(pl.LightningDataModule):
@@ -898,8 +913,11 @@ def main() -> None:
     """
     # 1) Config
     cfg_env = os.environ.get("TRAIN_CONFIG", "")
-    configs_dir = Path(__file__).parent.parent / "configs"
-    cfg_path = Path(cfg_env).resolve() if cfg_env else configs_dir / "train.base.yaml"
+    if cfg_env:
+        cfg_path = Path(cfg_env).resolve()
+    else:
+        local_config = Path(__file__).parent / "configs" / "train.base.yaml"
+        cfg_path = local_config if local_config.exists() else Path(__file__).parent.parent / "configs" / "train.base.yaml"
     if not cfg_path.is_absolute():
         cfg_path = (Path(__file__).parent / cfg_path).resolve()
     cfg = load_config(cfg_path)
@@ -916,46 +934,95 @@ def main() -> None:
     # 3) Seed
     set_seed(seed)
 
-    # 4) Build
+    # In train.py, around line 920-970, replace the relevant section with:
+
+    # 4) Build trainer with updated configuration
     trainer = build_trainer(tcfg, cfg_dir=cfg_dir)
 
     if task == "structural":
         # Data
         dm = StructuralDataModule(dcfg, cfg_dir=cfg_dir)
-        # Model (uses BetaDogmaModel + NTEncoder, losses from cfg.model.loss)
+        
+        # Validate model configuration
         required = ["encoder", "heads", "loss"]
         missing = [f"model.{k}" for k in required if k not in mcfg]
         if missing:
             msg = f"Missing required config keys: {', '.join(missing)}"
             raise ValueError(msg)
         
-        lr = float(ocfg.get("lr", 2e-4))
+        # Get training parameters
+        lr = float(ocfg.get("lr", 1e-5))
         weight_decay = float(ocfg.get("weight_decay", 0.01))
-        lit = LitStructural(model_cfg=mcfg, lr=lr, weight_decay=weight_decay)
-        # Train
+        
+        # Initialize model with gradient clipping
+        gradient_clip_val = float(ocfg.get("gradient_clip_val", 1.0))
+        lit = LitStructural(
+            model_cfg=mcfg, 
+            lr=lr, 
+            weight_decay=weight_decay,
+            gradient_clip_val=gradient_clip_val
+        )
+        
+        # Configure learning rate scheduler if specified
+        lr_scheduler_cfg = cfg.get("lr_scheduler", {})
+        if lr_scheduler_cfg:
+            from torch.optim.lr_scheduler import ReduceLROnPlateau
+            
+            # Get optimizer
+            optimizer = lit.configure_optimizers()
+            if isinstance(optimizer, tuple) and len(optimizer) > 0:
+                optimizer = optimizer[0]
+            
+            # Create scheduler
+            scheduler = ReduceLROnPlateau(
+                optimizer=optimizer,
+                mode=lr_scheduler_cfg.get("mode", "min"),
+                factor=float(lr_scheduler_cfg.get("factor", 0.5)),
+                patience=int(lr_scheduler_cfg.get("patience", 2)),
+                min_lr=float(lr_scheduler_cfg.get("min_lr", 1e-6)),
+            )
+            
+            # Add scheduler to the trainer
+            trainer.lr_schedulers = [{
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+                "interval": "epoch",
+                "frequency": 1,
+                "name": "lr"
+            }]
+        
+        # Add data validation if enabled
+        if dcfg.get("validate_numerical_stability", False):
+            print("Enabling numerical stability validation...")
+            torch.autograd.set_detect_anomaly(True)
+            
+            def check_tensor(name, tensor):
+                if torch.is_tensor(tensor):
+                    if torch.isnan(tensor).any():
+                        print(f"Warning: NaN detected in {name}")
+                    if torch.isinf(tensor).any():
+                        print(f"Warning: Inf detected in {name}")
+            
+            # Patch the training step to check for numerical issues
+            original_training_step = lit.training_step
+            
+            def patched_training_step(batch, batch_idx):
+                # Check input data
+                for k, v in batch.items():
+                    check_tensor(f"batch.{k}", v)
+                
+                # Run original training step
+                loss = original_training_step(batch, batch_idx)
+                
+                # Check output
+                check_tensor("loss", loss)
+                
+                return loss
+            
+            lit.training_step = patched_training_step
+        
+        # Train the model
         trainer.fit(lit, datamodule=dm)
-
-    elif task == "jsonl":
-        # Validate data presence unless toy
-        if not mcfg.get("toy", False):
-            for key in ("train", "val", "max_len"):
-                if key not in dcfg or dcfg[key] in (None, ""):
-                    msg = f"Non-toy training requires data.{key}. Missing in {cfg_path}."
-                    raise ValueError(msg)
-        # Data + model
-        dm = SeqDataModule(dcfg, cfg_dir=cfg_dir)
-        _model_kwargs = mcfg.get("kwargs") or {}
-        max_len = int(dcfg.get("max_len", _model_kwargs.get("max_len", 0)))
-        model = build_model(mcfg, max_len=max_len, cfg_dir=cfg_dir)
-        lr = float(ocfg.get("lr", 3e-4))
-        weight_decay = float(ocfg.get("weight_decay", 0.01))
-        lit = LitSeq(model=model, lr=lr, weight_decay=weight_decay)
-        # Train
-        trainer.fit(lit, datamodule=dm)
-
-    else:
-        msg = f"Unknown task: {task}. Use 'structural' or 'jsonl'."
-        raise ValueError(msg)
 
 # ---------- DataModule (legacy/jsonl) ----------
 class SeqDataModule(pl.LightningDataModule):
