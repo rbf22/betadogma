@@ -66,7 +66,7 @@ download:
           decompress: true
     
     # GTEx expression and junction data
-    gtex:
+    gtex_junctions:
       base_url: "https://storage.googleapis.com/adult-gtex"
       files:
         # Junction data
@@ -91,7 +91,7 @@ download:
           size_bytes: 8800000
     
     # Population variants (benign/common)
-    variants:
+    population_variants:
       base_url: "https://ftp.ensembl.org/pub/current_variation/vcf/homo_sapiens"
       files:
         # 1000 Genomes Phase 3
@@ -99,38 +99,51 @@ download:
           checksum: "b54f496abcab3ab11f9b4991751f48c142b723a834d66a039772236824476928"
           output_path: "variants/1000GENOMES-phase_3.vcf.gz"
           size_bytes: 2500000000
-        
-        # Index (will be created if missing)
+          required: true
+          # Index (will be created if missing)
         - filename: "1000GENOMES-phase_3.vcf.gz.csi"
-          checksum: null
+          checksum: "10959549a48485cd24c7a46b2da29954029a9d858818b68450978787c2d2449d"
           output_path: "variants/1000GENOMES-phase_3.vcf.gz.csi"
           required: false
-          size_bytes: 500000
-    
+          size_bytes: 500000      
+
+    # SpliceVarDB - Local variant database
+    splice_variants:
+      enabled: true
+      local: true  # Mark as local source to copy files instead of downloading
+      base_path: "../../splicevar"  # Go up to project root, then into splicevar
+      description: "SpliceVarDB variants (local copy)"
+      files:
+        - filename: "splicevar_hg38.vcf.gz"
+          source_path: "splicevar_hg38.vcf.gz"
+          output_path: "splicevar/splicevar_hg38.vcf.gz"
+          checksum: "86e27b02fbb3c355e2eb3851c918df066817676ce0bda4e5af3578fa41e6d798"
+          size_bytes: 123456789  # Update with actual size if needed
+          required: true
+          
+        - filename: "splicevar_hg38.vcf.gz.tbi"
+          source_path: "splicevar_hg38.vcf.gz.tbi"
+          output_path: "splicevar/splicevar_hg38.vcf.gz.tbi"
+          checksum: "8c35456eaf65c9815263b6eb66cff7b533ea690cb910fd429be3d0ded0f3fa89"
+          size_bytes: 1234567  # Update with actual size if needed
+          required: true
+        
     # ClinVar pathogenic variants
-    clinvar:
+    clinvar_variants:
       base_url: "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38"
       files:
         - filename: "clinvar.vcf.gz"
           url_path: "weekly/clinvar.vcf.gz"
-          checksum: null  # Will be verified via MD5 file
+          checksum: "835fc4d72fa269bceba1d6573fd3b0056ee96a05526dcb056e0335da9a2bff84"  # Will be verified via MD5 file
           output_path: "variants/clinvar.vcf.gz"
           size_bytes: 2000000000  # Approximate size
-          decompress: false
         
         - filename: "clinvar.vcf.gz.tbi"
           url_path: "weekly/clinvar.vcf.gz.tbi"
-          checksum: null
+          checksum: "13905c170e13ff2a516403fa01e1ff8bc6f556ba5fbadc73fa74f162d9d12571"
           output_path: "variants/clinvar.vcf.gz.tbi"
           required: true
           size_bytes: 5000000
-        
-        - filename: "clinvar.vcf.gz.md5"
-          url_path: "weekly/clinvar.vcf.gz.md5"
-          checksum: null
-          output_path: "variants/clinvar.vcf.gz.md5"
-          required: true
-          size_bytes: 100
 
 
 # -----------------------------------------------------------------------------
@@ -157,7 +170,7 @@ processing:
   # -------------------------------------------------------------------------
   # Step 2: Process GTEx junction data
   # -------------------------------------------------------------------------
-  gtex:
+  gtex_junctions:
     enabled: true
     description: "Calculate PSI values from GTEx junction data"
     kwargs:
@@ -177,15 +190,15 @@ processing:
       n_jobs: -1
   
   # -------------------------------------------------------------------------
-  # Step 3: Add common/benign variants
+  # Step 3a: Add common/benign variants
   # -------------------------------------------------------------------------
-  variants:
+  population_variants:
     enabled: true
     description: "Add common population variants (assumed benign for splicing)"
     kwargs:
       vcf: "{paths.raw}/variants/1000GENOMES-phase_3.vcf.gz"
       windows: "{paths.cache}/gencode_windows_base/*.parquet"
-      out: "{paths.cache}/variants_base"
+      out: "{paths.cache}/population_variants"
 
       # Variant selection - store as pools for on-the-fly application
       apply_alt: false         # Don't pre-apply, store variant pools instead
@@ -203,53 +216,35 @@ processing:
       debug: true
 
   # -------------------------------------------------------------------------
-  # Step 3b: Add ClinVar variants (both pathogenic and benign)
+  # Step 3b: Process ClinVar variants (both pathogenic and benign)
   # -------------------------------------------------------------------------
   clinvar_variants:
     enabled: true
     description: "Process ClinVar variants including both pathogenic and benign classes"
     kwargs:
-      # Input files
-      clinvar_vcf: "{paths.raw}/variants/clinvar.vcf.gz"
-      gtf: "{paths.raw}/gencode/gencode.v44.annotation.gtf"
+      # Required arguments
+      vcf: "{paths.raw}/variants/clinvar.vcf.gz"
       windows: "{paths.cache}/gencode_windows_base/*.parquet"
-      out: "{paths.cache}/clinvar_variants"
+      output: "{paths.cache}/clinvar_variants/clinvar_variants.parquet"
       
-      # Variant classification
-      variant_classes:
-        # Pathogenic variants
-        pathogenic:
-          significance: ["Pathogenic", "Likely_pathogenic"]
-          review_status: ["criteria_provided", "reviewed_by_expert_panel", "practice_guideline"]
-          min_af: 0.0
-          max_af: 0.01  # Rare variants
-          label: 1  # Positive class for training
-          
-        # Benign variants
-        benign:
-          significance: ["Benign", "Likely_benign", "Benign/Likely_benign"]
-          review_status: ["criteria_provided", "reviewed_by_expert_panel", "practice_guideline"]
-          min_af: 0.01  # More common variants
-          max_af: 1.0
-          label: 0  # Negative class for training
+      # Variant filtering for clinical significance
+      chromosomes: ["21"]  # Note: ClinVar uses numeric chromosome names without 'chr' prefix
+      min-qual: 0.0        # No quality filter
+      min-af: 0.0          # No minimum allele frequency
+      max-af: 1.0          # No maximum allele frequency
+      filter-pass: false   # Include variants even if they don't pass all filters
       
-      # Variant type filtering (applies to all classes)
-      variant_types: ["SNV", "deletion", "insertion", "indel"]
+      # Focus on clear clinical significance categories
+      clinical-sig: [
+        "Pathogenic", "Likely_pathogenic", "Pathogenic/Likely_pathogenic",
+        "Benign", "Likely_benign", "Benign/Likely_benign"
+      ]
       
-      # Location-based filtering (applies to all classes)
-      splice_region_padding: 10  # Include variants within 10bp of exon boundaries
-      
-      # Class balancing
-      max_variants_per_class: 10000  # Cap per class to prevent imbalance
-      
-      # Processing
-      shard_size: 1000
-      n_jobs: -1
-      debug: true
-      
-      # Logging
-      log_level: "INFO"
-      log_file: "{paths.logs}/clinvar_variants.log"
+      # Include variants with these review statuses
+      review-status: [
+        "criteria_provided", "criteria_provided,_multiple_submitters,_no_conflicts",
+        "reviewed_by_expert_panel", "practice_guideline"
+      ]
   
   # -------------------------------------------------------------------------
   # Step 4: Add experimentally validated splice variants
@@ -258,9 +253,9 @@ processing:
     enabled: true
     description: "Add SpliceVarDB and ClinVar variants"
     kwargs:
-      # Input files
-      vcf: "{paths.raw}/variants/splicevar_hg38.vcf.gz"  # SpliceVarDB VCF
-      windows: "{paths.cache}/variants_base/*.parquet"
+      # Input files - using local SpliceVarDB files
+      vcf: "{paths.raw}/splicevar/splicevar_hg38.vcf.gz"  # Local SpliceVarDB VCF
+      windows: "{paths.cache}/population_variants/*.parquet"
       output: "{paths.cache}/splice_variants/splice_variants.parquet"
       
       # Variant filtering
@@ -279,9 +274,9 @@ processing:
     description: "Create overlapping 128kb windows with 64kb stride"
     kwargs:
       # Use splice-merged windows, fallback to base windows
-      base_windows: "{paths.cache}/splice_variants/merged_windows"
-      fallback_windows: "{paths.cache}/variants_base"
-      out: "{paths.cache}/variants_overlapping"
+      base_windows: "{paths.cache}/splice_variants"
+      fallback_windows: "{paths.cache}/population_variants"
+      out: "{paths.cache}/overlapping_windows"
       
       stride: 65536          # 64kb = 128kb/2 (50% overlap)
       reuse_variants: true   # Keep variant assignments from base windows
@@ -526,10 +521,8 @@ validation:
       - "{paths.raw}/gtex/junctions/GTEx_junctions.gct.gz"
       - "{paths.raw}/variants/1000GENOMES-phase_3.vcf.gz"
       - "{paths.raw}/variants/clinvar_20251013.vcf.gz"
-    
-    local:
       - "{paths.raw}/variants/splicevar_hg38.vcf.gz"
-      - "{paths.raw}/variants/splicevar_hg38.vcf.gz.tbi"  # or .csi
+      - "{paths.raw}/variants/splicevar_hg38.vcf.gz.tbi"
   
   # Expected outputs by stage
   expected_outputs:
@@ -537,28 +530,27 @@ validation:
       - "{paths.cache}/gencode_windows_base/shard_*.parquet"
       - "{paths.cache}/gencode_windows_base/metadata.json"
     
-    gtex:
+    gtex_junctions:
       - "{paths.cache}/gtex_psi/junction_psi.parquet"
       - "{paths.cache}/gtex_psi/gene_psi_summary.parquet"
       - "{paths.cache}/gtex_psi/metadata.json"
     
-    variants:
-      - "{paths.cache}/variants_base/shard_*.parquet"
-      - "{paths.cache}/variants_base/metadata.json"
+    population_variants:
+      - "{paths.cache}/population_variants/shard_*.parquet"
+      - "{paths.cache}/population_variants/metadata.json"
     
-    pathogenic_variants:
-      - "{paths.cache}/pathogenic_variants/shard_*.parquet"
-      - "{paths.cache}/pathogenic_variants/metadata.json"
+    clinvar_variants:
+      - "{paths.cache}/clinvar_variants/shard_*.parquet"
+      - "{paths.cache}/clinvar_variants/metadata.json"
     
     splice_variants:
       - "{paths.cache}/splice_variants/splice_variants.parquet"
-      - "{paths.cache}/splice_variants/merged_windows/shard_*.parquet"
       - "{paths.cache}/splice_variants/metadata.json"
       - "{paths.cache}/splice_variants/location_stats.json"
     
     overlapping_windows:
-      - "{paths.cache}/variants_overlapping/shard_*.parquet"
-      - "{paths.cache}/variants_overlapping/metadata.json"
+      - "{paths.cache}/overlapping_windows/shard_*.parquet"
+      - "{paths.cache}/overlapping_windows/metadata.json"
     
     aggregate:
       - "{paths.output}/chr21.parquet"
@@ -598,13 +590,13 @@ validation:
 # LOGGING
 # -----------------------------------------------------------------------------
 logging:
-  level: "INFO"
+  level: "DEBUG"
   file: "{paths.logs}/pipeline_{name}.log"
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
   
   console:
     enabled: true
-    level: "INFO"
+    level: "DEBUG"
     color: true
   
   progress:

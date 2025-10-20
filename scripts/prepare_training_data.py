@@ -8,12 +8,13 @@ including GENCODE annotations, GTEx junction data, and genetic variants to creat
 richly annotated training examples for splice prediction.
 
 Processing Steps:
-    1. gencode           - Create genomic windows with structural annotations
-    2. gtex              - Process GTEx junction data and calculate PSI values
-    3. variants          - Add common genetic variants to base windows
-    4. splice_variants   - Add experimentally validated splice variants (SpliceVarDB)
-    5. overlapping_windows - Create overlapping windows from base windows
-    6. aggregate         - Merge all data sources into final training format
+    1. gencode             - Create genomic windows with structural annotations
+    2. gtex_junctions      - Process GTEx junction data and calculate PSI values
+    3. population_variants - Add common genetic variants from 1000 Genomes
+    4. clinvar_variants    - Add pathogenic variants from ClinVar
+    5. splice_variants     - Add experimentally validated splice variants (SpliceVarDB)
+    6. overlapping_windows - Create overlapping windows from base windows
+    7. aggregate           - Merge all data sources into final training format
 
 Example Usage:
     # Run full pipeline
@@ -38,7 +39,7 @@ import re
 import time
 import subprocess
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List
 from datetime import datetime
 from glob import glob
 
@@ -74,13 +75,13 @@ class TrainingDataPreparer:
     
     # Define processing steps in order
     STEPS = [
-        "gencode",           # Create genomic windows with annotations
-        "gtex",              # Process GTEx junction data
-        "variants",          # Add common genetic variants
-        "pathogenic_variants",  # Add pathogenic variants from ClinVar
-        "splice_variants",   # Add experimentally validated splice variants
-        "overlapping_windows",  # Create overlapping windows
-        "aggregate"          # Merge all data sources
+        "gencode",
+        "gtex_junctions",
+        "population_variants",
+        "clinvar_variants",
+        "splice_variants",
+        "overlapping_windows",
+        "aggregate"
     ]
     
     def __init__(
@@ -154,7 +155,6 @@ class TrainingDataPreparer:
         Returns:
             Configured logger
         """
-        # Get logging config
         log_cfg = self.config.get('logging', {})
         log_level = logging.DEBUG if self.debug else getattr(
             logging, log_cfg.get('level', 'INFO')
@@ -187,11 +187,7 @@ class TrainingDataPreparer:
         return logger
     
     def _resolve_paths(self) -> Dict[str, Path]:
-        """Resolve all paths from config.
-        
-        Returns:
-            Dictionary of resolved paths
-        """
+        """Resolve all paths from config."""
         paths_cfg = self.config.get('paths', {})
         paths = {}
         
@@ -201,18 +197,8 @@ class TrainingDataPreparer:
         return paths
     
     def _resolve_path(self, path_str: str) -> Path:
-        """Resolve a path relative to the config file, with template substitution.
-        
-        Args:
-            path_str: Path string, possibly with {templates}
-        
-        Returns:
-            Resolved absolute Path
-        """
-        # Resolve templates like {paths.raw}
+        """Resolve a path relative to the config file, with template substitution."""
         path_str = self._resolve_templates(path_str)
-        
-        # Convert to Path
         path = Path(path_str)
         
         # If relative, make it relative to config file
@@ -222,14 +208,7 @@ class TrainingDataPreparer:
         return path
     
     def _resolve_templates(self, value: Any) -> Any:
-        """Replace {template} placeholders with values from config.
-        
-        Args:
-            value: Value potentially containing {key.subkey} templates
-        
-        Returns:
-            Value with templates replaced
-        """
+        """Replace {template} placeholders with values from config."""
         if isinstance(value, str):
             pattern = r'\{([^}]+)\}'
             
@@ -247,7 +226,6 @@ class TrainingDataPreparer:
                     if isinstance(obj, dict) and key in obj:
                         obj = obj[key]
                     else:
-                        # Template not found, return original
                         return match.group(0)
                 
                 return str(obj)
@@ -263,12 +241,43 @@ class TrainingDataPreparer:
         else:
             return value
     
-    def check_prerequisites(self) -> bool:
-        """Check that all required raw data files exist.
+    def _log_step_summary(self, step_name: str, stdout: str, stderr: str) -> None:
+        """Log a summary of the step's execution."""
+        summary_patterns = {
+            'gencode': [
+                (r'Total genes processed: (\d+)', 'Genes processed'),
+                (r'Total transcripts: (\d+)', 'Transcripts found'),
+                (r'Total exons: (\d+)', 'Exons found'),
+                (r'wrote .*?/shard_\d+\.parquet \((\d+) rows\)', 'Genomic windows'),
+            ],
+            'gtex_junctions': [
+                (r'Total junctions: (\d+)', 'Junctions processed'),
+                (r'Samples with expression data: (\d+)', 'Samples'),
+            ],
+            'population_variants': [
+                (r'Total variants: (\d+)', 'Variants processed'),
+            ],
+            'aggregate': [
+                (r'Total training examples: (\d+)', 'Training examples'),
+            ]
+        }
         
-        Returns:
-            True if all prerequisites are met
-        """
+        patterns = summary_patterns.get(step_name, [])
+        output = stdout + '\n' + stderr
+        matches = []
+        
+        for pattern, label in patterns:
+            match = re.search(pattern, output, re.IGNORECASE)
+            if match:
+                matches.append(f"{label}: {match.group(1).strip()}")
+        
+        if matches:
+            self.logger.info("📊 Step Summary:")
+            for match in matches:
+                self.logger.info(f"   • {match}")
+    
+    def check_prerequisites(self) -> bool:
+        """Check that all required raw data files exist."""
         self.logger.info("=" * 80)
         self.logger.info("🔍 Checking prerequisites...")
         self.logger.info("=" * 80)
@@ -284,7 +293,6 @@ class TrainingDataPreparer:
             if not step_cfg.get('enabled', True):
                 continue
             
-            # Check input files for this step
             step_missing = self._check_step_prerequisites(step_name, step_cfg)
             missing.extend(step_missing)
         
@@ -305,92 +313,73 @@ class TrainingDataPreparer:
         step_name: str,
         step_cfg: Dict[str, Any]
     ) -> List[str]:
-        """Check prerequisites for a specific step.
-        
-        Only checks for raw input files (downloaded data), not intermediate outputs.
-        Intermediate outputs are checked automatically by _is_step_complete().
-        
-        Args:
-            step_name: Name of the step
-            step_cfg: Configuration for this step
-        
-        Returns:
-            List of missing files
-        """
+        """Check prerequisites for a specific step."""
         missing = []
         kwargs = step_cfg.get('kwargs', {})
-        
-        # Resolve all path templates
         kwargs = self._resolve_templates(kwargs)
         
-        # Define which files are "raw inputs" vs "intermediate outputs"
+        # Define raw input files (not intermediate outputs)
         RAW_INPUT_KEYS = {
-            'gencode': ['fasta', 'gtf'],
-            'gtex': ['junctions', 'gtf'],
-            'variants': ['vcf'],
-            'pathogenic_variants': ['clinvar_vcf', 'gtf'],
-            'splice_variants': ['splicevar_vcf', 'gtf'],  # UPDATED: renamed from pathogenic_variants
-            'overlapping_windows': [],  # Only uses intermediate outputs
-            'aggregate': []  # Only uses intermediate outputs
+            'gencode': [
+                ('fasta', 'Reference genome FASTA file'),
+                ('gtf', 'GENCODE GTF annotation file')
+            ],
+            'gtex_junctions': [
+                ('junctions', 'GTEx junctions file'),
+                ('gtf', 'GENCODE GTF annotation file')
+            ],
+            'population_variants': [
+                ('vcf', '1000 Genomes VCF file')
+            ],
+            'clinvar_variants': [
+                ('clinvar_vcf', 'ClinVar VCF file'),
+                ('gtf', 'GENCODE GTF annotation file')
+            ],
+            'splice_variants': [
+                ('splicevar_vcf', 'SpliceVarDB VCF file'),
+                ('gtf', 'GENCODE GTF annotation file')
+            ],
         }
         
-        # Get raw input keys for this step
-        raw_keys = RAW_INPUT_KEYS.get(step_name, [])
+        raw_keys = dict(RAW_INPUT_KEYS.get(step_name, []))
         
-        # Check raw input files only
-        for key in raw_keys:
+        for key, description in raw_keys.items():
             if key in kwargs:
                 path = Path(kwargs[key])
                 if not path.exists():
-                    missing.append(f"{step_name}.{key}: {path}")
+                    missing.append(f"{step_name}.{key}: {description} not found at: {path}")
+                    self.logger.error(f"  ✗ Missing {key}: {path}")
                 else:
                     self.logger.info(f"  ✓ Found {key}: {path.name}")
                     
-                    # Special handling for FASTA files - check/create index
+                    # Check/create FASTA index
                     if key == 'fasta':
                         fai_path = Path(str(path) + '.fai')
                         if not fai_path.exists():
-                            self.logger.warning(f"  ⚠️  FASTA index not found, creating...")
+                            self.logger.warning(f"  ⚠️  Creating FASTA index...")
                             if not self._create_fasta_index(path):
-                                self.logger.warning(f"     Could not create index automatically")
-                                self.logger.warning(f"     Create with: samtools faidx {path}")
+                                missing.append(f"{step_name}.{key}: Could not create FASTA index")
                         else:
                             self.logger.info(f"  ✓ Found FASTA index: {fai_path.name}")
                     
-                    # Special handling for VCF files (including splicevar_vcf) - check/create index
-                    elif key in ['vcf', 'splicevar_vcf', 'clinvar_vcf']:  # UPDATED: added splicevar_vcf
-                        tbi_path = Path(str(path) + '.tbi')
-                        csi_path = Path(str(path) + '.csi')
-                        
-                        if csi_path.exists():
-                            self.logger.info(f"  ✓ Found CSI index: {csi_path.name}")
-                        elif tbi_path.exists():
-                            self.logger.info(f"  ✓ Found TBI index: {tbi_path.name}")
+                    # Check/create VCF index
+                    elif key in ['vcf', 'splicevar_vcf', 'clinvar_vcf']:
+                        if not self._check_vcf_index(path):
+                            self.logger.warning(f"  ⚠️  Creating VCF index...")
+                            if not self._create_vcf_index(path):
+                                missing.append(f"{step_name}.{key}: Could not create VCF index")
                         else:
-                            self.logger.warning(f"  ⚠️  VCF index not found, creating...")
-                            if self._create_vcf_index(path):
-                                self.logger.info(f"  ✓ Index created successfully")
-                            else:
-                                self.logger.warning(f"     Could not create index automatically")
-                                self.logger.warning(f"     Processing may be slow without an index")
-                                self.logger.warning(f"     Create with:")
-                                self.logger.warning(f"       bcftools index {path}  # Creates .csi")
-                                self.logger.warning(f"       tabix -p vcf {path}     # Creates .tbi")
+                            self.logger.info(f"  ✓ Found VCF index")
         
         return missing
     
+    def _check_vcf_index(self, vcf_path: Path) -> bool:
+        """Check if VCF index exists."""
+        return (Path(str(vcf_path) + '.tbi').exists() or 
+                Path(str(vcf_path) + '.csi').exists())
+    
     def _create_fasta_index(self, fasta_path: Path) -> bool:
-        """Create an index for a FASTA file.
-        
-        Args:
-            fasta_path: Path to FASTA file
-        
-        Returns:
-            True if index was created successfully
-        """
-        self.logger.info(f"    Creating FASTA index for {fasta_path.name}...")
-        
-        # Try samtools first
+        """Create FASTA index using samtools or pyfaidx."""
         try:
             result = subprocess.run(
                 ['samtools', 'faidx', str(fasta_path)],
@@ -398,71 +387,37 @@ class TrainingDataPreparer:
                 text=True,
                 timeout=300
             )
-            
             if result.returncode == 0:
-                fai_path = Path(str(fasta_path) + '.fai')
-                if fai_path.exists():
-                    self.logger.info(f"    ✓ FASTA index created: {fai_path.name}")
-                    return True
-            else:
-                self.logger.debug(f"    samtools failed: {result.stderr}")
+                return Path(str(fasta_path) + '.fai').exists()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
         
-        except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
-            self.logger.debug(f"    samtools not available or failed: {e}")
-        
-        # Fall back to pyfaidx
+        # Fallback to pyfaidx
         try:
             import pyfaidx
             pyfaidx.Faidx(str(fasta_path))
-            fai_path = Path(str(fasta_path) + '.fai')
-            if fai_path.exists():
-                self.logger.info(f"    ✓ FASTA index created: {fai_path.name}")
-                return True
-        except Exception as e:
-            self.logger.debug(f"    pyfaidx failed: {e}")
+            return Path(str(fasta_path) + '.fai').exists()
+        except Exception:
+            pass
         
         return False
     
     def _create_vcf_index(self, vcf_path: Path) -> bool:
-        """Create an index for a VCF file.
-        
-        Tries bcftools first (for CSI), then falls back to tabix (for TBI).
-        
-        Args:
-            vcf_path: Path to VCF file
-        
-        Returns:
-            True if index was created successfully
-        """
-        self.logger.info(f"    Creating VCF index for {vcf_path.name}...")
-        
-        csi_path = Path(str(vcf_path) + '.csi')
-        tbi_path = Path(str(vcf_path) + '.tbi')
-        
-        # Try bcftools index (creates .csi - better for large files)
+        """Create VCF index using bcftools or tabix."""
+        # Try bcftools
         try:
             result = subprocess.run(
                 ['bcftools', 'index', str(vcf_path)],
                 capture_output=True,
                 text=True,
-                timeout=600  # 10 minutes
+                timeout=600
             )
-            
-            if result.returncode == 0:
-                if csi_path.exists():
-                    self.logger.info(f"    ✓ CSI index created: {csi_path.name}")
-                    self.logger.info(f"       (CSI format is recommended for large VCFs)")
-                    return True
-                elif tbi_path.exists():
-                    self.logger.info(f"    ✓ TBI index created: {tbi_path.name}")
-                    return True
-            else:
-                self.logger.debug(f"    bcftools failed: {result.stderr}")
+            if result.returncode == 0 and self._check_vcf_index(vcf_path):
+                return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
         
-        except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
-            self.logger.debug(f"    bcftools not available or failed: {e}")
-        
-        # Fall back to tabix (creates .tbi - older format)
+        # Try tabix
         try:
             result = subprocess.run(
                 ['tabix', '-p', 'vcf', str(vcf_path)],
@@ -470,30 +425,10 @@ class TrainingDataPreparer:
                 text=True,
                 timeout=600
             )
-            
-            if result.returncode == 0 and tbi_path.exists():
-                self.logger.info(f"    ✓ TBI index created: {tbi_path.name}")
+            if result.returncode == 0 and self._check_vcf_index(vcf_path):
                 return True
-            else:
-                self.logger.debug(f"    tabix failed: {result.stderr}")
-        
-        except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
-            self.logger.debug(f"    tabix not available or failed: {e}")
-        
-        # Try pysam as last resort
-        try:
-            import pysam
-            pysam.tabix_index(str(vcf_path), preset='vcf', force=True)
-            
-            if csi_path.exists():
-                self.logger.info(f"    ✓ CSI index created: {csi_path.name}")
-                return True
-            elif tbi_path.exists():
-                self.logger.info(f"    ✓ TBI index created: {tbi_path.name}")
-                return True
-        
-        except Exception as e:
-            self.logger.debug(f"    pysam indexing failed: {e}")
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
         
         return False
     
@@ -501,7 +436,7 @@ class TrainingDataPreparer:
         """Run the full data preparation pipeline.
         
         Returns:
-            True if pipeline completed successfully
+            True if pipeline completed successfully, False otherwise
         """
         self.logger.info("=" * 80)
         self.logger.info("🚀 BetaDogma Training Data Preparation")
@@ -519,7 +454,6 @@ class TrainingDataPreparer:
         if not self.check_prerequisites():
             return False
         
-        # Get processing configuration
         processing_cfg = self.config.get('processing', {})
         
         # Determine which steps to run
@@ -568,22 +502,21 @@ class TrainingDataPreparer:
             try:
                 success = self._run_step(step_name, step_cfg)
                 
-                if success:
-                    step_duration = time.time() - step_start_time
-                    self.logger.info(f"✅ Step '{step_name}' completed in {step_duration:.1f}s")
-                    self.stats['steps_completed'].append(step_name)
-                    
-                    # Create checkpoint
-                    if self.checkpoint_dir:
-                        self._create_checkpoint(step_name)
-                else:
+                if not success:
                     self.logger.error(f"❌ Step '{step_name}' failed")
                     self.stats['steps_failed'].append(step_name)
                     return False
+                
+                step_duration = time.time() - step_start_time
+                self.logger.info(f"✅ Step '{step_name}' completed in {step_duration:.1f}s")
+                self.stats['steps_completed'].append(step_name)
+                
+                # Create checkpoint
+                if self.checkpoint_dir:
+                    self._create_checkpoint(step_name)
                     
             except Exception as e:
-                self.logger.error(f"❌ Step '{step_name}' failed with exception:")
-                self.logger.error(f"   {e}")
+                self.logger.error(f"❌ Step '{step_name}' failed with exception: {e}")
                 if self.debug:
                     import traceback
                     traceback.print_exc()
@@ -596,15 +529,7 @@ class TrainingDataPreparer:
         return len(self.stats['steps_failed']) == 0
     
     def _is_step_complete(self, step_name: str, step_cfg: Dict[str, Any]) -> bool:
-        """Check if a step has already been completed.
-        
-        Args:
-            step_name: Name of the step
-            step_cfg: Configuration for this step
-        
-        Returns:
-            True if step outputs exist and checkpoint exists
-        """
+        """Check if a step has already been completed."""
         # Check checkpoint file
         if self.checkpoint_dir:
             checkpoint_file = self.checkpoint_dir / f"{step_name}.done"
@@ -630,21 +555,17 @@ class TrainingDataPreparer:
     def _run_step(self, step_name: str, step_cfg: Dict[str, Any]) -> bool:
         """Run a single processing step.
         
-        Args:
-            step_name: Name of the step
-            step_cfg: Configuration for this step
-        
         Returns:
-            True if step succeeded
+            True if step succeeded, False otherwise
         """
         kwargs = self._resolve_templates(step_cfg.get('kwargs', {}))
         
         # Map steps to their script paths
         STEP_SCRIPTS = {
             'gencode': 'src/betadogma/data/prepare_gencode.py',
-            'gtex': 'src/betadogma/data/prepare_gtex.py',
-            'variants': 'src/betadogma/data/prepare_variants.py',
-            'pathogenic_variants': 'src/betadogma/data/prepare_pathogenic_variants.py',
+            'gtex_junctions': 'src/betadogma/data/prepare_gtex.py',
+            'population_variants': 'src/betadogma/data/prepare_population_variants.py',
+            'clinvar_variants': 'src/betadogma/data/prepare_clinvar_variants.py',
             'splice_variants': 'src/betadogma/data/prepare_splice_variants.py',
             'overlapping_windows': 'src/betadogma/data/prepare_overlapping.py',
             'aggregate': 'src/betadogma/data/prepare_aggregate.py',
@@ -654,94 +575,95 @@ class TrainingDataPreparer:
             self.logger.error(f"❌ Unknown step: {step_name}")
             return False
         
-        # Build script path (relative to project root)
         script_path = ROOT / STEP_SCRIPTS[step_name]
         
         if not script_path.exists():
             self.logger.error(f"❌ Script not found: {script_path}")
             return False
         
-        # Build command with arguments
+        # Build command
         cmd = [sys.executable, str(script_path)]
         
         # Convert kwargs to command-line arguments
         for key, value in kwargs.items():
-            # Convert underscores to hyphens for CLI (Python style -> CLI style)
             cli_key = key.replace('_', '-')
             
-            # Special handling for effects in splice_variants step
-            if step_name == 'splice_variants' and key == 'effects' and isinstance(value, (list, tuple)):
-                # For effects, pass as a single --effects flag with space-separated values
-                cmd.extend([f'--{cli_key}', ' '.join(str(v) for v in value)])
-            # Handle boolean flags
-            elif isinstance(value, bool):
+            if isinstance(value, bool):
                 if value:
                     cmd.append(f'--{cli_key}')
-            # Handle list/tuple values
             elif isinstance(value, (list, tuple)):
-                # For other lists, pass each item with its own flag
-                for item in value:
-                    cmd.extend([f'--{cli_key}', str(item)])
-            # Handle all other non-empty values
+                if step_name == 'splice_variants' and key == 'effects':
+                    # For splice_variants, pass each effect as a separate --effect argument
+                    for item in value:
+                        cmd.extend(['--effect', str(item)])
+                else:
+                    for item in value:
+                        cmd.extend([f'--{cli_key}', str(item)])
             elif value is not None and value != '':
                 cmd.extend([f'--{cli_key}', str(value)])
-        
-        self.logger.info(f"  Executing: {' '.join(cmd)}")
-        
+                
         try:
-            # Run the script
-            import subprocess
+            start_time = time.time()
+            
+            # Run subprocess - this is the critical fix!
+            # We capture output but immediately fail on non-zero return codes
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                cwd=ROOT,  # Run from project root
-                timeout=None  # No timeout, let it run
+                cwd=ROOT,
+                check=False  # We'll check manually for better error handling
             )
             
-            # Log output
+            exec_time = time.time() - start_time
+            
+            # Log output (filter out progress bars for cleaner logs)
             if result.stdout:
                 for line in result.stdout.strip().split('\n'):
-                    if line:  # Skip empty lines
+                    if line and not any(x in line for x in ['%|', 'it/s', 'ETA:']):
                         self.logger.info(f"    {line}")
             
+            # Check return code BEFORE logging summary
             if result.returncode != 0:
-                self.logger.error(f"  ❌ Script failed with exit code {result.returncode}")
+                self.logger.error(f"❌ Script failed with exit code {result.returncode}")
+                self.logger.error(f"   Execution time: {exec_time:.1f}s")
+                
+                # Log stderr for debugging
                 if result.stderr:
-                    for line in result.stderr.strip().split('\n'):
-                        if line:  # Skip empty lines
-                            self.logger.error(f"    {line}")
+                    self.logger.error("   Error output:")
+                    for line in result.stderr.strip().split('\n')[:20]:  # First 20 lines
+                        if line:
+                            self.logger.error(f"     {line}")
+                
                 return False
+            
+            # Success - log summary
+            self.logger.info(f"✅ Script completed in {exec_time:.1f}s")
+            self._log_step_summary(step_name, result.stdout, result.stderr)
             
             return True
             
-        except subprocess.TimeoutExpired:
-            self.logger.error(f"  ❌ Script timed out")
+        except subprocess.SubprocessError as e:
+            self.logger.error(f"❌ Subprocess error: {e}")
             return False
             
         except Exception as e:
-            self.logger.error(f"  ❌ Failed to run script: {e}")
+            self.logger.error(f"❌ Unexpected error: {e}")
             if self.debug:
                 import traceback
                 traceback.print_exc()
             return False
-            
+    
     def _create_checkpoint(self, step_name: str) -> None:
-        """Create a checkpoint file for a completed step.
-        
-        Args:
-            step_name: Name of the step
-        """
+        """Create a checkpoint file for a completed step."""
         if not self.checkpoint_dir:
             return
         
         checkpoint_file = self.checkpoint_dir / f"{step_name}.done"
-        
         checkpoint_data = {
             'step': step_name,
             'completed_at': datetime.now().isoformat(),
             'config_path': str(self.config_path),
-            'config_hash': self._hash_config()
         }
         
         with open(checkpoint_file, 'w') as f:
@@ -749,74 +671,46 @@ class TrainingDataPreparer:
         
         self.logger.debug(f"📝 Checkpoint created: {checkpoint_file}")
     
-    def _hash_config(self) -> str:
-        """Create a hash of the config for change detection.
-        
-        Returns:
-            SHA256 hash of config
-        """
-        import hashlib
-        config_str = json.dumps(self.config, sort_keys=True)
-        return hashlib.sha256(config_str.encode()).hexdigest()[:16]
-    
     def _print_summary(self) -> None:
         """Print pipeline execution summary."""
         duration = (datetime.now() - self.stats['start_time']).total_seconds()
-        
-        # Calculate steps that were not run because we started from a specific step
-        steps_not_run = []
-        if self.from_step:
-            start_idx = self.STEPS.index(self.from_step)
-            steps_not_run = self.STEPS[:start_idx]
         
         self.logger.info("")
         self.logger.info("=" * 80)
         self.logger.info("📊 Pipeline Summary")
         self.logger.info("=" * 80)
-        self.logger.info(f"  Total time:      {duration:.1f}s ({duration/3600:.2f} hours)")
+        self.logger.info(f"  Total time:      {duration:.1f}s ({duration/60:.1f} min)")
         self.logger.info(f"  Steps completed: {len(self.stats['steps_completed'])}")
         self.logger.info(f"  Steps skipped:   {len(self.stats['steps_skipped'])}")
-        self.logger.info(f"  Steps not run:   {len(steps_not_run)}")
         self.logger.info(f"  Steps failed:    {len(self.stats['steps_failed'])}")
         
         if self.stats['steps_completed']:
-            self.logger.info(f"\n  ✅ Completed steps:")
+            self.logger.info(f"\n  ✅ Completed:")
             for step in self.stats['steps_completed']:
                 self.logger.info(f"     - {step}")
         
         if self.stats['steps_skipped']:
-            self.logger.info(f"\n  ⊘ Skipped steps:")
+            self.logger.info(f"\n  ⊘ Skipped:")
             for step in self.stats['steps_skipped']:
                 self.logger.info(f"     - {step}")
         
-        if steps_not_run:
-            self.logger.info(f"\n  ⏭️  Steps not run (started from '{self.from_step}'):")
-            for step in steps_not_run:
-                self.logger.info(f"     - {step}")
-        
         if self.stats['steps_failed']:
-            self.logger.info(f"\n  ❌ Failed steps:")
+            self.logger.info(f"\n  ❌ Failed:")
             for step in self.stats['steps_failed']:
                 self.logger.info(f"     - {step}")
         
         self.logger.info("=" * 80)
         
-        if len(self.stats['steps_failed']) == 0:
+        if not self.stats['steps_failed']:
             self.logger.info("✅ Pipeline completed successfully!")
-            self.logger.info("")
-            self.logger.info("📌 Training data ready at:")
-            self.logger.info(f"   {self.paths.get('output', 'N/A')}")
-            self.logger.info("")
+            self.logger.info(f"\n📌 Training data ready at: {self.paths.get('output', 'N/A')}")
         else:
-            self.logger.info("❌ Pipeline failed. Check logs for details.")
-            self.logger.info("")
+            self.logger.error("❌ Pipeline failed. Check logs above for details.")
+        
+        self.logger.info("")
     
     def validate_outputs(self) -> bool:
-        """Validate that all expected outputs were created.
-        
-        Returns:
-            True if all expected outputs exist
-        """
+        """Validate that all expected outputs were created."""
         self.logger.info("=" * 80)
         self.logger.info("🔍 Validating outputs...")
         self.logger.info("=" * 80)
@@ -830,10 +724,7 @@ class TrainingDataPreparer:
             self.logger.info(f"\n📦 {step_name}:")
             
             for pattern in patterns:
-                # Resolve template
                 pattern = self._resolve_templates(pattern)
-                
-                # Check if pattern matches any files
                 matches = glob(pattern)
                 
                 if matches:
@@ -841,12 +732,6 @@ class TrainingDataPreparer:
                 else:
                     self.logger.error(f"  ✗ {pattern} (no matches)")
                     all_valid = False
-        
-        # Check minimum counts
-        minimum_counts = validation_cfg.get('minimum_counts', {})
-        if minimum_counts:
-            self.logger.info(f"\n📊 Checking minimum counts:")
-            all_valid &= self._validate_minimum_counts(minimum_counts)
         
         self.logger.info("\n" + "=" * 80)
         if all_valid:
@@ -856,49 +741,23 @@ class TrainingDataPreparer:
         self.logger.info("=" * 80)
         
         return all_valid
-    
-    def _validate_minimum_counts(self, minimum_counts: Dict[str, int]) -> bool:
-        """Validate minimum counts for various data types.
-        
-        Args:
-            minimum_counts: Dictionary of expected minimum counts
-        
-        Returns:
-            True if all minimums are met
-        """
-        # This would need to be implemented based on your data format
-        # For now, just return True
-        self.logger.info("  (Minimum count validation not yet implemented)")
-        return True
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command line arguments.
-    
-    Returns:
-        Parsed arguments
-    """
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Prepare training data for BetaDogma",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Processing Steps (in order):
-  1. gencode           - Create genomic windows with structural annotations
-  2. gtex              - Process GTEx junction data and calculate PSI values
-  3. variants          - Add genetic variants to base windows
-  4. splice_variants   - Add experimentally validated splice variants (SpliceVarDB)
-  5. overlapping_windows - Create overlapping windows from base windows
-  6. aggregate         - Merge all data sources into final training format
-
 Examples:
   # Run full pipeline
-  python scripts/prepare_training_data.py --config configs/data.whole_genome.yaml
+  %(prog)s --config configs/data.yaml
   
-  # Resume from splice variants step
-  python scripts/prepare_training_data.py --config configs/data.whole_genome.yaml --from-step splice_variants
+  # Resume from specific step
+  %(prog)s --config configs/data.yaml --from-step splice_variants
   
   # Force re-run from specific step
-  python scripts/prepare_training_data.py --config configs/data.whole_genome.yaml --from-step gtex --force
+  %(prog)s --config configs/data.yaml --from-step gtex --force
         """
     )
     
@@ -930,7 +789,7 @@ Examples:
     parser.add_argument(
         "--log-file",
         type=Path,
-        help="Path to log file (default: output_dir/pipeline.log)"
+        help="Path to log file (default: console only)"
     )
     
     parser.add_argument(
@@ -952,13 +811,11 @@ def main() -> None:
     """Main entry point."""
     args = parse_args()
     
-    # Validate config exists
     if not args.config.exists():
         print(f"❌ Config file not found: {args.config}")
         sys.exit(1)
     
     try:
-        # Initialize preparer
         preparer = TrainingDataPreparer(
             config_path=args.config,
             from_step=args.from_step,
@@ -967,7 +824,6 @@ def main() -> None:
             log_file=args.log_file
         )
         
-        # Run appropriate mode
         if args.check:
             success = preparer.check_prerequisites()
         elif args.validate_only:

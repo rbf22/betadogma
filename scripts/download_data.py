@@ -611,7 +611,6 @@ class DataDownloader:
                 return False
             else:
                 print(f"  ✓ {filename} (verified)")
-                self.stats['verified'] += 1
                 return True
         
         # Create parent directory
@@ -680,35 +679,51 @@ class DataDownloader:
         return False
     
     def _verify_checksum(self, file_path: Path, expected_checksum: str) -> bool:
-        """Verify SHA256 checksum of a file.
+        """Verify the checksum of a file.
         
         Args:
-            file_path: Path to file to check
-            expected_checksum: Expected SHA256 hex digest
-        
+            file_path: Path to the file to verify
+            expected_checksum: Expected SHA256 checksum
+            
         Returns:
-            True if checksum matches
+            bool: True if checksum matches, False otherwise
         """
-        sha256 = hashlib.sha256()
-        
-        with open(file_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(self.chunk_size), b''):
-                sha256.update(chunk)
-        
-        actual_checksum = sha256.hexdigest()
-        if actual_checksum != expected_checksum:
-            print(f"Checksum verification failed for {file_path}. \nExpected: {expected_checksum}, \nActual: {actual_checksum}")
+        try:
+            # Calculate SHA256 of the file
+            sha256_hash = hashlib.sha256()
+            with open(file_path, 'rb') as f:
+                # Read in chunks to handle large files
+                for byte_block in iter(lambda: f.read(4096), b""):
+                    sha256_hash.update(byte_block)
+            
+            # Get hex digest
+            file_checksum = sha256_hash.hexdigest()
+            
+            # Compare checksums (case-insensitive)
+            if file_checksum.lower() == expected_checksum.lower():
+                self.stats['verified'] += 1
+                # Update total bytes with the size of the verified file
+                self.stats['total_bytes'] += file_path.stat().st_size
+                return True
+            
+            # Log checksum mismatch details
+            print(f"    ✗ Checksum mismatch for {file_path.name}:")
+            print(f"      Expected: {expected_checksum.lower()}")
+            print(f"      Observed: {file_checksum.lower()}")
             return False
-        return True
+            
+        except Exception as e:
+            print(f"    ✗ Checksum verification failed: {str(e)}")
+            return False
     
     def _decompress_file(self, file_path: Path) -> bool:
         """Decompress a .gz file.
         
         Args:
-            file_path: Path to .gz file
-        
+            file_path: Path to the .gz file to decompress
+            
         Returns:
-            True if decompression succeeded
+            bool: True if decompression succeeded, False otherwise
         """
         if not file_path.suffix == '.gz':
             return True
