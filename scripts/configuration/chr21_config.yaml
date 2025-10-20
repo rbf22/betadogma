@@ -111,22 +111,26 @@ download:
     clinvar:
       base_url: "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38"
       files:
-        - filename: "clinvar_20251013.vcf.gz"
-          checksum: "8027cc605e98371984f899814b6332c3e500b0ea888b953bb1b432c242f3ab3c"  # MD5 checksum provided by user
-          output_path: "variants/clinvar_20251013.vcf.gz"
-          size_bytes: 5000000000  # Approximate size
+        - filename: "clinvar.vcf.gz"
+          url_path: "weekly/clinvar.vcf.gz"
+          checksum: null  # Will be verified via MD5 file
+          output_path: "variants/clinvar.vcf.gz"
+          size_bytes: 2000000000  # Approximate size
+          decompress: false
         
-        - filename: "clinvar_20251013.vcf.gz.tbi"
+        - filename: "clinvar.vcf.gz.tbi"
+          url_path: "weekly/clinvar.vcf.gz.tbi"
           checksum: null
-          output_path: "variants/clinvar_20251013.vcf.gz.tbi"
-          required: false
-          size_bytes: 1000000
+          output_path: "variants/clinvar.vcf.gz.tbi"
+          required: true
+          size_bytes: 5000000
         
-        - filename: "clinvar_20251013.vcf.gz.md5"
+        - filename: "clinvar.vcf.gz.md5"
+          url_path: "weekly/clinvar.vcf.gz.md5"
           checksum: null
-          output_path: "variants/clinvar_20251013.vcf.gz.md5"
-          required: false
-          size_bytes: 1000
+          output_path: "variants/clinvar.vcf.gz.md5"
+          required: true
+          size_bytes: 100
 
 
 # -----------------------------------------------------------------------------
@@ -149,8 +153,6 @@ processing:
       bin_size: 1             # 1bp resolution
       chroms: "chr21"
       max_shard_bases: 50000000
-      smoke: false
-      shard_size: 1000
   
   # -------------------------------------------------------------------------
   # Step 2: Process GTEx junction data
@@ -173,7 +175,6 @@ processing:
       
       smoke: false
       n_jobs: -1
-      shard_size: 1000
   
   # -------------------------------------------------------------------------
   # Step 3: Add common/benign variants
@@ -196,65 +197,79 @@ processing:
       min_qual: 20
       filter_pass: false      # Accept all FILTER values
 
+      # Processing
       shard_size: 1000
-      n_jobs: -1
       seed: "{seed}"
       debug: true
 
   # -------------------------------------------------------------------------
-  # Step 3b: Add pathogenic variants from ClinVar
+  # Step 3b: Add ClinVar variants (both pathogenic and benign)
   # -------------------------------------------------------------------------
-  pathogenic_variants:
+  clinvar_variants:
     enabled: true
-    description: "Add pathogenic variants from ClinVar for splice disruption training"
+    description: "Process ClinVar variants including both pathogenic and benign classes"
     kwargs:
-      clinvar_vcf: "{paths.raw}/variants/clinvar_20251013.vcf.gz"
+      # Input files
+      clinvar_vcf: "{paths.raw}/variants/clinvar.vcf.gz"
       gtf: "{paths.raw}/gencode/gencode.v44.annotation.gtf"
       windows: "{paths.cache}/gencode_windows_base/*.parquet"
-      out: "{paths.cache}/pathogenic_variants"
+      out: "{paths.cache}/clinvar_variants"
       
-      # ClinVar filtering - focus on pathogenic splice variants
-      clinvar_filter: "pathogenic"
-      significance: ["Pathogenic", "Likely_pathogenic"]
-      review_status: ["criteria_provided", "reviewed_by_expert_panel"]
+      # Variant classification
+      variant_classes:
+        # Pathogenic variants
+        pathogenic:
+          significance: ["Pathogenic", "Likely_pathogenic"]
+          review_status: ["criteria_provided", "reviewed_by_expert_panel", "practice_guideline"]
+          min_af: 0.0
+          max_af: 0.01  # Rare variants
+          label: 1  # Positive class for training
+          
+        # Benign variants
+        benign:
+          significance: ["Benign", "Likely_benign", "Benign/Likely_benign"]
+          review_status: ["criteria_provided", "reviewed_by_expert_panel", "practice_guideline"]
+          min_af: 0.01  # More common variants
+          max_af: 1.0
+          label: 0  # Negative class for training
       
-      # Variant selection
-      apply_alt: false         # Don't pre-apply, store variant pools instead
-      max_per_window: 50      # Fewer than benign variants
-      min_af: 0.0             # Include rare pathogenic variants
-      max_af: 0.01            # Very rare
+      # Variant type filtering (applies to all classes)
+      variant_types: ["SNV", "deletion", "insertion", "indel"]
       
-      # Quality filters
-      min_qual: 0             # ClinVar variants may not have quality scores
-      filter_pass: false
+      # Location-based filtering (applies to all classes)
+      splice_region_padding: 10  # Include variants within 10bp of exon boundaries
       
+      # Class balancing
+      max_variants_per_class: 10000  # Cap per class to prevent imbalance
+      
+      # Processing
       shard_size: 1000
       n_jobs: -1
-      seed: "{seed}"
       debug: true
+      
+      # Logging
+      log_level: "INFO"
+      log_file: "{paths.logs}/clinvar_variants.log"
   
   # -------------------------------------------------------------------------
   # Step 4: Add experimentally validated splice variants
   # -------------------------------------------------------------------------
   splice_variants:
     enabled: true
-    description: "Add SpliceVarDB experimentally validated splice variants"
+    description: "Add SpliceVarDB and ClinVar variants"
     kwargs:
       # Input files
-      splicevar_vcf: "{paths.raw}/variants/splicevar_hg38.vcf.gz"
-      gtf: "{paths.raw}/gencode/gencode.v44.annotation.gtf"
-      base_windows: "{paths.cache}/variants_base/*.parquet"
-      out: "{paths.cache}/splice_variants"
-      chroms: "chr21"
-    
-      # Variant selection
-      include_effects: ["STRONG", "MILD", "NONE"]
+      vcf: "{paths.raw}/variants/splicevar_hg38.vcf.gz"  # SpliceVarDB VCF
+      windows: "{paths.cache}/variants_base/*.parquet"
+      output: "{paths.cache}/splice_variants/splice_variants.parquet"
+      
+      # Variant filtering
+      chromosomes: ["chr21"]
       min_qual: 0.0
-    
-      # Processing
-      shard_size: 1000
-      n_jobs: -1
-      debug: true
+      min_af: 0.0
+      max_af: 1.0
+      effects: ["STRONG", "MILD", "NONE"]
+      filter_pass: false
   
   # -------------------------------------------------------------------------
   # Step 5: Create overlapping windows for training
@@ -287,8 +302,7 @@ processing:
       input_dir: "{paths.cache}/gencode_windows_base"
       gtex_dir: "{paths.cache}/gtex_psi"
       variant_dir: "{paths.cache}/variants_overlapping"
-      splice_dir: "{paths.cache}/splice_variants"
-      pathogenic_dir: "{paths.cache}/pathogenic_variants"
+      splice_dir: "{paths.cache}/splice_variants"  # Includes both SpliceVarDB and ClinVar variants
       
       # Output
       output_dir: "{paths.output}"
@@ -331,6 +345,15 @@ processing:
         - num_variants     # Count of variants in window
         - has_variant      # Boolean: contains any variant
         
+        # ClinVar variants (pathogenic and benign)
+        - clinvar_variant_mask     # Binary mask of ClinVar variant positions
+        - clinvar_variant_info     # ClinVar variant details (CLNSIG, etc.)
+        - clinvar_significance     # Pathogenic/Benign/Likely_pathogenic/etc.
+        - clinvar_review_status    # Review status
+        - clinvar_allele_freq      # Population allele frequency
+        - num_clinvar_variants     # Count of ClinVar variants in window
+        - has_clinvar_variant      # Boolean: contains any ClinVar variant
+        
         # Splice variants (experimentally validated)
         - has_splice_variant        # Boolean: contains splice variant
         - splice_effect             # STRONG/MILD/NONE
@@ -345,13 +368,16 @@ processing:
         
         # Derived flags
         - is_splice_altering        # Boolean: STRONG or MILD effect
+        - is_pathogenic             # Boolean: ClinVar pathogenic variant
+        - is_benign                 # Boolean: ClinVar benign variant
         - is_canonical_site         # Boolean: ±2bp from donor/acceptor
         - is_deep_intronic          # Boolean: >50bp from any exon
         - is_exonic                 # Boolean: within exon
         
         # Training labels (computed)
-        - training_label            # "benign" / "splice_strong" / "splice_mild" / "splice_none" / "unlabeled"
+        - training_label            # "benign" / "pathogenic" / "splice_strong" / "splice_mild" / "splice_none" / "unlabeled"
         - training_weight           # Weight for loss function
+        - variant_class             # "common" / "clinvar_benign" / "clinvar_pathogenic" / "splice_var"
       
       # Filters
       max_variants_per_window: 0   # 0 = no limit

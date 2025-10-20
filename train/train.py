@@ -180,14 +180,103 @@ class StructuralParquetDataset(Dataset):
     """
     def __init__(self, paths: list[Path]):
         import pandas as pd
+        import numpy as np
         self._rows: list[dict[str, Any]] = []
+        self._df = None
+        
+        # Read all parquet files into a single DataFrame
+        dfs = []
         for p in paths:
             df = pd.read_parquet(p)
             req = {"seq", "donor", "acceptor", "tss", "polya"}
             miss = req - set(df.columns)
             if miss:
                 raise ValueError(f"Missing columns in {p}: {miss}")
-            self._rows.extend(df.to_dict("records"))
+            dfs.append(df)
+            
+        if dfs:
+            self._df = pd.concat(dfs, ignore_index=True)
+            self._rows = self._df.to_dict('records')
+    
+    def log_variant_stats(self, logger=None):
+        """Log statistics about variants in the dataset."""
+        import pandas as pd
+        import numpy as np
+        
+        if self._df is None or len(self._df) == 0:
+            if logger:
+                logger.info("No data available for variant statistics")
+            return
+            
+        stats = {}
+        total = len(self._df)
+        
+        # Log basic dataset info
+        if logger:
+            logger.info("\n📊 Dataset Statistics:")
+            logger.info("=" * 80)
+            logger.info(f"  Total examples: {total:,}")
+            
+            # Basic variant statistics
+            if 'has_variant' in self._df.columns:
+                variant_count = self._df['has_variant'].sum()
+                logger.info(f"\n  Variant Statistics:")
+                logger.info(f"    - Examples with variants: {variant_count:,} ({variant_count/total*100:.1f}%)")
+                
+                if 'num_variants' in self._df.columns:
+                    variant_stats = self._df[self._df['num_variants'] > 0]['num_variants'].describe(percentiles=[0.5, 0.9, 0.99])
+                    logger.info(f"    - Avg variants per window: {variant_stats['mean']:.2f}")
+                    logger.info(f"    - Max variants in a window: {variant_stats['max']}")
+                    logger.info(f"    - 90th percentile: {variant_stats['90%']:.1f} variants")
+            
+            # Splice variant statistics
+            if 'has_splice_variant' in self._df.columns:
+                splice_count = self._df['has_splice_variant'].sum()
+                logger.info(f"\n  Splice Variant Statistics:")
+                logger.info(f"    - Examples with splice variants: {splice_count:,} ({splice_count/total*100:.1f}%)")
+                
+                if 'splice_effect' in self._df.columns and 'splice_score' in self._df.columns:
+                    # Get splice effects for examples that have them
+                    splice_effects = self._df[self._df['splice_effect'].notna()]
+                    if not splice_effects.empty:
+                        logger.info(f"\n  Splice Effect Types:")
+                        effects = splice_effects['splice_effect'].value_counts()
+                        for effect, count in effects.items():
+                            logger.info(f"    - {effect}: {count:,} ({count/len(splice_effects)*100:.1f}%)")
+                        
+                        # Show score distribution for splice variants
+                        score_stats = splice_effects['splice_score'].describe(percentiles=[0.1, 0.5, 0.9])
+                        logger.info(f"\n  Splice Variant Scores:")
+                        logger.info(f"    - Mean: {score_stats['mean']:.3f}")
+                        logger.info(f"    - 10th percentile: {score_stats['10%']:.3f}")
+                        logger.info(f"    - 50th percentile: {score_stats['50%']:.3f}")
+                        logger.info(f"    - 90th percentile: {score_stats['90%']:.3f}")
+                        logger.info(f"    - Max: {score_stats['max']:.3f}")
+            
+            # Training label distribution
+            if 'training_label' in self._df.columns:
+                label_counts = self._df['training_label'].value_counts()
+                logger.info(f"\n  Training Label Distribution:")
+                for label, count in label_counts.items():
+                    logger.info(f"    - Label {int(label)}: {count:,} ({count/total*100:.1f}%)")
+            
+            # Check for any other interesting columns
+            interesting_cols = [
+                'is_splice_altering', 'is_canonical_site', 
+                'is_deep_intronic', 'is_exonic'
+            ]
+            present_cols = [col for col in interesting_cols if col in self._df.columns]
+            
+            if present_cols:
+                logger.info(f"\n  Additional Features:")
+                for col in present_cols:
+                    if self._df[col].dtype == bool:
+                        true_count = self._df[col].sum()
+                        logger.info(f"    - {col}: {true_count:,} ({true_count/total*100:.1f}% True)")
+            
+            logger.info("=" * 80 + "\n")
+        
+        return stats
 
     def __len__(self): return len(self._rows)
 
@@ -934,6 +1023,25 @@ class StructuralDataModule(pl.LightningDataModule):
         """
         train_glob = self.cfg.get("train_parquet_glob")
         val_glob = self.cfg.get("val_parquet_glob")
+        
+        if stage in (None, "fit"):
+            train_paths = self._resolve_glob(train_glob)
+            val_paths = self._resolve_glob(val_glob)
+            
+            logger.info(f"Loading training data from {len(train_paths)} files...")
+            self.train_ds = StructuralParquetDataset(train_paths)
+            
+            logger.info(f"Loading validation data from {len(val_paths)} files...")
+            self.val_ds = StructuralParquetDataset(val_paths)
+            
+            # Log dataset statistics
+            if hasattr(self.train_ds, 'log_variant_stats'):
+                logger.info("\nTraining Set:")
+                self.train_ds.log_variant_stats(logger)
+                
+            if hasattr(self.val_ds, 'log_variant_stats'):
+                logger.info("\nValidation Set:")
+                self.val_ds.log_variant_stats(logger)
         
         if not train_glob or not val_glob:
             raise ValueError(

@@ -333,16 +333,18 @@ def convert_gct_to_parquet(
                     
                     # Parse junction coordinates
                     try:
-                        if ':' in junction_id:
-                            chrom, coords_strand = junction_id.split(':', 1)
-                            coords, strand = coords_strand.rsplit('_', 1)
-                            start, end = map(int, coords.split('-'))
-                        else:
+                        if '_' in junction_id and junction_id.count('_') >= 2:
+                            # Handle chr_start_end format
                             parts = junction_id.split('_')
                             chrom = parts[0]
                             start = int(parts[1])
                             end = int(parts[2])
-                            strand = '+'
+                            strand = '+'  # Default strand if not specified
+                        else:
+                            # Fallback to other formats if needed
+                            chrom, coords_strand = junction_id.split(':', 1)
+                            coords, strand = coords_strand.rsplit('_', 1)
+                            start, end = map(int, coords.split('-'))
                         
                         # Filter by intron length
                         intron_length = abs(end - start)
@@ -350,10 +352,12 @@ def convert_gct_to_parquet(
                             stats['filtered_length'] += 1
                             continue
                         
-                        # Filter by chromosome
-                        if target_chroms and chrom not in target_chroms:
-                            stats['filtered_chrom'] += 1
-                            continue
+                        # Filter by chromosome (handle both 'chr21' and '21' formats)
+                        if target_chroms:
+                            chrom_clean = chrom.replace('chr', '')  # Remove 'chr' prefix for comparison
+                            if chrom not in target_chroms and chrom_clean not in target_chroms:
+                                stats['filtered_chrom'] += 1
+                                continue
                         
                         # Add junction
                         junctions.append({

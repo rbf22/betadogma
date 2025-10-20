@@ -84,8 +84,8 @@ def _masked_bce_with_logits(
     return F.binary_cross_entropy_with_logits(logits, targets, reduction="mean")
 
 def structural_bce_ce_loss(
-    head_outputs: Dict[str, Dict[str, torch.Tensor]],
-    labels: Dict[str, Dict[str, torch.Tensor]],
+    head_outputs: Dict[str, Any],
+    labels: Dict[str, Any],
     pad_mask: Optional[torch.BoolTensor] = None,
     weights: Optional[Dict[str, float]] = None,
 ) -> torch.Tensor:
@@ -96,21 +96,17 @@ def structural_bce_ce_loss(
         - "splice": dict with "donor" and "acceptor" tensors (B, L, 1)
         - "polya": dict with "polya" tensor (B, L, 1)
         - "orf": dict with "start" (B, L, 1), "stop" (B, L, 1), "frame" (B, L, 3)
+        - "variant_effect": dict with "effect" tensor (B, L, 1)
 
     For the "frame" task, labels["orf"]["frame"] should be (B, L) int64 in {0,1,2}.
     """
-    # Initialize weights with default values
-    w: Dict[str, float] = {
-        "donor": 1.0, 
-        "acceptor": 1.0,
-        "tss": 1.0, 
-        "polya": 1.0,
-        "orf_start": 0.5, 
-        "orf_stop": 0.5, 
-        "orf_frame": 0.5,
-    }
-    if weights:
-        w.update(weights)
+    # Initialize weights if not provided
+    weights = weights or {}
+    w_splice = weights.get('splice', 1.0)
+    w_tss = weights.get('tss', 1.0)
+    w_polya = weights.get('polya', 1.0)
+    w_orf = weights.get('orf', 1.0)
+    w_variant = weights.get('variant_effect', 1.0)
 
     # Initialize loss on the correct device
     device = next(iter(head_outputs.values()))[next(iter(next(iter(head_outputs.values()))))].device

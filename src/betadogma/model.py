@@ -190,6 +190,15 @@ class BetaDogmaModel(nn.Module):
         self.tss_head    = TSSHead(   d_in=d_in, d_hidden=d_hidden, dropout=dropout, use_conv=use_conv)
         self.polya_head  = PolyAHead( d_in=d_in, d_hidden=d_hidden, dropout=dropout, use_conv=use_conv)
         self.orf_head    = ORFHead(   d_in=d_in, d_hidden=d_hidden, dropout=dropout, use_conv=use_conv)
+        
+        # Variant effect prediction head
+        self.variant_effect_head = nn.Sequential(
+            nn.Linear(d_in, d_hidden // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_hidden // 2, 1),
+            nn.Sigmoid()
+        )
 
         self.isoform_decoder = IsoformDecoder(config=config.get("decoder", {}))
 
@@ -211,7 +220,8 @@ class BetaDogmaModel(nn.Module):
     def forward(
         self, 
         embeddings: torch.Tensor, 
-        input_ids: Optional[torch.Tensor] = None
+        input_ids: Optional[torch.Tensor] = None,
+        variant_positions: Optional[torch.Tensor] = None
     ) -> Dict[str, Union[Dict[str, torch.Tensor], torch.Tensor, None]]:
         """
         Run the per-base heads on precomputed embeddings.
@@ -219,6 +229,7 @@ class BetaDogmaModel(nn.Module):
         Args:
             embeddings: (B, L, d_in) tensor
             input_ids: Optional sequence tokens aligned to L (e.g., A/C/G/T/N vocab)
+            variant_positions: Optional tensor of variant positions (0-based, inclusive)
 
         Returns:
             A dict bundling all head outputs, plus embeddings/input_ids passthrough:
@@ -229,6 +240,7 @@ class BetaDogmaModel(nn.Module):
                 "orf":    {"start":(B,L,1), "stop":(B,L,1), "frame":(B,L,3)},
                 "embeddings": embeddings,
                 "input_ids": input_ids,
+                "variant_effect": (B, L) tensor of variant effect predictions (if variant_positions provided)
             }
         """
         outputs = {
@@ -239,6 +251,13 @@ class BetaDogmaModel(nn.Module):
             "embeddings": embeddings,
             "input_ids": input_ids,
         }
+        
+        # Add variant effect prediction if positions are provided
+        if variant_positions is not None and variant_positions.numel() > 0:
+            # Get embeddings at variant positions
+            batch_indices = torch.arange(embeddings.size(0), device=embeddings.device)
+            variant_embeddings = embeddings[batch_indices, variant_positions]
+            outputs["variant_effect"] = self.variant_effect_head(variant_embeddings).squeeze(-1)
         return outputs
 
     @classmethod

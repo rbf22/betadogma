@@ -645,7 +645,7 @@ class TrainingDataPreparer:
             'gtex': 'src/betadogma/data/prepare_gtex.py',
             'variants': 'src/betadogma/data/prepare_variants.py',
             'pathogenic_variants': 'src/betadogma/data/prepare_pathogenic_variants.py',
-            'splice_variants': 'src/betadogma/data/prepare_splice_variants.py',  # UPDATED: renamed
+            'splice_variants': 'src/betadogma/data/prepare_splice_variants.py',
             'overlapping_windows': 'src/betadogma/data/prepare_overlapping.py',
             'aggregate': 'src/betadogma/data/prepare_aggregate.py',
         }
@@ -669,16 +669,21 @@ class TrainingDataPreparer:
             # Convert underscores to hyphens for CLI (Python style -> CLI style)
             cli_key = key.replace('_', '-')
             
-            # Handle different value types
-            if isinstance(value, bool):
+            # Special handling for effects in splice_variants step
+            if step_name == 'splice_variants' and key == 'effects' and isinstance(value, (list, tuple)):
+                # For effects, pass as a single --effects flag with space-separated values
+                cmd.extend([f'--{cli_key}', ' '.join(str(v) for v in value)])
+            # Handle boolean flags
+            elif isinstance(value, bool):
                 if value:
                     cmd.append(f'--{cli_key}')
+            # Handle list/tuple values
             elif isinstance(value, (list, tuple)):
-                # Multiple values for same argument
+                # For other lists, pass each item with its own flag
                 for item in value:
                     cmd.extend([f'--{cli_key}', str(item)])
+            # Handle all other non-empty values
             elif value is not None and value != '':
-                # Skip empty strings and None
                 cmd.extend([f'--{cli_key}', str(value)])
         
         self.logger.info(f"  Executing: {' '.join(cmd)}")
@@ -758,6 +763,12 @@ class TrainingDataPreparer:
         """Print pipeline execution summary."""
         duration = (datetime.now() - self.stats['start_time']).total_seconds()
         
+        # Calculate steps that were not run because we started from a specific step
+        steps_not_run = []
+        if self.from_step:
+            start_idx = self.STEPS.index(self.from_step)
+            steps_not_run = self.STEPS[:start_idx]
+        
         self.logger.info("")
         self.logger.info("=" * 80)
         self.logger.info("📊 Pipeline Summary")
@@ -765,6 +776,7 @@ class TrainingDataPreparer:
         self.logger.info(f"  Total time:      {duration:.1f}s ({duration/3600:.2f} hours)")
         self.logger.info(f"  Steps completed: {len(self.stats['steps_completed'])}")
         self.logger.info(f"  Steps skipped:   {len(self.stats['steps_skipped'])}")
+        self.logger.info(f"  Steps not run:   {len(steps_not_run)}")
         self.logger.info(f"  Steps failed:    {len(self.stats['steps_failed'])}")
         
         if self.stats['steps_completed']:
@@ -775,6 +787,11 @@ class TrainingDataPreparer:
         if self.stats['steps_skipped']:
             self.logger.info(f"\n  ⊘ Skipped steps:")
             for step in self.stats['steps_skipped']:
+                self.logger.info(f"     - {step}")
+        
+        if steps_not_run:
+            self.logger.info(f"\n  ⏭️  Steps not run (started from '{self.from_step}'):")
+            for step in steps_not_run:
                 self.logger.info(f"     - {step}")
         
         if self.stats['steps_failed']:

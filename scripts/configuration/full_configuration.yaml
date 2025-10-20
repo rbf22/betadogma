@@ -192,7 +192,31 @@ processing:
       seed: "{seed}"
       debug: false
   
-  # Step 4: Create overlapping windows from base windows
+  # Step 4: Add experimentally validated splice variants
+  splice_variants:
+    enabled: true
+    kwargs:
+      vcf: "{paths.raw}/splicevar/splicevar_hg38.vcf.gz"
+      windows: "{paths.cache}/variants_base/*.parquet"
+      out: "{paths.cache}/splice_variants"
+      
+      # Splice variant processing settings
+      effects: ["STRONG", "MILD", "NONE"]  # Include all effect types
+      min_af: 0.0           # Include even rare splice variants
+      max_af: 1.0           # Include even common splice variants
+      
+      # Performance settings
+      shard_size: 50000     # Process 50k windows per shard
+      n_jobs: -1            # Parallel processing across CPU cores
+      
+      # Quality filters
+      min_qual: 0           # No quality threshold for experimental variants
+      filter_pass: false    # Include variants even if they don't pass all filters
+      
+      seed: "{seed}"
+      debug: false
+
+  # Step 5: Create overlapping windows from base windows
   # This enables sliding window predictions at inference time
   overlapping_windows:
     enabled: true
@@ -211,8 +235,8 @@ processing:
       seed: "{seed}"
       debug: false
   
-  # Step 5: Aggregate all data into final training format
-  # Merges gencode windows, GTEx data, and variants
+  # Step 6: Aggregate all data into final training format
+  # Merges gencode windows, GTEx data, variants, and splice variants
   aggregate:
     enabled: true
     kwargs:
@@ -220,6 +244,7 @@ processing:
       output_dir: "{paths.output}"
       gtex_dir: "{paths.cache}/gtex_psi"
       variant_dir: "{paths.cache}/variants_overlapping"
+      splice_variant_dir: "{paths.cache}/splice_variants"
       
       # Output format
       write_index: true     # Create index for fast loading
@@ -240,6 +265,12 @@ processing:
         - psi              # Junction PSI values (from GTEx)
         - variant_mask     # Which bases have variants
         - variant_info     # Variant metadata
+        - has_splice_variant  # Whether window contains a splice variant
+        - splice_effect    # Splice effect type (STRONG/MILD/NONE)
+        - splice_score     # Splice effect score (1.0=strong, 0.5=mild, 0.0=none)
+        - splice_method    # Experimental method used
+        - splice_location  # Variant location (exonic/intronic)
+        - is_pathogenic    # Whether variant is pathogenic
       
       # Additional filtering
       max_variants_per_window: 0  # 0 = no additional downsampling

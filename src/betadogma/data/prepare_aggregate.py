@@ -330,15 +330,36 @@ def merge_gtex_by_coordinates(
     merged['num_junctions'] = merged['num_junctions'].fillna(0).astype(int)
     merged['has_gtex_data'] = merged['has_gtex_data'].fillna(False)
     
+    # Log detailed GTEx statistics
     windows_with_gtex = merged['has_gtex_data'].sum()
     total_junctions = merged['num_junctions'].sum()
     
-    logger.info(f"  Windows with GTEx data: {windows_with_gtex:,} / {len(merged):,}")
+    logger.info("\n🌐 GTEx Splicing Data:")
+    logger.info("=" * 50)
+    logger.info(f"  Windows with GTEx data: {windows_with_gtex:,}/{len(merged):,} "
+               f"({windows_with_gtex/len(merged)*100:.1f}%)")
     logger.info(f"  Total junctions mapped: {total_junctions:,}")
     
     if windows_with_gtex > 0:
-        avg_psi = merged[merged['has_gtex_data']]['psi_mean'].mean()
-        logger.info(f"  Average PSI (windows with data): {avg_psi:.3f}")
+        gtex_windows = merged[merged['has_gtex_data']]
+        avg_psi = gtex_windows['psi_mean'].mean()
+        median_psi = gtex_windows['psi_mean'].median()
+        
+        logger.info("\n  PSI Statistics (windows with data):")
+        logger.info(f"    - Mean: {avg_psi:.3f}")
+        logger.info(f"    - Median: {median_psi:.3f}")
+        logger.info(f"    - Min: {gtex_windows['psi_mean'].min():.3f}")
+        logger.info(f"    - Max: {gtex_windows['psi_mean'].max():.3f}")
+        
+        # Junction count distribution
+        junction_counts = gtex_windows['num_junctions']
+        logger.info("\n  Junction Counts per Window:")
+        logger.info(f"    - Mean: {junction_counts.mean():.1f}")
+        logger.info(f"    - Median: {junction_counts.median():.1f}")
+        logger.info(f"    - Min: {junction_counts.min():,}")
+        logger.info(f"    - Max: {junction_counts.max():,}")
+    
+    logger.info("=" * 50)
     
     return merged
 
@@ -351,8 +372,31 @@ def merge_variants_with_windows(
     windows: pd.DataFrame,
     variant_dir: str
 ) -> pd.DataFrame:
-    """Merge population variant data with windows."""
+    """
+    Merge population variant data with windows.
+    
+    Handles multiple variant types (1000 Genomes, ClinVar, etc.) and aggregates
+    them into a single variant representation per window.
+    
+    Args:
+        windows: DataFrame with genomic windows
+        variant_dir: Directory containing variant parquet files
+        
+    Returns:
+        DataFrame with merged variant information
+    """
     logger.info("\n📂 Loading population variants...")
+    
+    # Define merge columns that will be used in the final merge
+    merge_cols = [
+        'chrom', 'start', 'end', 'strand', 
+        'has_variant', 'num_variants',
+        'variant_info', 'variant_mask', 
+        'variant_type',  # Track SNP/INS/DEL
+        'variant_af',    # Track allele frequency
+        'is_pathogenic', # Track pathogenicity
+        'SNP', 'INS', 'DEL'  # Legacy type indicators
+    ]
     
     if not os.path.exists(variant_dir):
         logger.warning(f"  Variant directory not found: {variant_dir}")
@@ -360,125 +404,407 @@ def merge_variants_with_windows(
         windows['num_variants'] = 0
         windows['variant_mask'] = None
         windows['variant_info'] = None
-        if 'seq_alt' not in windows.columns:
-            windows['seq_alt'] = windows.get('seq', '')
         return windows
     
+    # Load and process variants
     variants = load_parquet_dir(variant_dir)
     logger.info(f"  Loaded {len(variants):,} variant records")
     
-    # Check for duplicates in variant data
-    variant_dupes = variants.duplicated(subset=['chrom', 'start', 'end'], keep=False)
-    if variant_dupes.any():
-        logger.info(f"  Found {variant_dupes.sum():,} duplicate variant records")
-        logger.info(f"  Unique windows in variants: {variants[['chrom', 'start', 'end']].drop_duplicates().shape[0]:,}")
+    # Add source information if not present
+    if 'source' not in variants.columns:
+        variants['source'] = '1kg'  # Default to 1000 Genomes if source not specified
     
-    # Build aggregation dictionary
+    # Ensure variant type is properly set
+    if 'variant_type' not in variants.columns:
+        # Infer from existing type indicators if available
+        if all(t in variants.columns for t in ['SNP', 'INS', 'DEL']):
+            variants['variant_type'] = np.select(
+                [variants['SNP'], variants['INS'], variants['DEL']],
+                ['SNP', 'INS', 'DEL'],
+                default='UNKNOWN'
+            )
+        else:
+            variants['variant_type'] = 'UNKNOWN'
+    
+    # Ensure allele frequency is set
+    if 'variant_af' not in variants.columns and 'af' in variants.columns:
+        variants['variant_af'] = variants['af']
+    elif 'variant_af' not in variants.columns:
+        variants['variant_af'] = 0.0  # Default to 0 if not available
+    
+    # Check for required columns and handle missing ones
+    required_columns = ['chrom', 'pos', 'ref', 'alt']
+    missing_columns = [col for col in required_columns if col not in variants.columns]
+    
+    if missing_columns:
+        logger.warning(f"  Missing required columns in variant data: {missing_columns}")
+        logger.info(f"  Available columns: {variants.columns.tolist()}")
+        
+        # If we don't have the required columns for deduplication, just continue with all variants
+        logger.info("  Cannot perform deduplication without required columns. Using all variants as-is.")
+        variant_dupes = pd.Series(False, index=variants.index)
+    else:
+        # Check for duplicates in variant data using available columns
+        variant_dupes = variants.duplicated(subset=required_columns, keep=False)
+        if variant_dupes.any():
+            logger.info(f"  Found {variant_dupes.sum():,} duplicate variant records")
+            logger.info(f"  Unique variants: {variants[required_columns].drop_duplicates().shape[0]:,}")
+        else:
+            variant_dupes = pd.Series(False, index=variants.index)
+    
+    # Build aggregation dictionary - only keep essential fields
     agg_dict = {}
     
-    if 'var_type' in variants.columns:
-        agg_dict['var_type'] = lambda x: list(x)
+    # Add standard fields if they exist
+    for col in ['ref', 'alt', 'af', 'variant_type', 'variant_af']:
+        if col in variants.columns:
+            agg_dict[col] = 'first'
     
-    if 'in_window_idx' in variants.columns:
-        agg_dict['in_window_idx'] = lambda x: list(x)
+    # Handle pathogenicity
+    if 'is_pathogenic' in variants.columns:
+        agg_dict['is_pathogenic'] = 'any'
     
-    if 'variant_spec' in variants.columns:
-        agg_dict['variant_spec'] = lambda x: list(x)
+    # Add list-type aggregations
+    for col in ['source', 'var_type', 'in_window_idx', 'variant_spec']:
+        if col in variants.columns:
+            agg_dict[col] = lambda x: list(x) if len(x) > 1 else x.iloc[0]
     
-    if 'seq_alt' in variants.columns:
-        agg_dict['seq_alt'] = 'first'
+    # Add boolean aggregations
+    for col in ['is_pathogenic', 'is_benign']:
+        if col in variants.columns:
+            agg_dict[col] = 'any'
     
-    logger.info("  Aggregating variants per window...")
-    variant_agg = variants.groupby(['chrom', 'start', 'end'], as_index=False).agg(agg_dict)
+    # Add ClinVar-specific fields
+    for col in ['clinvar_significance', 'clinvar_review_status', 'clinvar_allele_freq']:
+        if col in variants.columns:
+            agg_dict[col] = 'first'
     
-    logger.info(f"  Aggregated to {len(variant_agg):,} unique windows")
-    
-    variant_agg['num_variants'] = variant_agg['var_type'].apply(len) if 'var_type' in variant_agg.columns else 1
-    variant_agg['has_variant'] = True
-    
-    # Create variant_mask
-    if 'in_window_idx' in variant_agg.columns:
-        def create_mask(indices, window_size=131072):
-            mask = np.zeros(window_size, dtype=bool)
-            for idx in indices:
-                if isinstance(idx, (int, np.integer)) and 0 <= idx < window_size:
-                    mask[idx] = True
-            return mask
-        
-        variant_agg['variant_mask'] = variant_agg['in_window_idx'].apply(create_mask)
-    
-    # Create variant_info
-    if all(c in variant_agg.columns for c in ['var_type', 'in_window_idx', 'variant_spec']):
-        def create_variant_info(row):
-            return [
-                {
-                    'type': row['var_type'][i],
-                    'pos': row['in_window_idx'][i] if i < len(row['in_window_idx']) else -1,
-                    'spec': row['variant_spec'][i] if i < len(row['variant_spec']) else '',
-                }
-                for i in range(len(row['var_type']))
-            ]
-        
-        variant_agg['variant_info'] = variant_agg.apply(create_variant_info, axis=1)
-    
-    # Count by type
-    if 'var_type' in variant_agg.columns:
-        variant_agg['num_snp'] = variant_agg['var_type'].apply(lambda x: sum(1 for t in x if t == 'SNP'))
-        variant_agg['num_ins'] = variant_agg['var_type'].apply(lambda x: sum(1 for t in x if t == 'INS'))
-        variant_agg['num_del'] = variant_agg['var_type'].apply(lambda x: sum(1 for t in x if t == 'DEL'))
+    # Group by genomic position to merge variants at the same location
+    logger.info("    # Convert variants to genomic positions for interval mapping")
+    if 'pos' in variants.columns:
+        variant_positions = variants['pos'].values
+    elif 'start' in variants.columns:
+        variant_positions = variants['start'].values
     else:
-        variant_agg['num_snp'] = 0
-        variant_agg['num_ins'] = 0
-        variant_agg['num_del'] = 0
+        logger.warning("  No position information available for variants. Cannot map to windows.")
+        windows['has_variant'] = False
+        windows['num_variants'] = 0
+        windows['variant_mask'] = None
+        windows['variant_info'] = None
+        return windows
     
-    # Select merge columns
-    merge_cols = ['chrom', 'start', 'end', 'has_variant', 'num_variants', 
-                  'num_snp', 'num_ins', 'num_del']
+    # Determine grouping columns based on available data
+    if 'pos' in variants.columns:
+        group_cols = ['chrom', 'pos']
+    elif 'start' in variants.columns:
+        group_cols = ['chrom', 'start']
+    else:
+        logger.warning("  No position column found. Using all variants as-is.")
+        group_cols = ['chrom']  # Fallback to just chromosome if no position column
     
-    if 'variant_mask' in variant_agg.columns:
-        merge_cols.append('variant_mask')
-    if 'variant_info' in variant_agg.columns:
-        merge_cols.append('variant_info')
-    if 'seq_alt' in variant_agg.columns:
-        merge_cols.append('seq_alt')
+    # If we have a valid grouping, perform the aggregation
+    if len(group_cols) > 1:
+        variant_agg = variants.groupby(group_cols, as_index=False).agg(agg_dict)
+    else:
+        # If we can't group by position, just take the first variant per chromosome
+        variant_agg = variants.drop_duplicates(subset=group_cols, keep='first')
+    
+    # Add window-based information
+    logger.info("  Mapping variants to windows...")
+    variant_windows = []
+    
+    # Convert windows to interval index for faster lookup
+    windows['interval'] = pd.IntervalIndex.from_arrays(
+        windows['start'], windows['end'], closed='both'
+    )
+    
+    # Create interval tree for faster window lookups
+    from intervaltree import IntervalTree
+    chrom_trees = {}
+    has_strand = 'strand' in windows.columns
+    
+    for chrom, group in windows.groupby('chrom'):
+        tree = IntervalTree()
+        for idx, row in group.iterrows():
+            # Use strand if available, otherwise default to '+'
+            strand = row['strand'] if has_strand else '+'
+            # Store window info as (start, end, strand, index) to keep track of the original row
+            tree[row['start']:row['end']+1] = (row['start'], row['end'], strand, idx)
+        chrom_trees[chrom] = tree
+    
+    # Map each variant to its containing windows
+    for _, var in variant_agg.iterrows():
+        chrom = var['chrom']
+        
+        # Use 'pos' if available, otherwise use 'start' as position
+        if 'pos' in var:
+            pos = var['pos']
+        elif 'start' in var:
+            pos = var['start']
+        else:
+            logger.warning(f"Variant missing position information: {var}")
+            continue
+            
+        if chrom not in chrom_trees:
+            continue
+            
+        # Find all windows containing this variant
+        for interval in chrom_trees[chrom][pos]:
+            window_start, window_end, strand, _ = interval.data
+            
+            # Calculate position within window (1-based)
+            in_window_pos = pos - window_start + 1
+            
+            # Create variant info with available data
+            variant_info = {
+                'chrom': chrom,
+                'start': window_start,
+                'end': window_end,
+                'strand': strand,
+                'variant_chrom': chrom,
+                'variant_pos': pos,
+                'in_window_pos': in_window_pos,
+                'source': var.get('source', 'unknown'),
+                'type': var.get('var_type', 'UNK'),
+                'has_splice_variant': var.get('has_splice_variant', False),
+                'num_splice_variants': var.get('num_splice_variants', 0),
+                'max_splice_score': var.get('max_splice_score', 0.0)
+            }
+            
+            # Add sequence information if available
+            if 'seq' in var and 'seq_alt' in var:
+                variant_info.update({
+                    'ref': var.get('seq', 'N'),
+                    'alt': var.get('seq_alt', 'N'),
+                    'is_snp': var.get('ch_snp', False),
+                    'is_ins': var.get('ch_ins', False),
+                    'is_del': var.get('ch_del', False)
+                })
+            
+            # Add any additional fields that might be useful
+            for field in ['af', 'is_pathogenic', 'clinvar_significance', 'splice_effect',
+                                'is_snp', 'is_ins', 'is_del']:
+                if field in var:
+                    variant_info[field] = var[field]
+            
+            # Add optional fields
+            for field in ['af', 'is_pathogenic', 'clinvar_significance', 'splice_effect']:
+                if field in var:
+                    variant_info[field] = var[field]
+            
+            variant_windows.append(variant_info)
+    
+    # Convert to DataFrame and aggregate by window
+    if variant_windows:
+        try:
+            variant_windows_df = pd.DataFrame(variant_windows)
+            
+            # Ensure we have the required columns for grouping
+            required_cols = ['chrom', 'start', 'end', 'strand']
+            for col in required_cols:
+                if col not in variant_windows_df.columns:
+                    logger.warning(f"Missing required column: {col}")
+                    variant_windows_df[col] = ''
+            
+            # Add in_window_pos if missing
+            if 'in_window_pos' not in variant_windows_df.columns:
+                if 'pos' in variant_windows_df.columns and 'start' in variant_windows_df.columns:
+                    variant_windows_df['in_window_pos'] = variant_windows_df['pos'] - variant_windows_df['start'] + 1
+                else:
+                    variant_windows_df['in_window_pos'] = 0
+            
+            # Group by window coordinates
+            grouped = variant_windows_df.groupby(
+                ['chrom', 'start', 'end', 'strand'], 
+                group_keys=False
+            )
+            
+            # Initialize list to store window variant data
+            window_data = []
+            
+            # Process each window group
+            for (chrom, start, end, strand), group in grouped:
+                # Initialize variant info list for this window
+                variant_info = []
+                
+                # Process each variant in the window
+                for _, row in group.iterrows():
+                    # Create variant info dictionary with all position information
+                    variant = {
+                        # Original genomic coordinates
+                        'chrom': str(row.get('chrom', '')),  # Add chromosome
+                        'pos': int(row.get('pos', row.get('start', 0))),  # Genomic position
+                        'ref': str(row.get('ref', row.get('seq', 'N'))),  # Reference allele
+                        'alt': str(row.get('alt', row.get('seq_alt', 'N'))),  # Alternate allele
+                        
+                        # Window-relative position
+                        'in_window_pos': int(row.get('in_window_pos', 0)),
+                        'window_start': int(row.get('start', 0)),
+                        'window_end': int(row.get('end', 0)),
+                        'strand': str(row.get('strand', '+')),  # Default to '+' if missing
+                        
+                        # Variant metadata
+                        'source': str(row.get('source', 'unknown')),
+                        'type': str(row.get('var_type', 'UNK')),
+                        'has_splice_variant': bool(row.get('has_splice_variant', False)),
+                        'num_splice_variants': int(row.get('num_splice_variants', 0)),
+                        'max_splice_score': float(row.get('max_splice_score', 0.0))
+                    }
+                    
+                    # Add any additional fields that might be useful
+                    for field in ['af', 'is_pathogenic', 'clinvar_significance', 'splice_effect',
+                                'is_snp', 'is_ins', 'is_del']:
+                        if field in row:
+                            variant[field] = row[field]
+                    
+                    # Add optional fields
+                    for field in ['af', 'is_pathogenic', 'clinvar_significance', 'splice_effect']:
+                        if field in row:
+                            variant[field] = row[field]
+                    
+                    variant_info.append(variant)
+                
+                # Count variant types
+                snp_count = 0
+                ins_count = 0
+                del_count = 0
+                
+                for v in variant_info:
+                    vt = str(v.get('type', '')).upper()
+                    if 'INS' in vt:
+                        ins_count += 1
+                    elif 'DEL' in vt:
+                        del_count += 1
+                    else:
+                        snp_count += 1
+                
+                # Add window data
+                window_data.append({
+                    'chrom': str(chrom),
+                    'start': int(start),
+                    'end': int(end),
+                    'strand': str(strand),
+                    'has_variant': len(variant_info) > 0,
+                    'num_variants': len(variant_info),
+                    'variant_info': variant_info,
+                    'variant_mask': [v.get('pos', 0) for v in variant_info],
+                    'SNP': snp_count,
+                    'INS': ins_count,
+                    'DEL': del_count
+                })
+            
+            # Convert to DataFrame
+            if window_data:
+                window_variants = pd.DataFrame(window_data)
+            else:
+                window_variants = pd.DataFrame(columns=[
+                    'chrom', 'start', 'end', 'strand', 'has_variant', 'num_variants',
+                    'variant_info', 'variant_mask', 'SNP', 'INS', 'DEL'
+                ])
+                
+        except Exception as e:
+            logger.error(f"Error processing variants: {str(e)}")
+            logger.error(traceback.format_exc())
+            window_variants = pd.DataFrame(columns=[
+                'chrom', 'start', 'end', 'strand', 'has_variant', 'num_variants',
+                'variant_info', 'variant_mask', 'SNP', 'INS', 'DEL'
+            ])
+    else:
+        # No variants found
+        window_variants = pd.DataFrame(columns=['chrom', 'start', 'end', 'strand'])
+        window_variants['has_variant'] = False
+        window_variants['num_variants'] = 0
+        window_variants['variant_info'] = None
+        window_variants['variant_mask'] = None
+        window_variants[['SNP', 'INS', 'DEL']] = 0
+        
+        # Ensure all required columns exist
+        for col in merge_cols:
+            if col not in window_variants.columns:
+                window_variants[col] = None
+        
+        # Select only the required columns
+        window_variants = window_variants[merge_cols]
+        
+        # Add pathogenic variant counts if available in variant_info
+        if not window_variants.empty and 'variant_info' in window_variants.columns:
+            def count_pathogenic(variants):
+                if not isinstance(variants, list):
+                    return 0
+                return sum(1 for v in variants if isinstance(v, dict) and v.get('is_pathogenic', False))
+            
+            window_variants['num_pathogenic'] = window_variants['variant_info'].apply(count_pathogenic)
+            merge_cols.append('num_pathogenic')
     
     # Merge
     logger.info("  Merging with base windows...")
     logger.info(f"    Base windows: {len(windows):,}")
-    logger.info(f"    Variant windows: {len(variant_agg):,}")
+    logger.info(f"    Variant windows: {len(window_variants):,}")
+    
+    # Ensure we only keep the columns that exist in window_variants
+    valid_merge_cols = [col for col in merge_cols if col in window_variants.columns]
     
     merged = windows.merge(
-        variant_agg[merge_cols],
+        window_variants[valid_merge_cols],
         on=['chrom', 'start', 'end'],
         how='left',
         validate='one_to_one'  # Ensure 1:1 merge
     )
     
-    logger.info(f"    After merge: {len(merged):,}")
-    
-    # Check for unexpected duplication
-    if len(merged) != len(windows):
-        logger.error(f"  ❌ DUPLICATION DETECTED: {len(windows):,} → {len(merged):,}")
-        logger.error(f"  Keeping only first occurrence of each window")
-        merged = merged.drop_duplicates(subset=['chrom', 'start', 'end'], keep='first')
-        logger.info(f"    After deduplication: {len(merged):,}")
-    
-    # Fill NaN values
+    # Fill NA values for variant columns
     merged['has_variant'] = merged['has_variant'].fillna(False)
     merged['num_variants'] = merged['num_variants'].fillna(0).astype(int)
-    merged['num_snp'] = merged['num_snp'].fillna(0).astype(int)
-    merged['num_ins'] = merged['num_ins'].fillna(0).astype(int)
-    merged['num_del'] = merged['num_del'].fillna(0).astype(int)
     
-    if 'seq_alt' in merged.columns and 'seq' in merged.columns:
-        merged['seq_alt'] = merged['seq_alt'].fillna(merged['seq'])
+    # Fill in 0 for variant type counts
+    for col in ['SNP', 'INS', 'DEL']:
+        merged[col] = merged[col].fillna(0).astype(int)
     
-    windows_with_variants = merged['has_variant'].sum()
-    logger.info(f"  Windows with variants: {windows_with_variants:,} / {len(merged):,}")
+    # Log detailed variant statistics
+    num_windows_with_variants = merged['has_variant'].sum()
+    total_variants = merged['num_variants'].sum()
     
-    if 'var_type' in variant_agg.columns:
-        logger.info(f"  Variant counts: SNP={merged['num_snp'].sum():,}, "
-                   f"INS={merged['num_ins'].sum():,}, DEL={merged['num_del'].sum():,}")
+    logger.info("\n📊 Variant Statistics:")
+    logger.info("=" * 50)
+    logger.info(f"  Windows with variants: {num_windows_with_variants:,}/{len(merged):,} "
+               f"({num_windows_with_variants/len(merged)*100:.1f}%)")
+    logger.info(f"  Total variants: {total_variants:,}")
+    
+    # Variant type breakdown
+    logger.info("\n  Variant Types:")
+    logger.info(f"    - SNPs: {merged['SNP'].sum():,}")
+    logger.info(f"    - Insertions: {merged['INS'].sum():,}")
+    logger.info(f"    - Deletions: {merged['DEL'].sum():,}")
+    
+    # Pathogenic variants
+    if 'num_pathogenic' in merged.columns:
+        patho_count = merged['num_pathogenic'].sum()
+        patho_windows = (merged['num_pathogenic'] > 0).sum()
+        logger.info(f"\n  Pathogenic Variants:")
+        logger.info(f"    - Total: {patho_count:,}")
+        logger.info(f"    - Windows with pathogenic variants: {patho_windows:,} "
+                  f"({patho_windows/len(merged)*100:.1f}%)")
+    
+    # Variant sources (if available)
+    if 'variant_info' in merged.columns:
+        try:
+            sources = {}
+            for variants in merged['variant_info'].dropna():
+                for var in variants:
+                    source = var.get('source', 'unknown')
+                    sources[source] = sources.get(source, 0) + 1
+            
+            if sources:
+                logger.info("\n  Variant Sources:")
+                for source, count in sorted(sources.items()):
+                    logger.info(f"    - {source}: {count:,}")
+        except Exception as e:
+            logger.debug(f"Could not extract variant sources: {str(e)}")
+    
+    logger.info("=" * 50)
+    
+    # Clean up
+    del windows, variant_windows_df, window_variants
+    gc.collect()
     
     return merged
 
@@ -504,34 +830,57 @@ def flatten_splice_variants(df: pd.DataFrame) -> pd.DataFrame:
     
     df = df.copy()
     
-    # Initialize columns with defaults
+    # Initialize columns with defaults and track their presence
     splice_cols = {
-        'splice_effect': '',
-        'splice_score': 0.0,
-        'splice_method': '',
-        'splice_location': '',
-        'splice_distance_to_exon': np.inf,
-        'splice_site_type': '',
-        'splice_gene': '',
-        'splice_hgvs': '',
-        'is_splice_altering': False,
-        'is_canonical_site': False,
-        'is_deep_intronic': False,
-        'is_exonic': False,
+        'splice_effect': ('', 'categorical'),
+        'splice_score': (0.0, 'float'),
+        'splice_method': ('', 'categorical'),
+        'splice_location': ('', 'categorical'),
+        'splice_distance_to_exon': (np.inf, 'float'),
+        'splice_site_type': ('', 'categorical'),
+        'splice_gene': ('', 'categorical'),
+        'splice_hgvs': ('', 'categorical'),
+        'splice_variant_type': ('UNKNOWN', 'categorical'),
+        'splice_variant_af': (0.0, 'float'),
+        'is_splice_altering': (False, 'bool'),
+        'is_canonical_site': (False, 'bool'),
+        'is_deep_intronic': (False, 'bool'),
+        'is_exonic': (False, 'bool'),
+        'is_pathogenic': (False, 'bool'),
     }
     
-    for col, default in splice_cols.items():
+    # Initialize missing columns with appropriate defaults
+    for col, (default, dtype) in splice_cols.items():
         if col not in df.columns:
             df[col] = default
+            # Ensure correct data type
+            if dtype == 'float':
+                df[col] = df[col].astype(float)
+            elif dtype == 'bool':
+                df[col] = df[col].astype(bool)
+            elif dtype == 'categorical':
+                df[col] = df[col].astype('category')
     
     # Only process windows that have splice variants
     has_splice = df['has_splice_variant'].fillna(False)
     
     if not has_splice.any():
-        logger.info("    No splice variants to flatten")
+        logger.info("    No splice variants to flatten (no windows with has_splice_variant=True)")
         return df
     
     logger.info(f"    Processing {has_splice.sum():,} windows with splice variants")
+    
+    # Debug: Check if we have the splice_variants column
+    if 'splice_variants' not in df.columns:
+        logger.warning("    No 'splice_variants' column found in the input data")
+        return df
+        
+    # Debug: Check the type of the splice_variants column
+    logger.info(f"    Type of splice_variants column: {df['splice_variants'].dtype}")
+    
+    # Debug: Count non-null values in splice_variants
+    non_null = df[has_splice]['splice_variants'].notna().sum()
+    logger.info(f"    Non-null splice_variants: {non_null:,} out of {has_splice.sum():,} windows with has_splice_variant=True")
     
     # Define effect priority for selecting primary variant
     effect_priority = {'STRONG': 3, 'MILD': 2, 'NONE': 1, '': 0}
@@ -573,32 +922,76 @@ def flatten_splice_variants(df: pd.DataFrame) -> pd.DataFrame:
             logger.warning(f"    Row {idx}: Error selecting primary variant: {e}")
             continue
         
-        # Flatten primary variant to top-level columns
-        df.at[idx, 'splice_effect'] = primary.get('splice_effect', '')
-        df.at[idx, 'splice_score'] = float(primary.get('splice_score', 0.0))
-        df.at[idx, 'splice_method'] = primary.get('method', '')
-        df.at[idx, 'splice_location'] = primary.get('location', '')
-        df.at[idx, 'splice_distance_to_exon'] = float(primary.get('distance_to_exon', np.inf))
-        df.at[idx, 'splice_site_type'] = primary.get('site_type', '')
-        df.at[idx, 'splice_gene'] = primary.get('gene', '')
-        df.at[idx, 'splice_hgvs'] = primary.get('hgvs', '')
-        
-        # Derive boolean flags
-        effect = primary.get('splice_effect', '')
-        site_type = primary.get('site_type', '')
-        
-        df.at[idx, 'is_splice_altering'] = effect in ['STRONG', 'MILD']
-        df.at[idx, 'is_canonical_site'] = site_type == 'canonical'
-        df.at[idx, 'is_deep_intronic'] = site_type == 'deep_intronic'
-        df.at[idx, 'is_exonic'] = site_type == 'exonic'
+        # Flatten primary variant to top-level columns with validation
+        try:
+            # Basic variant info
+            df.at[idx, 'splice_effect'] = str(primary.get('splice_effect', ''))
+            df.at[idx, 'splice_score'] = float(primary.get('splice_score', 0.0))
+            df.at[idx, 'splice_method'] = str(primary.get('method', ''))
+            df.at[idx, 'splice_location'] = str(primary.get('location', ''))
+            df.at[idx, 'splice_distance_to_exon'] = float(primary.get('distance_to_exon', np.inf))
+            df.at[idx, 'splice_site_type'] = str(primary.get('site_type', ''))
+            df.at[idx, 'splice_gene'] = str(primary.get('gene', ''))
+            df.at[idx, 'splice_hgvs'] = str(primary.get('hgvs', ''))
+            
+            # Additional variant info if available
+            if 'variant_type' in primary:
+                df.at[idx, 'splice_variant_type'] = str(primary['variant_type'])
+            if 'af' in primary:
+                df.at[idx, 'splice_variant_af'] = float(primary['af'])
+            
+            # Derive boolean flags
+            effect = str(primary.get('splice_effect', '')).upper()
+            site_type = str(primary.get('site_type', '')).lower()
+            
+            df.at[idx, 'is_splice_altering'] = effect in ['STRONG', 'MILD']
+            df.at[idx, 'is_canonical_site'] = site_type == 'canonical'
+            df.at[idx, 'is_deep_intronic'] = 'deep' in site_type
+            df.at[idx, 'is_exonic'] = 'exon' in site_type
+            
+            # Pathogenicity if available
+            if 'is_pathogenic' in primary:
+                df.at[idx, 'is_pathogenic'] = bool(primary['is_pathogenic'])
+            
+            extracted += 1
+            
+        except Exception as e:
+            logger.warning(f"    Row {idx}: Error processing variant: {e}")
+            logger.debug(f"    Variant data: {primary}")
+            continue
         
         extracted += 1
     
     logger.info(f"    Successfully extracted {extracted} splice variants")
     
-    # Log statistics
-    logger.info(f"    Splice variant statistics:")
-    logger.info(f"      Total windows with splice variants: {has_splice.sum():,}")
+    # Log comprehensive statistics
+    logger.info("\n🔍 Splice Variant Statistics")
+    logger.info("=" * 80)
+    logger.info(f"  Total windows processed: {len(df):,}")
+    logger.info(f"  Windows with splice variants: {has_splice.sum():,} ({has_splice.mean()*100:.1f}%)")
+    
+    if has_splice.any():
+        # Variant type distribution
+        if 'splice_variant_type' in df.columns:
+            type_counts = df[has_splice]['splice_variant_type'].value_counts()
+            logger.info("\n  Variant Type Distribution:")
+            for var_type, count in type_counts.items():
+                logger.info(f"    - {var_type}: {count:,} ({count/has_splice.sum()*100:.1f}%)")
+        
+        # Allele frequency distribution
+        if 'splice_variant_af' in df.columns:
+            af_stats = df[has_splice]['splice_variant_af'].describe(percentiles=[0.1, 0.25, 0.5, 0.75, 0.9, 0.99])
+            logger.info("\n  Allele Frequency Distribution:")
+            for stat in ['mean', 'min', '10%', '50%', '90%', 'max']:
+                if stat in af_stats:
+                    logger.info(f"    - {stat}: {af_stats[stat]:.6f}")
+        
+        # Pathogenicity
+        if 'is_pathogenic' in df.columns:
+            path_count = df[has_splice]['is_pathogenic'].sum()
+            logger.info(f"\n  Pathogenic Variants: {path_count:,} ({path_count/has_splice.sum()*100:.1f}% of splice variants)")
+    
+    logger.info("=" * 80)
     
     if has_splice.any():
         logger.info(f"      By effect:")
@@ -678,8 +1071,8 @@ def merge_splice_variants_with_windows(
         splice_cols.append('splice_variants')
     if 'num_splice_variants' in splice_windows.columns:
         splice_cols.append('num_splice_variants')
-    if 'splice_effects' in splice_windows.columns:
-        splice_cols.append('splice_effects')
+    if 'splice_effect' in splice_windows.columns:
+        splice_cols.append('splice_effect')
     if 'max_splice_score' in splice_windows.columns:
         splice_cols.append('max_splice_score')
     
@@ -728,9 +1121,59 @@ def merge_splice_variants_with_windows(
             logger.info(f"  DEBUG: Length: {len(sample)}")
             if len(sample) > 0:
                 logger.info(f"  DEBUG: First item: {sample[0]}")
+    else:
+        logger.warning("  No splice_variants column found in merged data")
     
     # Flatten
     merged = flatten_splice_variants(merged)
+    
+    # Debug: Check if any splice effects were actually set
+    if 'splice_effect' in merged.columns:
+        effect_counts = merged[merged['has_splice_variant']]['splice_effect'].value_counts()
+        logger.info("\n  Splice effects after flattening:")
+        for effect, count in effect_counts.items():
+            logger.info(f"    {effect}: {count}")
+    
+    # Log detailed splice variant statistics
+    windows_with_splice = merged['has_splice_variant'].sum()
+    total_splice_vars = merged['num_splice_variants'].sum()
+    
+    logger.info("\n🧬 Splice Variant Statistics:")
+    logger.info("=" * 50)
+    logger.info(f"  Windows with splice variants: {windows_with_splice:,}/{len(merged):,} "
+               f"({windows_with_splice/len(merged)*100:.1f}%)")
+    logger.info(f"  Total splice variants: {total_splice_vars:,}")
+    
+    if 'splice_effect' in merged.columns:
+        # Detailed effect distribution
+        effects = merged[merged['has_splice_variant']]['splice_effect'].value_counts()
+        if not effects.empty:
+            logger.info("\n  Splice Effect Distribution:")
+            for effect, count in effects.items():
+                logger.info(f"    - {effect}: {count:,} windows "
+                          f"({count/windows_with_splice*100:.1f}%)")
+    
+    # Splice score statistics if available
+    if 'max_splice_score' in merged.columns:
+        splice_scores = merged[merged['has_splice_variant']]['max_splice_score']
+        if not splice_scores.empty:
+            logger.info("\n  SpliceAI Score Statistics (max per window):")
+            logger.info(f"    - Mean: {splice_scores.mean():.3f}")
+            logger.info(f"    - Median: {splice_scores.median():.3f}")
+            logger.info(f"    - Min: {splice_scores.min():.3f}")
+            logger.info(f"    - Max: {splice_scores.max():.3f}")
+            
+            # Score distribution in bins
+            bins = [0, 0.2, 0.5, 0.8, 1.0]
+            score_bins = pd.cut(splice_scores, bins=bins, right=False)
+            bin_counts = score_bins.value_counts().sort_index()
+            
+            logger.info("\n  SpliceAI Score Distribution:")
+            for score_range, count in bin_counts.items():
+                logger.info(f"    - {score_range}: {count:,} windows "
+                          f"({count/len(splice_scores)*100:.1f}%)")
+    
+    logger.info("=" * 50)
     
     return merged
 
@@ -855,23 +1298,69 @@ def split_train_test(
             stratify=stratify_col
         )
     
-    # Report statistics
-    logger.info(f"\n  Split statistics:")
-    logger.info(f"    Train: {len(train_df):,} windows ({len(train_df)/len(df)*100:.1f}%)")
+    # Log comprehensive data summary
+    logger.info("\n📊 Training Data Summary:")
+    logger.info("=" * 50)
     
-    if len(train_df) > 0:
-        train_pos = (train_df['training_label']==1).sum()
-        logger.info(f"      Positives: {train_pos:,} ({train_pos/len(train_df)*100:.1f}%)")
-        logger.info(f"      Negatives: {(train_df['training_label']==0).sum():,} "
-                   f"({(train_df['training_label']==0).sum()/len(train_df)*100:.1f}%)")
+    # Basic dataset stats
+    logger.info(f"  Total windows: {len(df):,}")
+    logger.info(f"  Training set: {len(train_df):,} windows ({len(train_df)/len(df)*100:.1f}%)")
+    logger.info(f"  Test set:     {len(test_df):,} windows ({len(test_df)/len(df)*100:.1f}%)")
     
-    logger.info(f"    Test: {len(test_df):,} windows ({len(test_df)/len(df)*100:.1f}%)")
+    # Label distribution
+    train_pos = train_df['training_label'].sum()
+    test_pos = test_df['training_label'].sum()
     
-    if len(test_df) > 0:
-        test_pos = (test_df['training_label']==1).sum()
-        logger.info(f"      Positives: {test_pos:,} ({test_pos/len(test_df)*100:.1f}%)")
-        logger.info(f"      Negatives: {(test_df['training_label']==0).sum():,} "
-                   f"({(test_df['training_label']==0).sum()/len(test_df)*100:.1f}%)")
+    logger.info("\n🏷️  Label Distribution:")
+    logger.info("  Training set:")
+    logger.info(f"    - Positive: {train_pos:,} ({train_pos/len(train_df)*100:.1f}%)")
+    logger.info(f"    - Negative: {len(train_df)-train_pos:,} ({(len(train_df)-train_pos)/len(train_df)*100:.1f}%)")
+    logger.info("  Test set:")
+    logger.info(f"    - Positive: {test_pos:,} ({test_pos/len(test_df)*100:.1f}%)")
+    logger.info(f"    - Negative: {len(test_df)-test_pos:,} ({(len(test_df)-test_pos)/len(test_df)*100:.1f}%)")
+    
+    # Feature statistics
+    logger.info("\n🔍 Feature Statistics:")
+    
+    # GTEx coverage (if available)
+    if 'has_gtex_data' in train_df.columns:
+        train_gtex = train_df['has_gtex_data'].sum()
+        test_gtex = test_df['has_gtex_data'].sum()
+        logger.info("  GTEx Coverage:")
+        logger.info(f"    - Training: {train_gtex:,} windows with data ({train_gtex/len(train_df)*100:.1f}%)")
+        logger.info(f"    - Test:     {test_gtex:,} windows with data ({test_gtex/len(test_df)*100:.1f}%)")
+    else:
+        logger.info("  GTEx Data: No GTEx data available in this dataset")
+    
+    # Variant statistics (if available)
+    if 'has_variant' in train_df.columns:
+        train_vars = train_df['has_variant'].sum()
+        test_vars = test_df['has_variant'].sum()
+        logger.info("  Variant Coverage:")
+        logger.info(f"    - Training: {train_vars:,} windows with variants ({train_vars/len(train_df)*100:.1f}%)")
+        logger.info(f"    - Test:     {test_vars:,} windows with variants ({test_vars/len(test_df)*100:.1f}%)")
+    else:
+        logger.info("  Variant Data: No variant data available in this dataset")
+    
+    # Splice variant statistics (if available)
+    if 'has_splice_variant' in train_df.columns:
+        train_splice = train_df['has_splice_variant'].sum()
+        test_splice = test_df['has_splice_variant'].sum()
+        logger.info("  Splice Variants:")
+        logger.info(f"    - Training: {train_splice:,} windows with splice variants ({train_splice/len(train_df)*100:.1f}%)")
+        logger.info(f"    - Test:     {test_splice:,} windows with splice variants ({test_splice/len(test_df)*100:.1f}%)")
+    else:
+        logger.info("  Splice Variants: No splice variant data available in this dataset")
+    
+    # Class weights
+    logger.info("\n⚖️  Class Weights:")
+    if 'training_weight' in train_df.columns:
+        weight_stats = train_df.groupby('training_label')['training_weight'].agg(['mean', 'std', 'min', 'max'])
+        for label, stats in weight_stats.iterrows():
+            logger.info(f"  Label {int(label)}: mean={stats['mean']:.2f} ± {stats['std']:.2f} "
+                      f"(range: {stats['min']:.2f}-{stats['max']:.2f})")
+    
+    logger.info("=" * 50)
     
     return train_df, test_df
 

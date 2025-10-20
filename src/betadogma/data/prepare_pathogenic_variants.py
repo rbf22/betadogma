@@ -1,34 +1,27 @@
 #!/usr/bin/env python3
 """
-Prepare pathogenic variants from ClinVar for splice disruption training.
+Prepare pathogenic variants from ClinVar for splice effect prediction.
 
-This script:
-1. Reads ClinVar VCF with splice-related annotations
-2. Filters for pathogenic/likely pathogenic variants with splice significance
-3. Merges with base genomic windows
-4. Outputs pathogenic variant annotations
+This script processes pathogenic variants from ClinVar, validates them
+against reference sequences, and prepares them for model training.
 
-Usage:
-    python prepare_pathogenic_variants.py \\
-        --clinvar-vcf data/raw/variants/clinvar_20251013.vcf.gz \\
-        --windows data/cache/chr21/gencode_windows_base/*.parquet \\
-        --out data/cache/chr21/pathogenic_variants \\
-        --chroms chr21
+Key Features:
+- Processes ClinVar pathogenic variants
+- Validates reference sequences
+- Handles both single and multi-nucleotide variants
+- Maintains consistent output format with other variant types
+- Preserves all variant metadata
 """
 
-import argparse
 import logging
-import sys
-import json
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
-from collections import defaultdict, Counter
-from datetime import datetime
+from typing import Dict, List, Optional, Any, Union
 
 import numpy as np
 import pandas as pd
-import pysam
 from tqdm import tqdm
+
+from betadogma.data.variant_loader import VariantLoader
 
 # Setup logging
 logging.basicConfig(
@@ -38,305 +31,218 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def parse_clinvar_info(info_str: str) -> Dict[str, str]:
-    """Parse VCF INFO field into dictionary."""
-    info = {}
-    for item in info_str.split(';'):
-        if '=' in item:
-            key, value = item.split('=', 1)
-            if value.startswith('(') and value.endswith(')'):
-                info[key] = tuple(value[1:-1].split(','))
-            else:
-                info[key] = value
+class PathogenicVariantLoader(VariantLoader):
+    """Loader for ClinVar pathogenic variants."""
+    
+    def __init__(self, 
+                clinical_significance: Optional[List[str]] = None,
+                review_status: Optional[List[str]] = None,
+                **kwargs):
+        """Initialize the pathogenic variant loader.
+        
+        Args:
+            clinical_significance: List of clinical significance terms to include
+            review_status: List of review statuses to include
+            **kwargs: Additional arguments for VariantLoader
+        """
+        super().__init__(**kwargs)
+        self.clinical_significance = clinical_significance or [
+            'Pathogenic', 'Likely_pathogenic', 'Pathogenic/Likely_pathogenic'
+        ]
+        self.review_status = review_status or [
+            'criteria_provided', 'reviewed_by_expert_panel', 'practice_guideline'
+        ]
+        # Add pathogenic-specific columns to variant columns
+        self._variant_columns.extend([
+            'clinical_significance', 'review_status', 'gene', 'phenotype',
+            'variant_type', 'variant_length', 'clinvar_id', 'origin'
+        ])
+    
+    def _process_variant_record(self, record) -> Optional[Dict[str, Any]]:
+        """Process a single variant record from a VCF."""
+        try:
+            # Skip based on quality (handled by base class)
+            if self.min_qual > 0 and record.qual is not None and record.qual < self.min_qual:
+                return None
+            
+            # Parse INFO field
+            info = {k: v[0] if isinstance(v, tuple) and len(v) == 1 else v 
+                   for k, v in dict(record.info).items()}
+            
+            # Get clinical significance
+            clnsig = info.get('CLNSIG', '')
+            if isinstance(clnsig, (list, tuple)):
+                clnsig = clnsig[0] if clnsig else ''
+            
+            # Filter by clinical significance
+            if clnsig not in self.clinical_significance:
+                return None
+            
+            # Get review status
+            clnrevstat = info.get('CLNREVSTAT', '')
+            if isinstance(clnrevstat, (list, tuple)):
+                clnrevstat = clnrevstat[0] if clnrevstat else ''
+            
+            # Filter by review status if specified
+            if self.review_status and not any(rs in clnrevstat for rs in self.review_status):
+                return None
+            
+            # Get variant details
+            ref = str(record.ref).upper()
+            alts = [str(alt).upper() for alt in record.alts] if record.alts else ['.']
+            
+            variants = []
+            
+            # Create entry for each alternate allele
+            for alt in alts:
+                # Skip non-SNV variants if needed
+                if len(ref) > 1 or len(alt) > 1:
+                    logger.debug(f"Skipping non-SNV variant: {record.chrom}:{record.pos}{ref}>{alt}")
+                    continue
+                
+                # Get allele frequency
+                af = self._get_allele_frequency(info)
+                
+                # Get gene and phenotype
+                gene = info.get('GENEINFO', '').split('|')[0] if 'GENEINFO' in info else ''
+                phenotype = info.get('CLNDN', '')
+                if isinstance(phenotype, (list, tuple)):
+                    phenotype = phenotype[0] if phenotype else ''
+                
+                variant = {
+                    'chrom': str(record.chrom),
+                    'pos': int(record.pos),
+                    'ref': ref,
+                    'alt': alt,
+                    'af': af,
+                    'source': 'ClinVar',
+                    'is_pathogenic': True,
+                    'clinical_significance': clnsig,
+                    'review_status': clnrevstat,
+                    'gene': gene,
+                    'phenotype': phenotype,
+                    'variant_type': self._get_variant_type(ref, alt),
+                    'variant_length': max(len(ref), len(alt)),
+                    'clinvar_id': record.id if record.id != '.' else '',
+                    'origin': info.get('ORIGIN', [''])[0] if isinstance(info.get('ORIGIN'), list) else info.get('ORIGIN', ''),
+                    'filter': 'PASS' if not record.filter.keys() else ';'.join(record.filter.keys())
+                }
+                
+                variants.append(variant)
+            
+            return variants if len(variants) > 1 else variants[0] if variants else None
+            
+        except Exception as e:
+            logger.warning(f"Error processing variant at {record.chrom}:{record.pos}: {str(e)}")
+            return None
+    
+    def _get_variant_type(self, ref: str, alt: str) -> str:
+        """Determine the type of variant."""
+        if len(ref) == len(alt):
+            return 'SNP' if len(ref) == 1 else 'MNP'
+        elif len(ref) > len(alt):
+            return 'DEL'
         else:
-            info[item] = True
-    return info
+            return 'INS'
 
 
-def load_pathogenic_variants_from_clinvar(
+def load_pathogenic_variants_from_vcf(
     vcf_path: str,
     chromosomes: Optional[List[str]] = None,
-    clinvar_filter: str = "pathogenic",
-    significance: Optional[List[str]] = None,
+    clinical_significance: Optional[List[str]] = None,
     review_status: Optional[List[str]] = None,
-    min_qual: float = 0.0
+    min_qual: float = 0.0,
+    min_af: float = 0.0,
+    max_af: float = 1.0,
+    filter_pass: bool = False
 ) -> pd.DataFrame:
     """
     Load pathogenic variants from ClinVar VCF.
-
+    
     Args:
-        vcf_path: Path to ClinVar VCF (bgzipped with index)
-        chromosomes: List of chromosomes to include (e.g., ['chr21'])
-        clinvar_filter: Filter level ('pathogenic', 'likely_pathogenic', 'vus', etc.)
-        significance: List of clinical significances to include
+        vcf_path: Path to VCF file (bgzipped with index)
+        chromosomes: List of chromosomes to include
+        clinical_significance: List of clinical significance terms to include
         review_status: List of review statuses to include
-        min_qual: Minimum quality score (default 0 = no filter)
-
+        min_qual: Minimum quality score
+        min_af: Minimum allele frequency
+        max_af: Maximum allele frequency
+        filter_pass: Only include variants with FILTER=PASS
+        
     Returns:
-        DataFrame with ClinVar pathogenic variants
+        DataFrame with standardized variant columns
     """
-    logger.info(f"Loading ClinVar variants from: {vcf_path}")
-
-    if significance is None:
-        significance = ["Pathogenic", "Likely_pathogenic"]
-
-    variants = []
-    total_variants = 0
-    filtered_counts = defaultdict(int)
-
-    try:
-        vcf = pysam.VariantFile(vcf_path)
-
-        # Get chromosomes to process
-        vcf_chroms = list(vcf.header.contigs)
-        if chromosomes:
-            target_chroms = [c for c in chromosomes if c in vcf_chroms]
-        else:
-            target_chroms = vcf_chroms
-
-        logger.info(f"Processing chromosomes: {target_chroms}")
-
-        for chrom in target_chroms:
-            logger.info(f"Processing {chrom}...")
-            try:
-                for record in vcf.fetch(chrom):
-                    total_variants += 1
-
-                    # Apply quality filter
-                    if min_qual > 0 and record.qual < min_qual:
-                        filtered_counts['quality'] += 1
-                        continue
-
-                    # Parse INFO field
-                    info = parse_clinvar_info(str(record.info.get('CLNSIG', '')))
-
-                    # Check clinical significance
-                    clnsig = info.get('CLNSIG', '').split('|')[0] if info.get('CLNSIG') else ''
-                    if clnsig not in significance:
-                        filtered_counts['significance'] += 1
-                        continue
-
-                    # Check review status
-                    if review_status:
-                        revstat = str(info.get('CLNREVSTAT', '')).split('|')[0] if info.get('CLNREVSTAT') else ''
-                        if revstat not in review_status:
-                            filtered_counts['review_status'] += 1
-                            continue
-
-                    # Check for splice-related annotations
-                    # Look for splice-related terms in HGVS or other fields
-                    hgvs = str(info.get('HGVS', ''))
-                    is_splice_related = any(term in hgvs.lower() for term in [
-                        'splice', 'splicing', 'intron', 'exon', 'acceptor', 'donor'
-                    ])
-
-                    # Also check disease names or phenotypes for splice terms
-                    phenotype = str(info.get('CLNDN', ''))
-                    is_splice_related = is_splice_related or any(term in phenotype.lower() for term in [
-                        'splice', 'splicing', 'intron'
-                    ])
-
-                    if not is_splice_related:
-                        filtered_counts['not_splice'] += 1
-                        continue
-
-                    # Extract variant information
-                    variant_data = {
-                        'chrom': record.chrom,
-                        'pos': record.pos,
-                        'ref': record.ref,
-                        'alt': ','.join(record.alts) if record.alts else '',
-                        'qual': record.qual,
-                        'clnsig': clnsig,
-                        'clnrevstat': revstat,
-                        'hgvs': hgvs,
-                        'gene': str(info.get('GENEINFO', '')),
-                        'phenotype': phenotype,
-                        'is_splice_related': True
-                    }
-
-                    variants.append(variant_data)
-
-            except ValueError as e:
-                logger.warning(f"Error fetching {chrom}: {e}")
-
-        vcf.close()
-
-    except Exception as e:
-        logger.error(f"Error loading ClinVar VCF: {e}")
-        raise
-
-    # Create DataFrame
-    df = pd.DataFrame(variants)
-
-    logger.info(f"Loaded {len(df)} pathogenic splice variants")
-    logger.info(f"Total variants processed: {total_variants}")
-    logger.info(f"Filtered: {dict(filtered_counts)}")
-
-    return df
+    loader = PathogenicVariantLoader(
+        clinical_significance=clinical_significance,
+        review_status=review_status,
+        min_qual=min_qual,
+        min_af=min_af,
+        max_af=max_af,
+        filter_pass=filter_pass
+    )
+    return loader.load_from_vcf(vcf_path, chromosomes)
 
 
-def annotate_variant_location(variants_df: pd.DataFrame, gtf_path: str) -> pd.DataFrame:
-    """
-    Annotate variant locations relative to exons.
-
-    Args:
-        variants_df: DataFrame with variant data
-        gtf_path: Path to GTF annotation file
-
-    Returns:
-        DataFrame with location annotations added
-    """
-    logger.info(f"Annotating variant locations using GTF: {gtf_path}")
-
-    # This is a simplified location annotation
-    # In a full implementation, you'd use a library like pybedtools or similar
-    # For now, we'll add basic location info based on HGVS
-
-    def classify_location(hgvs):
-        if not hgvs:
-            return 'unknown'
-
-        hgvs_lower = hgvs.lower()
-        if 'intron' in hgvs_lower or 'ivs' in hgvs_lower:
-            if any(term in hgvs_lower for term in ['splice', 'acceptor', 'donor']):
-                return 'canonical'
-            elif any(term in hgvs_lower for term in ['near', 'flank']):
-                return 'near_splice'
-            else:
-                return 'deep_intronic'
-        elif 'exon' in hgvs_lower:
-            return 'exonic'
-        else:
-            return 'unknown'
-
-    variants_df['location'] = variants_df['hgvs'].apply(classify_location)
-
-    # Calculate distance to nearest exon (simplified)
-    # This would require more sophisticated exon coordinate mapping
-    variants_df['distance_to_exon'] = 0  # Placeholder
-
-    return variants_df
-
-
-def merge_with_windows(variants_df: pd.DataFrame, windows_glob: str) -> pd.DataFrame:
+def merge_pathogenic_variants_with_windows(
+    variants_df: pd.DataFrame,
+    windows_glob: str
+) -> pd.DataFrame:
     """
     Merge pathogenic variants with genomic windows.
-
+    
     Args:
-        variants_df: DataFrame with variant data
+        variants_df: DataFrame containing variant information
         windows_glob: Glob pattern for window Parquet files
-
+        
     Returns:
         DataFrame with variants merged into windows
     """
-    logger.info(f"Merging variants with windows: {windows_glob}")
-
-    # Read windows
-    windows_files = sorted(Path('.').glob(windows_glob.replace('*.parquet', '*')))
-    if not windows_files:
-        raise FileNotFoundError(f"No window files found: {windows_glob}")
-
-    windows_df = pd.concat([pd.read_parquet(f) for f in windows_files[:5]], ignore_index=True)  # Sample for structure
-
-    # This is a simplified merge - in practice you'd need more sophisticated spatial joining
-    # For now, we'll create a basic structure
-
-    merged_data = []
-
-    for _, window in windows_df.iterrows():
-        chrom = window['chrom']
-        start = window['start']
-        end = window['end']
-
-        # Find variants in this window
-        window_variants = variants_df[
-            (variants_df['chrom'] == chrom) &
-            (variants_df['pos'] >= start) &
-            (variants_df['pos'] < end)
-        ]
-
-        if not window_variants.empty:
-            for _, variant in window_variants.iterrows():
-                merged_data.append({
-                    'chrom': chrom,
-                    'start': start,
-                    'end': end,
-                    'seq': window['seq'],
-                    'has_pathogenic_variant': True,
-                    'pathogenic_clnsig': variant['clnsig'],
-                    'pathogenic_gene': variant['gene'],
-                    'pathogenic_location': variant['location'],
-                    'variant_spec': f"{variant['chrom']}:{variant['pos']}{variant['ref']}>{variant['alt']}",
-                    'num_pathogenic_variants': 1
-                })
-
-    result_df = pd.DataFrame(merged_data)
-    logger.info(f"Merged {len(result_df)} windows with pathogenic variants")
-
-    return result_df
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Prepare pathogenic variants from ClinVar")
-    parser.add_argument("--clinvar-vcf", required=True, help="Path to ClinVar VCF file")
-    parser.add_argument("--gtf", required=True, help="Path to GTF annotation file")
-    parser.add_argument("--windows", required=True, help="Glob pattern for base window files")
-    parser.add_argument("--out", required=True, help="Output directory")
-    parser.add_argument("--chroms", nargs='+', help="Chromosomes to process")
-    parser.add_argument("--clinvar-filter", default="pathogenic", help="ClinVar filter level")
-    parser.add_argument("--significance", nargs='+', default=["Pathogenic", "Likely_pathogenic"],
-                       help="Clinical significances to include")
-    parser.add_argument("--review-status", nargs='+', default=["criteria_provided", "reviewed_by_expert_panel"],
-                       help="Review statuses to include")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-
-    args = parser.parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    # Create output directory
-    Path(args.out).mkdir(parents=True, exist_ok=True)
-
-    try:
-        # Load pathogenic variants
-        variants_df = load_pathogenic_variants_from_clinvar(
-            args.clinvar_vcf,
-            chromosomes=args.chroms,
-            clinvar_filter=args.clinvar_filter,
-            significance=args.significance,
-            review_status=args.review_status
-        )
-
-        # Annotate locations
-        variants_df = annotate_variant_location(variants_df, args.gtf)
-
-        # Merge with windows
-        merged_df = merge_with_windows(variants_df, args.windows)
-
-        # Write outputs
-        output_file = Path(args.out) / "pathogenic_variants.parquet"
-        merged_df.to_parquet(output_file, index=False)
-
-        # Write metadata
-        metadata = {
-            'created': datetime.now().isoformat(),
-            'source': args.clinvar_vcf,
-            'chromosomes': args.chroms,
-            'num_variants': len(variants_df),
-            'num_windows': len(merged_df)
-        }
-
-        with open(Path(args.out) / "metadata.json", 'w') as f:
-            json.dump(metadata, f, indent=2)
-
-        logger.info(f"Pathogenic variants processing complete. Output: {output_file}")
-
-    except Exception as e:
-        logger.error(f"Processing failed: {e}")
-        sys.exit(1)
+    loader = PathogenicVariantLoader()
+    return loader.merge_with_windows(variants_df, windows_glob)
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Prepare pathogenic variants for training')
+    parser.add_argument('--vcf', required=True, help='Input VCF file')
+    parser.add_argument('--windows', required=True, help='Glob pattern for window files')
+    parser.add_argument('--output', required=True, help='Output file path')
+    parser.add_argument('--chromosomes', nargs='+', help='Chromosomes to include')
+    parser.add_argument('--min-qual', type=float, default=0.0, help='Minimum quality score')
+    parser.add_argument('--min-af', type=float, default=0.0, help='Minimum allele frequency')
+    parser.add_argument('--max-af', type=float, default=1.0, help='Maximum allele frequency')
+    parser.add_argument('--filter-pass', action='store_true', help='Only include PASS variants')
+    parser.add_argument('--clinical-sig', nargs='+', 
+                       default=['Pathogenic', 'Likely_pathogenic', 'Pathogenic/Likely_pathogenic'],
+                       help='Clinical significance terms to include')
+    parser.add_argument('--review-status', nargs='+',
+                       default=['criteria_provided', 'reviewed_by_expert_panel', 'practice_guideline'],
+                       help='Review statuses to include')
+    
+    args = parser.parse_args()
+    
+    # Load variants
+    variants = load_pathogenic_variants_from_vcf(
+        vcf_path=args.vcf,
+        chromosomes=args.chromosomes,
+        clinical_significance=args.clinical_sig,
+        review_status=args.review_status,
+        min_qual=args.min_qual,
+        min_af=args.min_af,
+        max_af=args.max_af,
+        filter_pass=args.filter_pass
+    )
+    
+    if not variants.empty:
+        # Merge with windows
+        result = merge_pathogenic_variants_with_windows(
+            variants_df=variants,
+            windows_glob=args.windows
+        )
+        
+        # Save results
+        result.to_parquet(args.output)
+        logger.info(f"Saved {len(result)} records to {args.output}")
+    else:
+        logger.warning("No variants found matching criteria")

@@ -24,6 +24,10 @@ import argparse
 import gzip
 import os
 import sys
+import json
+import logging
+import logging.config
+from datetime import datetime
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple, Union, Any, cast
@@ -256,14 +260,20 @@ def prepare_gencode(
 
     # Chromosome selection
     allowed_chroms = set([c.strip() for c in chroms.split(",") if c.strip()]) if chroms else None
+    
+    # Debug: Print requested chromosomes and available chromosomes in FASTA
+    fasta = pyfaidx.Fasta(fasta_path, as_raw=True, sequence_always_upper=True)
+    fasta_chroms = list(fasta.keys())
+    print(f"[prepare_gencode] Requested chromosomes: {allowed_chroms}")
+    print(f"[prepare_gencode] Available chromosomes in FASTA: {fasta_chroms}")
 
     # 1) parse GTF (stream)
     print("[prepare_gencode] parsing GTF...")
     gtf_iter = read_gtf_minimal(gtf_path, allowed_chroms)
     donors_dict, acceptors_dict, tss_dict, polya_dict = collect_sites(gtf_iter)
 
-    # 2) reference genome
-    fasta = pyfaidx.Fasta(fasta_path, as_raw=True, sequence_always_upper=True)
+    # 2) reference genome (already loaded for chromosome checking)
+    # fasta = pyfaidx.Fasta(fasta_path, as_raw=True, sequence_always_upper=True)
 
     # 3) sliding windows per chromosome
     shard_rows: List[Dict] = []
@@ -271,8 +281,26 @@ def prepare_gencode(
     shard_idx = 0
 
     if allowed_chroms:
+        # Try exact match first
         chrom_list = [c for c in allowed_chroms if c in fasta]
+        
+        # If no matches, try case-insensitive and with/without 'chr' prefix
+        if not chrom_list:
+            fasta_chroms_lower = {c.lower(): c for c in fasta.keys()}
+            for c in allowed_chroms:
+                # Try exact case-insensitive match
+                if c.lower() in fasta_chroms_lower:
+                    chrom_list.append(fasta_chroms_lower[c.lower()])
+                # Try adding 'chr' prefix if not present
+                elif not c.startswith('chr') and f'chr{c}'.lower() in fasta_chroms_lower:
+                    chrom_list.append(fasta_chroms_lower[f'chr{c}'.lower()])
+                # Try removing 'chr' prefix if present
+                elif c.startswith('chr') and c[3:].lower() in fasta_chroms_lower:
+                    chrom_list.append(fasta_chroms_lower[c[3:].lower()])
+        
+        print(f"[prepare_gencode] Filtered chromosome list: {chrom_list}")
     else:
+        # Default: all chromosomes starting with 'chr'
         chrom_list = [c for c in fasta.keys() if c.startswith("chr")]
 
     print(f"[prepare_gencode] processing {len(chrom_list)} contigs ...")
@@ -310,7 +338,7 @@ def prepare_gencode(
             shard_rows.append(row)
             bases_in_shard += (wend - wstart)
 
-            if bases_in_shard >= max_shard_bases:
+            if shard_rows and (bases_in_shard >= max_shard_bases or wend + stride > clen):
                 df = pd.DataFrame(shard_rows)
                 outp = os.path.join(out_dir, f"shard_{shard_idx:04d}.parquet")
                 df.to_parquet(outp, index=False)
@@ -319,12 +347,33 @@ def prepare_gencode(
                 bases_in_shard = 0
                 shard_idx += 1
 
+    # Write any remaining rows
     if shard_rows:
         df = pd.DataFrame(shard_rows)
         outp = os.path.join(out_dir, f"shard_{shard_idx:04d}.parquet")
         df.to_parquet(outp, index=False)
         print(f"[prepare_gencode] wrote {outp} ({len(df)} rows)")
-    print(f"[prepare_gencode] done. Wrote {shard_idx} shards to {out_dir}")
+        shard_idx += 1
+    
+    # Count actual number of parquet files written
+    import glob
+    parquet_files = glob.glob(os.path.join(out_dir, 'shard_*.parquet'))
+    num_shards = len(parquet_files)
+    
+    print(f"[prepare_gencode] done. Wrote {num_shards} shards to {out_dir}")
+    
+    # Write metadata
+    metadata = {
+        'version': '1.0',
+        'timestamp': datetime.now().isoformat(),
+        'num_shards': num_shards,
+        'chromosomes': chrom_list,
+        'window_size': window,
+        'stride': stride,
+        'bin_size': bin_size,
+    }
+    with open(os.path.join(out_dir, 'metadata.json'), 'w') as f:
+        json.dump(metadata, f, indent=2)
 
 
 def main() -> None:
