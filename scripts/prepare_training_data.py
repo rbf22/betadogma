@@ -597,8 +597,10 @@ class TrainingDataPreparer:
                     for item in value:
                         cmd.extend(['--effect', str(item)])
                 else:
-                    for item in value:
-                        cmd.extend([f'--{cli_key}', str(item)])
+                    # For nargs='+' style args, pass one flag followed by multiple values
+                    if len(value) > 0:
+                        cmd.append(f'--{cli_key}')
+                        cmd.extend([str(item) for item in value])
             elif value is not None and value != '':
                 cmd.extend([f'--{cli_key}', str(value)])
                 

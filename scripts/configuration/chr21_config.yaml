@@ -242,7 +242,7 @@ processing:
       
       # Include variants with these review statuses
       review-status: [
-        "criteria_provided", "criteria_provided,_multiple_submitters,_no_conflicts",
+        "criteria_provided,_multiple_submitters,_no_conflicts",
         "reviewed_by_expert_panel", "practice_guideline"
       ]
   

@@ -7,6 +7,7 @@ variants (common, pathogenic, splice) with consistent interfaces and utilities.
 
 import logging
 import os
+import glob
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any
@@ -157,10 +158,15 @@ class VariantLoader(ABC):
             logger.debug(f"Opening VCF file: {vcf_path}")
             vcf = pysam.VariantFile(vcf_path)
             
-            # Get chromosomes to process
+            # Get chromosomes to process, adapting requested names to header convention
             vcf_chroms = list(vcf.header.contigs)
-            target_chroms = chromosomes if chromosomes else vcf_chroms
-            target_chroms = [str(c) for c in target_chroms if str(c) in vcf_chroms]
+            if chromosomes:
+                from .chrom_utils import match_chroms_to_header
+                target_chroms = match_chroms_to_header(chromosomes, vcf_chroms)
+                # Keep only those present in header
+                target_chroms = [c for c in target_chroms if str(c) in vcf_chroms]
+            else:
+                target_chroms = vcf_chroms
             
             logger.info(f"Processing {len(target_chroms)} chromosomes: {', '.join(target_chroms)}")
             logger.debug(f"VCF contigs: {vcf_chroms}")
@@ -227,7 +233,7 @@ class VariantLoader(ABC):
     
     def merge_with_windows(self, 
                          variants_df: pd.DataFrame,
-                         windows_files: List[str]) -> pd.DataFrame:
+                         windows_files: Union[List[str], str]) -> pd.DataFrame:
         """Merge variants with genomic windows.
         
         Args:
@@ -237,10 +243,37 @@ class VariantLoader(ABC):
         Returns:
             DataFrame with merged variant and window information
         """
+        # Expand glob pattern if a string was provided
+        if isinstance(windows_files, str):
+            windows_files = sorted(glob.glob(windows_files))
+        
         # Pre-compute variant positions for faster lookup
         variants_df = variants_df.copy()
         variants_df['pos'] = variants_df['pos'].astype(int)
         variants_df = variants_df.sort_values(['chrom', 'pos'])
+
+        # Normalize variant chrom naming to match windows convention if possible
+        try:
+            from .chrom_utils import detect_convention, normalize_chroms, UCSC, NCBI
+            # Peek into first non-empty window file to detect convention
+            window_chroms_sample = []
+            for wf in windows_files:
+                try:
+                    df_sample = pd.read_parquet(wf, columns=['chrom'])
+                    if not df_sample.empty:
+                        window_chroms_sample = df_sample['chrom'].astype(str).head(10).tolist()
+                        break
+                except Exception:
+                    continue
+            if window_chroms_sample:
+                win_conv = detect_convention(window_chroms_sample)
+                # If conventions differ, normalize variants
+                var_conv = detect_convention(variants_df['chrom'].astype(str).head(10).tolist())
+                if var_conv != win_conv:
+                    variants_df['chrom'] = normalize_chroms(variants_df['chrom'].astype(str).tolist(), win_conv)
+        except Exception:
+            # Best-effort normalization; continue if detection fails
+            pass
         
         # Use the output directory for intermediate files
         # Get the directory from the first window file as a fallback
@@ -289,6 +322,8 @@ class VariantLoader(ABC):
                             # Skip if sequence is not available
                             if not isinstance(seq, str) or len(seq) == 0:
                                 continue
+                            # Normalize sequence case to avoid mismatches on lowercase
+                            seq_upper = seq.upper()
                             
                             processed_windows += 1
                             
@@ -313,7 +348,7 @@ class VariantLoader(ABC):
                                     alt = variant['alt']
                                     
                                     # Verify reference allele matches the sequence
-                                    if seq[rel_pos-1:rel_pos-1+len(ref)] != ref:
+                                    if seq_upper[rel_pos-1:rel_pos-1+len(ref)] != ref:
                                         skipped_variants += 1
                                         continue
                                     

@@ -25,6 +25,7 @@ from tqdm import tqdm
 
 from betadogma.data.variant_loader import VariantLoader
 from betadogma.data.vcf_processor import VCFProcessor
+import pysam
 
 # Setup logging
 logging.basicConfig(
@@ -98,10 +99,6 @@ class ClinvarVariantLoader(VariantLoader):
             
             # Create entry for each alternate allele
             for alt in alts:
-                # Skip non-SNV variants if needed
-                if len(ref) > 1 or len(alt) > 1:
-                    logger.debug(f"Skipping non-SNV variant: {record.chrom}:{record.pos}{ref}>{alt}")
-                    continue
                 
                 # Get allele frequency
                 af = self._get_allele_frequency(info)
@@ -224,17 +221,25 @@ def load_clinvar_variants_from_vcf(
     with tempfile.TemporaryDirectory(prefix='clinvar_') as temp_dir:
         temp_dir = Path(temp_dir)
         processed_vcf = temp_dir / 'processed.vcf.gz'
+        processed_is_temp = False
         
         try:
             # Skip VCF processing and use the original file
             # This avoids the chromosome normalization issue
             processed_vcf = Path(vcf_path)
+            processed_is_temp = False
             
-            # Ensure the index exists
+            # Ensure the index exists (create alongside original if missing)
             tbi_path = Path(f"{vcf_path}.tbi")
-            if not tbi_path.exists():
+            csi_path = Path(f"{vcf_path}.csi")
+            if not tbi_path.exists() and not csi_path.exists():
                 logger.info("Indexing VCF...")
-                pysam.tabix_index(str(processed_vcf), preset="vcf", force=True)
+                try:
+                    # Prefer CSI for very large VCFs; fall back to TBI
+                    pysam.tabix_index(str(processed_vcf), preset="vcf", force=False)
+                except Exception:
+                    # As a fallback, try creating CSI via pysam (if configured) or ignore
+                    pass
             
             # Initialize the ClinVar variant loader
             loader = ClinvarVariantLoader(
@@ -288,12 +293,17 @@ def load_clinvar_variants_from_vcf(
                 except Exception as e:
                     logger.error(f"Error reading VCF file for debugging: {str(e)}")
             
-            # Optionally keep the processed VCF for debugging
-            if keep_processed_vcf and processed_vcf.exists():
+            # Optionally keep the processed VCF for debugging (only for temp files)
+            if keep_processed_vcf and processed_is_temp and processed_vcf.exists():
                 debug_vcf = Path("clinvar_processed.vcf.gz")
                 import shutil
                 shutil.copy2(processed_vcf, debug_vcf)
-                shutil.copy2(f"{processed_vcf}.tbi", f"{debug_vcf}.tbi")
+                # Copy index if present
+                for idx_ext in (".tbi", ".csi"):
+                    src = Path(f"{processed_vcf}{idx_ext}")
+                    dst = Path(f"{debug_vcf}{idx_ext}")
+                    if src.exists():
+                        shutil.copy2(src, dst)
                 logger.info(f"Processed VCF saved to: {debug_vcf}")
             
             return variants
@@ -303,12 +313,18 @@ def load_clinvar_variants_from_vcf(
             return pd.DataFrame()
         
         finally:
-            # Clean up temporary files
-            if not keep_processed_vcf and processed_vcf.exists():
-                processed_vcf.unlink(missing_ok=True)
-                tbi_file = Path(f"{processed_vcf}.tbi")
-                if tbi_file.exists():
-                    tbi_file.unlink()
+            # Clean up only temporary processed files, never the original VCF
+            if processed_is_temp:
+                try:
+                    if not keep_processed_vcf and processed_vcf.exists():
+                        processed_vcf.unlink(missing_ok=True)
+                    for idx_ext in (".tbi", ".csi"):
+                        idx_path = Path(f"{processed_vcf}{idx_ext}")
+                        if idx_path.exists():
+                            idx_path.unlink()
+                except Exception:
+                    # Best-effort cleanup; ignore failures
+                    pass
 
 
 def merge_pathogenic_variants_with_windows(
@@ -404,11 +420,35 @@ if __name__ == "__main__":
         sys.exit(1)
     
     # If we get here, we have variants to process
-    result = merge_pathogenic_variants_with_windows(
-        variants_df=variants,
-        windows_glob=args.windows
-    )
+    # Expand windows glob and merge
+    try:
+        import glob as _glob
+        window_files = sorted(_glob.glob(args.windows))
+        if not window_files:
+            logger.warning(f"No window files found matching pattern: {args.windows}")
+        else:
+            logger.info(f"Merging ClinVar variants with {len(window_files)} window files")
+        result = merge_pathogenic_variants_with_windows(
+            variants_df=variants,
+            windows_glob=window_files if window_files else args.windows
+        )
+        # Validate expected columns are present post-merge
+        expected_cols = {'has_variant','variant_pos','variant_ref','variant_alt'}
+        missing = [c for c in expected_cols if c not in result.columns]
+        if missing:
+            raise RuntimeError(f"Post-merge result missing expected columns: {missing}. Aborting to avoid saving unusable output.")
+    except Exception as e:
+        import traceback
+        logger.error("Failed during ClinVar merge with windows:")
+        logger.error(traceback.format_exc())
+        raise
     
-    # Save results
-    result.to_parquet(args.output)
-    logger.info(f"Successfully processed and saved {len(result)} variants to {args.output}")
+    # Save results (ensure directory exists)
+    try:
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        result.to_parquet(out_path)
+        logger.info(f"Successfully processed and saved {len(result)} records to {out_path}")
+    except Exception as e:
+        logger.error(f"Failed to save ClinVar results to {args.output}: {e}")
+        raise

@@ -6,7 +6,7 @@ This module handles loading and validating configuration settings for data proce
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Union
 import yaml
-from .data.chrom_utils import get_chrom_set
+from .data.chrom_utils import get_chrom_set, normalize_chrom_convention, UCSC, NCBI
 
 # Default configuration values
 DEFAULT_CONFIG = {
@@ -94,19 +94,29 @@ class Config:
     def get_chromosomes(self) -> Set[str]:
         """Get the set of chromosomes to process."""
         chrom_config = self._config["chromosomes"]
+        convention = str(chrom_config.get("naming_convention", "ucsc")).lower()
         
         # Get base set of chromosomes
         if chrom_config.get("include"):
-            chroms = set(chrom_config["include"])
+            # Normalize included list to target convention
+            included = set(
+                normalize_chrom_convention(c, convention) for c in chrom_config["include"]
+            )
+            chroms = included
         else:
-            chroms = get_chrom_set(
+            # Build default UCSC set then convert to target convention if needed
+            base = get_chrom_set(
                 include_sex=chrom_config.get("include_sex_chromosomes", True),
                 include_mito="chrM" not in chrom_config.get("exclude", [])
             )
+            chroms = set(normalize_chrom_convention(c, convention) for c in base)
         
-        # Apply exclusions
-        chroms -= set(chrom_config.get("exclude", []))
-        
+        # Apply exclusions (normalize to same convention)
+        excludes = set(
+            normalize_chrom_convention(c, convention) for c in chrom_config.get("exclude", [])
+        )
+        chroms -= excludes
+
         return chroms
     
     def get_path(self, *keys: str) -> str:

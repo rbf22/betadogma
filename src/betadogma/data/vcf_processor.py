@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 import pysam
 from tqdm import tqdm
 
-from .chrom_utils import ChromosomeNormalizer, normalize_chrom
+from .chrom_utils import ChromosomeNormalizer, normalize_chrom_convention, detect_convention
 from ..config import get_config
 
 logger = logging.getLogger(__name__)
@@ -30,6 +30,8 @@ class VCFProcessor:
         else:
             self.config = config
         self.chroms = self.config.get_chromosomes()
+        # Determine target convention from configured chromosomes
+        self.target_convention = 'ucsc' if any(str(c).lower().startswith('chr') for c in self.chroms) else 'ncbi'
         
     def process_vcf(
         self,
@@ -69,7 +71,8 @@ class VCFProcessor:
         with ChromosomeNormalizer(
             input_path=input_vcf,
             output_path=output_vcf,
-            target_chroms=self.chroms
+            target_chroms=self.chroms,
+            target_convention=self.target_convention
         ) as normalizer:
             normalizer.process()
         
@@ -140,11 +143,9 @@ class VCFProcessor:
                     
                     # Skip if not in target chromosomes or if chromosome format is incorrect
                     if self.chroms:
-                        # Normalize the chromosome name to match the target format
-                        normalized_chrom = normalize_chrom(record.chrom, prefix='chr' if any(c.startswith('chr') for c in self.chroms) else '')
+                        normalized_chrom = normalize_chrom_convention(record.chrom, self.target_convention)
                         if normalized_chrom not in self.chroms:
                             continue
-                        # Update the record's chromosome to the normalized version
                         record.chrom = normalized_chrom
                         
                     # Get allele frequency

@@ -315,105 +315,113 @@ def merge_splice_variants_with_windows(
 
 if __name__ == "__main__":
     import argparse
-    
-    parser = argparse.ArgumentParser(description='Prepare splice variants for training')
-    parser.add_argument('--vcf', required=True, help='Input VCF file')
-    parser.add_argument('--windows', required=True, help='Glob pattern for window files')
-    parser.add_argument('--output', required=True, help='Output file path')
-    parser.add_argument('--chromosomes', nargs='+', help='Chromosomes to include')
-    parser.add_argument('--min-qual', type=float, default=0.0, help='Minimum quality score')
-    parser.add_argument('--min-af', type=float, default=0.0, help='Minimum allele frequency')
-    parser.add_argument('--max-af', type=float, default=1.0, help='Maximum allele frequency')
-    parser.add_argument('--filter-pass', action='store_true', help='Only include PASS variants')
-    # Add effect arguments
-    effect_group = parser.add_argument_group('Splice Effect Options')
-    effect_group.add_argument('--effect', action='append',
-                            help='Splice effect to include (can be used multiple times)')
-    effect_group.add_argument('--effects', nargs='+', action='append',
-                            help='Splice effects to include (space-separated list)')
-    
-    # Set default effects that will be used if no effects are specified
-    default_effects = ['STRONG', 'MILD', 'NONE']
-    
-    # Parse the arguments
-    args = parser.parse_args()
-    
-    # Process the effects
-    effects = []
-    
-    # Handle --effect flag (can be used multiple times)
-    if args.effect is not None:
-        # --effect was used one or more times
-        for effect in args.effect:
-            if effect:
-                effects.append(effect.strip().upper())
-    
-    # Handle --effects flag (can be used multiple times with space-separated lists)
-    if args.effects is not None:
-        # args.effects is a list of lists because of nargs='+' and action='append'
-        for effect_list in args.effects:
-            for effect in effect_list:
+    import sys
+    try:
+        parser = argparse.ArgumentParser(description='Prepare splice variants for training')
+        parser.add_argument('--vcf', required=True, help='Input VCF file')
+        parser.add_argument('--windows', required=True, help='Glob pattern for window files')
+        parser.add_argument('--output', required=True, help='Output file path')
+        parser.add_argument('--chromosomes', nargs='+', help='Chromosomes to include')
+        parser.add_argument('--min-qual', type=float, default=0.0, help='Minimum quality score')
+        parser.add_argument('--min-af', type=float, default=0.0, help='Minimum allele frequency')
+        parser.add_argument('--max-af', type=float, default=1.0, help='Maximum allele frequency')
+        parser.add_argument('--filter-pass', action='store_true', help='Only include PASS variants')
+        # Add effect arguments
+        effect_group = parser.add_argument_group('Splice Effect Options')
+        effect_group.add_argument('--effect', action='append',
+                                help='Splice effect to include (can be used multiple times)')
+        effect_group.add_argument('--effects', nargs='+', action='append',
+                                help='Splice effects to include (space-separated list)')
+        
+        # Set default effects that will be used if no effects are specified
+        default_effects = ['STRONG', 'MILD', 'NONE']
+        
+        # Parse the arguments
+        args = parser.parse_args()
+        
+        # Process the effects
+        effects = []
+        
+        # Handle --effect flag (can be used multiple times)
+        if args.effect is not None:
+            for effect in args.effect:
                 if effect:
-                    # Handle case where effects might be passed as a single string with commas
-                    if ',' in effect:
-                        effects.extend([x.strip().upper() for x in effect.split(',') if x.strip()])
+                    effects.append(effect.strip().upper())
+        
+        # Handle --effects flag (can be used multiple times with space-separated lists)
+        if args.effects is not None:
+            for effect_list in args.effects:
+                for effect in effect_list:
+                    if effect:
+                        if ',' in effect:
+                            effects.extend([x.strip().upper() for x in effect.split(',') if x.strip()])
+                        else:
+                            effects.append(effect.strip().upper())
+        
+        # If no effects were specified, use defaults
+        if not effects:
+            effects = default_effects
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        args.effects = [x for x in effects if not (x in seen or seen.add(x))]
+        
+        # Validate effects
+        valid_effects = set(SPLICE_EFFECT_SCORES.keys())
+        for effect in args.effects:
+            if effect not in valid_effects:
+                logger.warning(f"Warning: Unknown effect '{effect}'. Valid effects are: {', '.join(valid_effects)}")
+        
+        logger.info(f"Including splice effects: {args.effects}")
+        
+        # Load variants
+        variants = load_splice_variants_from_vcf(
+            vcf_path=args.vcf,
+            chromosomes=args.chromosomes,
+            include_effects=args.effects,
+            min_qual=args.min_qual,
+            min_af=args.min_af,
+            max_af=args.max_af,
+            filter_pass=args.filter_pass
+        )
+        
+        if not variants.empty:
+            # Merge with windows if provided
+            if args.windows:
+                try:
+                    import glob as _glob
+                    window_files = sorted(_glob.glob(args.windows))
+                    if not window_files:
+                        logger.warning(f"No window files found matching pattern: {args.windows}")
                     else:
-                        effects.append(effect.strip().upper())
-    
-    # If no effects were specified, use defaults
-    if not effects:
-        effects = default_effects
-    
-    # Remove duplicates while preserving order
-    seen = set()
-    args.effects = [x for x in effects if not (x in seen or seen.add(x))]
-    
-    # Validate effects
-    valid_effects = set(SPLICE_EFFECT_SCORES.keys())
-    for effect in args.effects:
-        if effect not in valid_effects:
-            logger.warning(f"Warning: Unknown effect '{effect}'. Valid effects are: {', '.join(valid_effects)}")
-    
-    logger.info(f"Including splice effects: {args.effects}")
-    
-    # Set up logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
-    # Load variants
-    variants = load_splice_variants_from_vcf(
-        vcf_path=args.vcf,
-        chromosomes=args.chromosomes,
-        include_effects=args.effects,
-        min_qual=args.min_qual,
-        min_af=args.min_af,
-        max_af=args.max_af,
-        filter_pass=args.filter_pass
-    )
-    
-    if not variants.empty:
-        # Merge with windows if provided
-        if args.windows:
-            import glob
-            # Expand the glob pattern to get the actual files
-            window_files = sorted(glob.glob(args.windows))
-            if not window_files:
-                logger.warning(f"No window files found matching pattern: {args.windows}")
-            else:
-                logger.info(f"Merging with {len(window_files)} window files")
-                variants = merge_splice_variants_with_windows(variants, window_files)
-        
-        # Save results
-        variants.to_parquet(args.output)
-        logger.info(f"Saved {len(variants)} records to {args.output}")
-        
-        # Log variant statistics
-        if 'splice_effect' in variants.columns:
-            effect_counts = variants['splice_effect'].value_counts().to_dict()
-            logger.info("Variant counts by effect:")
-            for effect, count in effect_counts.items():
-                logger.info(f"  {effect}: {count:,} ({count/len(variants)*100:.1f}%)")
-    else:
-        logger.warning("No variants found matching criteria")
+                        logger.info(f"Merging with {len(window_files)} window files")
+                        variants = merge_splice_variants_with_windows(variants, window_files)
+                except Exception as e:
+                    logger.error(f"Failed to merge splice variants with windows: {e}")
+            
+            # Save results (ensure output directory exists)
+            try:
+                out_path = Path(args.output)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                variants.to_parquet(out_path)
+                logger.info(f"Saved {len(variants)} records to {out_path}")
+            except Exception as e:
+                logger.error(f"Failed to save results to {args.output}: {e}")
+                sys.exit(1)
+            
+            # Log variant statistics
+            if 'splice_effect' in variants.columns:
+                effect_counts = variants['splice_effect'].value_counts().to_dict()
+                logger.info("Variant counts by effect:")
+                for effect, count in effect_counts.items():
+                    logger.info(f"  {effect}: {count:,} ({count/len(variants)*100:.1f}%)")
+        else:
+            logger.warning("No variants found matching criteria")
+        sys.exit(0)
+    except SystemExit as e:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in prepare_splice_variants: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
