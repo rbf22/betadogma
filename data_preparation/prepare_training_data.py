@@ -158,6 +158,11 @@ class TrainingDataGenerator:
         self.splice_variants = {}
         self.benign_variants = {}
         
+        # Caching for performance optimization
+        self._isoform_cache = {}  # Cache isoforms by (chrom, start, end)
+        self._cds_seq_cache = {}  # Cache CDS sequences by (chrom, tx_id)
+        self._current_chrom_isoforms = None  # Current chromosome for isoform caching
+        
         print("\nLoading static data files...")
         self.transcripts = self._load_gencode(gencode_gtf)
         
@@ -248,6 +253,8 @@ class TrainingDataGenerator:
             if tpm_dict:
                 print(f"  TPM range: {min(tpm_dict.values()):.2f} - {max(tpm_dict.values()):.2f}")
             
+            # OPTIMIZATION 1: Cache the result
+            self._isoform_cache[tpm_path] = tpm_dict
             return tpm_dict
             
         except Exception as e:
@@ -322,7 +329,7 @@ class TrainingDataGenerator:
         # NMD if stop codon is >50nt before last junction
         return distance > 50
     
-    def _get_transcripts_in_region(self, chrom: str, start: int, end: int) -> List[Dict]:
+    def _get_transcripts_in_region(self, chrom: str, start: int, end: int):
         """Get all transcripts overlapping a genomic region with isoform details.
         
         Returns list of isoform dictionaries with:
@@ -336,7 +343,12 @@ class TrainingDataGenerator:
         - has_nmd: Whether transcript triggers NMD
         - is_canonical: Whether this is the main isoform
         """
-        if not hasattr(self, 'transcripts') or self.transcripts is None:
+        # OPTIMIZATION 1: Check isoform cache first
+        cache_key = (chrom, start, end)
+        if cache_key in self._isoform_cache:
+            return self._isoform_cache[cache_key]
+        
+        if not self.transcripts or len(self.transcripts) == 0:
             return []
         
         isoforms = []
@@ -345,25 +357,28 @@ class TrainingDataGenerator:
             # Get transcripts overlapping this region
             chrom_features = self.transcripts[self.transcripts.Chromosome == chrom]
             
-            # Cache per-chromosome slices to avoid repeated slicing
+            # OPTIMIZATION 5: Pre-load all transcripts for chromosome once
             if not hasattr(self, '_current_chrom') or self._current_chrom != chrom:
                 self._current_chrom = chrom
                 self._chrom_tx = chrom_features[chrom_features.Feature == 'transcript'].df.copy()
                 self._chrom_exons = chrom_features[chrom_features.Feature == 'exon'].df.copy()
                 self._chrom_cds = chrom_features[chrom_features.Feature == 'CDS'].df.copy() if 'CDS' in chrom_features.Feature.unique() else pd.DataFrame()
+                
+                # OPTIMIZATION 2: Pre-compute versionless IDs at load time
+                if 'transcript_id' in self._chrom_tx.columns:
+                    self._chrom_tx['transcript_id'] = self._chrom_tx['transcript_id'].fillna('').astype(str)
+                    self._chrom_tx['transcript_id_versionless'] = self._chrom_tx['transcript_id'].str.split('.').str[0]
+                if 'transcript_id' in self._chrom_exons.columns:
+                    self._chrom_exons['transcript_id'] = self._chrom_exons['transcript_id'].fillna('').astype(str)
+                    self._chrom_exons['transcript_id_versionless'] = self._chrom_exons['transcript_id'].str.split('.').str[0]
+                if not self._chrom_cds.empty and 'transcript_id' in self._chrom_cds.columns:
+                    self._chrom_cds['transcript_id'] = self._chrom_cds['transcript_id'].fillna('').astype(str)
+                    self._chrom_cds['transcript_id_versionless'] = self._chrom_cds['transcript_id'].str.split('.').str[0]
+            
             transcripts_df = self._chrom_tx
             exons_df = self._chrom_exons
             cds_df = self._chrom_cds
-            # Always ensure IDs are strings and versionless column exists
-            if 'transcript_id' in transcripts_df.columns:
-                transcripts_df['transcript_id'] = transcripts_df['transcript_id'].fillna('').astype(str)
-                transcripts_df['transcript_id_versionless'] = transcripts_df['transcript_id'].str.split('.').str[0]
-            if 'transcript_id' in exons_df.columns:
-                exons_df['transcript_id'] = exons_df['transcript_id'].fillna('').astype(str)
-                exons_df['transcript_id_versionless'] = exons_df['transcript_id'].str.split('.').str[0]
-            if not cds_df.empty and 'transcript_id' in cds_df.columns:
-                cds_df['transcript_id'] = cds_df['transcript_id'].fillna('').astype(str)
-                cds_df['transcript_id_versionless'] = cds_df['transcript_id'].str.split('.').str[0]
+            
             transcripts_df['Start0'] = transcripts_df['Start'] - 1
             transcripts_df['End0'] = transcripts_df['End']
             overlapping_tx = transcripts_df[
@@ -372,6 +387,7 @@ class TrainingDataGenerator:
             ]
             
             if overlapping_tx.empty:
+                self._isoform_cache[cache_key] = []
                 return []
             
             
@@ -430,35 +446,39 @@ class TrainingDataGenerator:
                         cds_end = cds_end_abs0 - start
                         
                         try:
-                            parts = []
-                            if strand == '+':
-                                for i, (_, row_cds) in enumerate(tx_cds.sort_values('Start').iterrows()):
-                                    s0 = int(row_cds['Start']) - 1
-                                    e0 = int(row_cds['End'])
-                                    seq = self.genome.fetch(chrom, s0, e0).upper()
-                                    frame = row_cds.get('Frame', 0)
-                                    try:
-                                        frame = int(frame) if frame != '.' else 0
-                                    except Exception:
-                                        frame = 0
-                                    if i == 0 and frame > 0 and len(seq) > frame:
-                                        seq = seq[frame:]
-                                    parts.append(seq)
+                            # OPTIMIZATION 3: Cache CDS sequences by (chrom, tx_id)
+                            cds_cache_key = (chrom, tx_id)
+                            if cds_cache_key in self._cds_seq_cache:
+                                cds_seq = self._cds_seq_cache[cds_cache_key]
                             else:
-                                for i, (_, row_cds) in enumerate(tx_cds.sort_values('Start', ascending=False).iterrows()):
+                                # OPTIMIZATION 4: Batch genome fetches
+                                parts = []
+                                cds_rows = tx_cds.sort_values('Start') if strand == '+' else tx_cds.sort_values('Start', ascending=False)
+                                
+                                # Collect all regions to fetch
+                                regions_to_fetch = []
+                                for i, (_, row_cds) in enumerate(cds_rows.iterrows()):
                                     s0 = int(row_cds['Start']) - 1
                                     e0 = int(row_cds['End'])
-                                    seq = self.genome.fetch(chrom, s0, e0).upper()
-                                    seq = self._reverse_complement(seq)
                                     frame = row_cds.get('Frame', 0)
                                     try:
                                         frame = int(frame) if frame != '.' else 0
                                     except Exception:
                                         frame = 0
+                                    regions_to_fetch.append((s0, e0, frame, i))
+                                
+                                # Fetch all regions at once
+                                for s0, e0, frame, i in regions_to_fetch:
+                                    seq = self.genome.fetch(chrom, s0, e0).upper()
+                                    if strand == '-':
+                                        seq = self._reverse_complement(seq)
                                     if i == 0 and frame > 0 and len(seq) > frame:
                                         seq = seq[frame:]
                                     parts.append(seq)
-                            cds_seq = ''.join(parts)
+                                
+                                cds_seq = ''.join(parts)
+                                self._cds_seq_cache[cds_cache_key] = cds_seq
+                            
                             protein_seq = self._translate_cds(cds_seq, chrom)
                             if chrom not in ['chrM', 'MT', 'M']:
                                 has_nmd = self._check_nmd(
@@ -509,6 +529,8 @@ class TrainingDataGenerator:
         except Exception as e:
             print(f"  ⚠️  Error getting transcripts for {chrom}:{start}-{end}: {e}")
         
+        # OPTIMIZATION 1: Cache the result
+        self._isoform_cache[cache_key] = isoforms
         return isoforms
     
     def _collect_variants_in_region(self, chrom: str, start: int, end: int) -> List[Dict]:
@@ -1350,6 +1372,10 @@ class TrainingDataGenerator:
         # Clear existing files
         for f in output_dir.glob("*.parquet"):
             f.unlink()
+        
+        # OPTIMIZATION 1: Clear isoform cache at start of split
+        self._isoform_cache.clear()
+        self._cds_seq_cache.clear()
         
         total_examples = 0
         
