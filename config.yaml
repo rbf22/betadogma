@@ -1,0 +1,51 @@
+data:
+  reference_fasta: "data/processed/genome/GRCh38.fa.gz"
+  gencode_gtf: "data/processed/annotation/gencode_v26/gencode.v26.annotation.gtf.gz"
+  clinvar_vcf: "data/processed/variants/clinvar/clinvar.vcf.gz"
+  splicevar_vcf: "data/processed/variants/splicevar/splicevar_hg38.vcf.gz"
+  thousand_genomes_vcf: "data/processed/variants/1000genomes/1000GENOMES-phase_3.vcf.gz"
+  gtex_junctions: "data/processed/gtex/v8/junctions/junctions_filtered.parquet"
+  gtex_expression: "data/processed/gtex/v8/expression/transcript_tpm_summary.parquet"
+  protein_fasta: "data/processed/annotation/gencode_v26/gencode.v26.pc_translations.fa.gz"
+  transcript_fasta: "data/processed/annotation/gencode_v26/gencode.v26.transcripts.fa.gz"
+  max_clinvar_variants: 10000000
+  max_benign_variants: 10000000
+  window_size: 300000
+  step_size: 150000
+  batch_size: 100
+  gtex_sample_min: 50
+  use_multiprocessing: false
+  data_dir: "data/processed"
+
+model:
+  name: "LongSafari/hyenadna-medium-450k-seqlen-hf"  # or another HyenaDNA model name
+  hidden_size: 768                     # Hidden size for the model
+  num_layers: 24                       # Number of transformer layers
+  max_seq_len: 450000                  # Maximum sequence length
+  use_gradient_checkpointing: true     # Whether to use gradient checkpointing
+  freeze_encoder: true                 # Whether to freeze the encoder weights
+
+output:
+  output_dir: "output"
+  checkpoint_dir: "output/checkpoints"
+  log_dir: "output/logs"
+
+training:
+  train_chromosomes: ["chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10", "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19"]
+  val_chromosomes: ["chr20", "chr21", "chr22"]
+  test_chromosomes: ["chrX", "chrY", "chrM"]
+  batch_size: 4                    # Batch size per device
+  accumulate_grad_batches: 8       # Accumulate gradients over multiple batches
+  learning_rate: 5.0e-5            # Learning rate
+  weight_decay: 0.01               # Weight decay for optimizer
+  max_epochs: 50                   # Maximum number of training epochs
+  precision: "16-mixed"            # Training precision
+  gradient_clip_val: 1.0           # Gradient clipping value
+  limit_train_batches: 1.0         # Fraction of training data to use (1.0 = 100%)
+  limit_val_batches: 1.0           # Fraction of validation data to use
+  num_workers: 4                   # Number of data loader workers
+  devices: 1                       # Number of GPUs to use
+  save_top_k: 1                    # Save top-k checkpoints
+  monitor: "val/loss"              # Metric to monitor for checkpointing
+  mode: "min"                      # Minimize the monitored metric
+  patience: 5                      # Patience for early stopping

@@ -4,6 +4,7 @@ __pycache__/
 *.swp
 *.tmp
 *.log
+.DS_Store
 .build/
 dist/
 .venv/
@@ -15,6 +16,14 @@ dist/
 .checkpoints/
 data/raw/
 data/cache/
+data/annotation/
+data/expression/
+data/genome/
+data/junctions/
+data/reference/
+data/variants/
+data/processed/
+output/
 train/runs
 poetry.lock
 ./poetry.lock
