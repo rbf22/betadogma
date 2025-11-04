@@ -21,7 +21,7 @@ model:
   name: "LongSafari/hyenadna-medium-450k-seqlen-hf"  # or another HyenaDNA model name
   hidden_size: 768                     # Hidden size for the model
   num_layers: 24                       # Number of transformer layers
-  max_seq_len: 450000                  # Maximum sequence length
+  max_seq_len: 300000                  # Maximum sequence length (matches data generation)
   use_gradient_checkpointing: true     # Whether to use gradient checkpointing
   freeze_encoder: true                 # Whether to freeze the encoder weights
 

@@ -12,21 +12,36 @@ from typing import List, Dict, Optional, Tuple, Union, Any
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+import pyarrow as pa
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.checkpoint import checkpoint
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
-import warnings
-import yaml
+import threading
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple, Union, Any
+import random
 
 # Add parent directory to path for local imports
 import sys
 sys.path.append(str(Path(__file__).parent.parent))
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.checkpoint import checkpoint
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from typing import Optional, Dict, List
+import warnings
+import yaml
+from pathlib import Path
 warnings.filterwarnings('ignore')
 
 # Load configuration from YAML
@@ -60,7 +75,7 @@ def get_gpu_config():
     
     if gpu_memory_gb >= 75:  # A100-80GB
         config = {
-            'max_seq_len': 300000,  # Full 450k!
+            'max_seq_len': 450000,  # Full 450k!
             'batch_size': 2,
             'accumulate_grad_batches': 8,
             'device_name': 'A100-80GB',
@@ -70,7 +85,7 @@ def get_gpu_config():
         
     elif gpu_memory_gb >= 35:  # A100-40GB
         config = {
-            'max_seq_len': 300000,  # Full 450k!
+            'max_seq_len': 450000,  # Full 450k!
             'batch_size': 1,
             'accumulate_grad_batches': 16,
             'device_name': 'A100-40GB',
@@ -80,7 +95,7 @@ def get_gpu_config():
         
     elif gpu_memory_gb >= 14:  # T4, RTX 3080 (16GB)
         config = {
-            'max_seq_len': 300000,  # YES! Full 450k!
+            'max_seq_len': 450000,  # YES! Full 450k!
             'batch_size': 1,
             'accumulate_grad_batches': 32,
             'device_name': 'T4/RTX3080',
@@ -141,17 +156,6 @@ class Config:
         self.w_polya = 0.5
         self.w_splice_effect = 1.0
         self.pos_weight = 20.0  # For positive class in BCEWithLogitsLoss
-
-        # Phase 1: Protein prediction
-        self.protein_hidden = 256
-        self.protein_layers = 2
-        
-        # Phase 1: Loss weights
-        self.w_protein = 2.0
-        self.w_cds_start = 0.5
-        self.w_cds_end = 0.5
-        self.w_nmd = 1.0
-        self.w_expression = 1.0
         
         # Coupling parameters
         self.coupling_strength = 0.1  # Controls strength of coupling between tasks
@@ -192,8 +196,8 @@ class Config:
 class CharacterTokenizer:
     """Character-level DNA tokenizer."""
     
-    def __init__(self, max_length: int = 300000):
-        self.max_length = max_length  # Hard cap at 450k
+    def __init__(self, max_length: int = 450000):
+        self.max_length = min(max_length, 450000)  # Hard cap at 450k
         self.vocab = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': 4}
         self.pad_token_id = 4
         
@@ -324,111 +328,6 @@ class BetaDogmaDataset(Dataset):
                 
         raise IndexError(f"Could not find index {idx} in any file")
     
-    @staticmethod
-    def parse_isoforms(isoforms_json: str) -> Dict:
-        """Parse isoform metadata from JSON string."""
-        if not isoforms_json or isoforms_json == '[]':
-            return {'proteins': [], 'nmd_flags': [], 'tpms': [], 'cds_coords': [], 'is_canonical': []}
-        
-        try:
-            isoforms = json.loads(isoforms_json)
-            return {
-                'proteins': [iso.get('protein_seq', '') for iso in isoforms],
-                'nmd_flags': [iso.get('has_nmd', False) for iso in isoforms],
-                'tpms': [iso.get('expression_tpm', 0.0) for iso in isoforms],
-                'cds_coords': [(iso.get('cds_start', -1), iso.get('cds_end', -1)) for iso in isoforms],
-                'is_canonical': [iso.get('is_canonical', False) for iso in isoforms]
-            }
-        except:
-            return {'proteins': [], 'nmd_flags': [], 'tpms': [], 'cds_coords': [], 'is_canonical': []}
-    
-    @staticmethod
-    def extract_canonical_isoform(isoform_data: Dict) -> Dict:
-        """Extract canonical isoform data from parsed isoforms."""
-        canonical_idx = None
-        for i, is_canon in enumerate(isoform_data['is_canonical']):
-            if is_canon:
-                canonical_idx = i
-                break
-        
-        if canonical_idx is None and isoform_data['tpms']:
-            canonical_idx = np.argmax(isoform_data['tpms'])
-        
-        if canonical_idx is not None and canonical_idx < len(isoform_data['proteins']):
-            cds_start, cds_end = isoform_data['cds_coords'][canonical_idx]
-            return {
-                'protein': isoform_data['proteins'][canonical_idx],
-                'nmd': isoform_data['nmd_flags'][canonical_idx],
-                'tpm': isoform_data['tpms'][canonical_idx],
-                'cds_start': cds_start,
-                'cds_end': cds_end
-            }
-        
-        return {'protein': '', 'nmd': False, 'tpm': 0.0, 'cds_start': -1, 'cds_end': -1}
-    
-    @classmethod
-    def create_protein_labels(cls, protein_seq: str, cds_start: int, cds_end: int, seq_len: int) -> np.ndarray:
-        """Convert protein sequence to per-position amino acid labels."""
-        labels = np.full(seq_len, -1, dtype=np.int64)
-        
-        if not protein_seq or cds_start is None or cds_end is None or cds_start < 0 or cds_end < 0 or cds_end > seq_len:
-            return labels
-        
-        codon_positions = range(cds_start, min(cds_end, seq_len), 3)
-        
-        for i, pos in enumerate(codon_positions):
-            if i >= len(protein_seq):
-                break
-            aa = protein_seq[i]
-            if aa in cls.AA_TO_IDX:
-                aa_idx = cls.AA_TO_IDX[aa]
-                for j in range(3):
-                    if pos + j < seq_len:
-                        labels[pos + j] = aa_idx
-        
-        return labels
-    
-    @staticmethod
-    def create_cds_boundary_labels(cds_start: int, cds_end: int, seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Create binary labels for CDS start and end positions."""
-        start_labels = np.zeros(seq_len, dtype=np.float32)
-        end_labels = np.zeros(seq_len, dtype=np.float32)
-        
-        if cds_start is not None and 0 <= cds_start < seq_len:
-            start_labels[cds_start] = 1.0
-        if cds_end is not None and 0 <= cds_end < seq_len:
-            end_labels[cds_end] = 1.0
-        
-        return start_labels, end_labels
-    
-    @staticmethod
-    def to_tensor(data, length: int) -> torch.Tensor:
-        """Convert data to tensor with proper padding/truncation."""
-        # Parse JSON if string
-        if isinstance(data, str):
-            try:
-                data = json.loads(data)
-            except (json.JSONDecodeError, TypeError):
-                return torch.zeros(length, dtype=torch.float32)
-        
-        # Convert to numpy
-        if isinstance(data, (list, np.ndarray)):
-            data = np.asarray(data, dtype=np.float32)
-            
-            # Truncate if too long (center crop)
-            if len(data) > length:
-                start = (len(data) - length) // 2
-                data = data[start:start + length]
-            
-            # Pad if too short
-            elif len(data) < length:
-                pad = (0, length - len(data))
-                data = np.pad(data, pad, 'constant')
-            
-            return torch.from_numpy(data)
-        
-        return torch.zeros(length, dtype=torch.float32)
-    
     def _apply_synthetic_variant(self, seq: str, seed: int) -> tuple:
         """Apply random variant (SNV/INS/DEL) to sequence.
         
@@ -547,228 +446,290 @@ class BetaDogmaDataset(Dataset):
         
         return seq_alt, variant_info
     
-    # ================================================================
-    # Phase 2A: Variant Augmentation (33/33/33 strategy)
-    # ================================================================
-    
-    def _apply_variant_to_sequence(self, seq: str, variant: Dict) -> str:
-        """Apply a variant to the sequence.
-        
-        Args:
-            seq: Reference sequence
-            variant: Variant dict with 'pos', 'ref', 'alt'
+    def _get_file_and_row(self, idx):
+        """Find which file and row contains the given index."""
+        if idx < 0 or idx >= self.length:
+            raise IndexError(f"Index {idx} out of bounds [0, {self.length-1}]")
             
-        Returns:
-            Sequence with variant applied
-        """
-        pos = variant.get('pos', 0)
-        ref = variant.get('ref', '')
-        alt = variant.get('alt', '')
-        
-        if pos < 0 or pos >= len(seq):
-            return seq
-        
-        # Verify reference matches
-        if seq[pos:pos+len(ref)] != ref:
-            return seq
-        
-        # Apply variant
-        seq_list = list(seq)
-        seq_list[pos:pos+len(ref)] = list(alt)
-        return ''.join(seq_list)
-    
-    def _recompute_labels_for_variant(self, labels: Dict, variant: Dict, seq_len: int) -> Dict:
-        """Recompute labels for a variant (Phase 2B).
-        
-        For benign variants: keep labels the same (sequence changed, function didn't)
-        For pathogenic variants: modify labels based on variant effect
-        
-        Args:
-            labels: Reference labels dict
-            variant: Variant dict with 'is_benign', 'splice_effect_score'
-            seq_len: Sequence length
+        # Binary search to find the right file
+        low, high = 0, len(self.file_metas) - 1
+        while low <= high:
+            mid = (low + high) // 2
+            meta = self.file_metas[mid]
             
-        Returns:
-            Updated labels dict
-        """
-        labels_alt = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in labels.items()}
-        
-        # For benign variants, keep labels the same (this is the teaching signal)
-        if variant.get('is_benign', False):
-            return labels_alt
-        
-        # For pathogenic variants with splice effects, modify splice labels
-        if variant.get('has_splice_effect', False):
-            effect_score = variant.get('splice_effect_score', 0.0)
-            
-            # If strong effect, flip splice site labels at variant position
-            if effect_score > 0.5:
-                pos = variant.get('pos', 0)
-                if 0 <= pos < seq_len:
-                    # Flip donor label
-                    if 'donor' in labels_alt:
-                        labels_alt['donor'][pos] = 1.0 - labels_alt['donor'][pos]
-                    # Flip acceptor label
-                    if 'acceptor' in labels_alt:
-                        labels_alt['acceptor'][pos] = 1.0 - labels_alt['acceptor'][pos]
-        
-        return labels_alt
-    
-    def _get_augmentation_mode(self) -> str:
-        """Decide augmentation mode: reference, benign, or pathogenic (33/33/33).
-        
-        Returns:
-            'reference', 'benign', or 'pathogenic'
-        """
-        if self.mode in ['val', 'test']:
-            return 'reference'  # No augmentation in val/test
-        
-        p = random.random()
-        if p < 0.33:
-            return 'reference'
-        elif p < 0.66:
-            return 'benign'
-        else:
-            return 'pathogenic'
-    
-    def __getitem__(self, idx):
-        """Get a single item with Phase 2 variant augmentation support."""
-        file_path, row_idx = self._get_file_and_row(idx)
-        
-        try:
-            # Read row with Phase 2 variant data
-            df = pd.read_parquet(
-                file_path,
-                columns=['seq', 'donor', 'acceptor', 'tss', 'polya', 'isoforms', 'variants']
-            )
-                
-            if len(df) <= row_idx:
-                raise IndexError(f"Row {row_idx} not found")
-                    
-            row = df.iloc[row_idx]
-            
-            # ================================================================
-            # Phase 2A: Decide augmentation mode (33/33/33 strategy)
-            # ================================================================
-            aug_mode = self._get_augmentation_mode()
-            variant = None
-            
-            # Parse variants from row
-            try:
-                variants_json = row.get('variants', '[]')
-                if isinstance(variants_json, str):
-                    variants = json.loads(variants_json)
-                else:
-                    variants = variants_json if variants_json else []
-            except:
-                variants = []
-            
-            # Select variant based on augmentation mode
-            if aug_mode == 'benign' and variants:
-                benign_vars = [v for v in variants if v.get('is_benign', False)]
-                if benign_vars:
-                    variant = random.choice(benign_vars)
-                    aug_mode = 'benign'
-                else:
-                    aug_mode = 'reference'
-            
-            elif aug_mode == 'pathogenic' and variants:
-                path_vars = [v for v in variants if v.get('is_pathogenic', False) or v.get('has_splice_effect', False)]
-                if path_vars:
-                    variant = random.choice(path_vars)
-                    aug_mode = 'pathogenic'
-                else:
-                    aug_mode = 'reference'
-            
-            # ================================================================
-            # Process sequence
-            # ================================================================
-            seq = str(row['seq'])
-            if not seq or len(seq) == 0:
-                seq = 'N' * self.max_seq_len
-            
-            # Ensure sequence is exactly max_seq_len
-            if len(seq) > self.max_seq_len:
-                start = (len(seq) - self.max_seq_len) // 2
-                seq = seq[start:start + self.max_seq_len]
-            elif len(seq) < self.max_seq_len:
-                pad_left = (self.max_seq_len - len(seq)) // 2
-                pad_right = self.max_seq_len - len(seq) - pad_left
-                seq = ('N' * pad_left) + seq + ('N' * pad_right)
-            
-            # Phase 2A: Apply variant to sequence if selected
-            if variant and aug_mode in ['benign', 'pathogenic']:
-                seq = self._apply_variant_to_sequence(seq, variant)
-            
-            # Tokenize
-            tokenized = self.tokenizer(seq, max_length=self.max_seq_len, padding='max_length', truncation=True)
-            
-            # ================================================================
-            # Process labels
-            # ================================================================
-            labels = {
-                'donor': self.to_tensor(row['donor'], self.max_seq_len),
-                'acceptor': self.to_tensor(row['acceptor'], self.max_seq_len),
-                'tss': self.to_tensor(row['tss'], self.max_seq_len),
-                'polya': self.to_tensor(row['polya'], self.max_seq_len),
-            }
-            
-            # Phase 1: Isoform data
-            isoform_data = self.parse_isoforms(row.get('isoforms', '[]'))
-            canonical = self.extract_canonical_isoform(isoform_data)
-            
-            protein_labels = self.create_protein_labels(canonical['protein'], canonical['cds_start'], canonical['cds_end'], self.max_seq_len)
-            labels['protein'] = torch.from_numpy(protein_labels)
-            
-            cds_start_labels, cds_end_labels = self.create_cds_boundary_labels(canonical['cds_start'], canonical['cds_end'], self.max_seq_len)
-            labels['cds_start'] = torch.from_numpy(cds_start_labels)
-            labels['cds_end'] = torch.from_numpy(cds_end_labels)
-            
-            nmd_value = canonical['nmd']
-            if isinstance(nmd_value, str):
-                nmd_value = nmd_value.lower() == 'true'
-            labels['nmd'] = torch.tensor(float(nmd_value), dtype=torch.float32)
-            
-            labels['expression'] = torch.tensor(np.log1p(canonical['tpm']), dtype=torch.float32)
-            
-            # ================================================================
-            # Phase 2B: Recompute labels for variant if needed
-            # ================================================================
-            if variant and aug_mode in ['benign', 'pathogenic']:
-                labels = self._recompute_labels_for_variant(labels, variant, self.max_seq_len)
-                # Add variant effect label for training
-                labels['variant_effect'] = torch.tensor(variant.get('splice_effect_score', 0.0), dtype=torch.float32)
+            if idx < meta['start_idx']:
+                high = mid - 1
+            elif idx > meta['end_idx']:
+                low = mid + 1
             else:
-                labels['variant_effect'] = torch.tensor(0.0, dtype=torch.float32)
-            
-            return {
-                'input_ids': tokenized['input_ids'].squeeze(0),
-                'attention_mask': tokenized['attention_mask'].squeeze(0),
-                'labels': labels,
-                'augmentation_mode': aug_mode
-            }
+                # Found the file
+                row_idx = idx - meta['start_idx']
+                return meta['path'], row_idx
                 
-        except Exception as e:
-            print(f"⚠️  Error loading example {idx}: {e}")
-            tokenized = self.tokenizer('N' * self.max_seq_len, max_length=self.max_seq_len, padding='max_length', truncation=True)
+        raise IndexError(f"Could not find index {idx} in any file")
+
+    @staticmethod
+    def to_tensor(data, length):
+        """Convert data to tensor with proper padding/truncation."""
+        if isinstance(data, (list, np.ndarray)):
+            data = np.asarray(data, dtype=np.float32)
+            if len(data) > length:
+                start = (len(data) - length) // 2
+                data = data[start:start + length]
+            elif len(data) < length:
+                pad = (0, length - len(data))
+        
+    def __len__(self):
+        return self.length
+        
+    def _get_file_and_offset(self, idx):
+        """Convert global index to (file_path, offset)."""
+        if idx < 0 or idx >= self.length:
+            raise IndexError(f"Index {idx} out of bounds [0, {self.length-1}]")
+                
+        # Find which file contains this index
+        file_idx = np.searchsorted(self.file_bounds[:, 1], idx, side='right')
+        file_path = self.file_paths[file_idx]
+        offset = idx - self.file_metadata[file_path]['start_idx']
             
-            return {
-                'input_ids': tokenized['input_ids'].squeeze(0),
-                'attention_mask': tokenized['attention_mask'].squeeze(0),
-                'labels': {
-                    'donor': torch.zeros(self.max_seq_len, dtype=torch.float32),
-                    'acceptor': torch.zeros(self.max_seq_len, dtype=torch.float32),
-                    'tss': torch.zeros(self.max_seq_len, dtype=torch.float32),
-                    'polya': torch.zeros(self.max_seq_len, dtype=torch.float32),
-                    'protein': torch.full((self.max_seq_len,), -1, dtype=torch.long),
-                    'cds_start': torch.zeros(self.max_seq_len, dtype=torch.float32),
-                    'cds_end': torch.zeros(self.max_seq_len, dtype=torch.float32),
-                    'nmd': torch.tensor(0.0, dtype=torch.float32),
-                    'expression': torch.tensor(0.0, dtype=torch.float32),
-                    'variant_effect': torch.tensor(0.0, dtype=torch.float32),
-                },
-                'augmentation_mode': 'error'
+        return file_path, offset
+    
+def _apply_synthetic_variant(self, seq: str, seed: int) -> tuple:
+    """Apply random variant (SNV/INS/DEL) to sequence.
+    
+    Args:
+        seq: Reference sequence
+        seed: Random seed for reproducibility
+            
+    Returns:
+        (mutated_sequence, variant_info_dict)
+    """
+    rng = np.random.RandomState(seed)
+        
+    seq_len = len(seq)
+    if seq_len < 200:
+        return seq, None
+        
+    # Pick random position (avoid edges)
+    pos = rng.randint(100, seq_len - 100)
+        
+    # Choose variant type: 70% SNV, 15% INS, 15% DEL
+    var_type = rng.choice(['SNV', 'INS', 'DEL'], p=[0.7, 0.15, 0.15])
+        
+    bases = ['A', 'C', 'G', 'T']
+    ref_base = seq[pos]
+        
+    if ref_base not in bases:
+        return seq, None
+        
+    if var_type == 'SNV':
+        # Simple substitution
+        alt_base = rng.choice([b for b in bases if b != ref_base])
+        ref = ref_base
+        alt = alt_base
+    elif var_type == 'INS':
+        # Insert 1-5 random bases
+        ins_len = rng.randint(1, 6)
+        alt = ''.join(rng.choice(bases) for _ in range(ins_len))
+        ref = ref_base
+        # Insert after the anchor base
+        alt = ref + alt
+    else:  # DEL
+        # Delete 1-5 bases
+        del_len = min(rng.randint(1, 6), len(seq) - pos - 1)
+        ref = ref_base + seq[pos+1:pos+1+del_len]
+        alt = ref_base
+        
+    # Apply mutation
+    seq_list = list(seq)
+        
+    if var_type == 'SNV':
+        seq_list[pos] = alt
+    elif var_type == 'INS':
+        # Insert after the anchor base
+        seq_list[pos+1:pos+1] = list(alt[1:])  # alt includes the anchor base
+    else:  # DEL
+        # Remove deleted bases
+        del seq_list[pos+1:pos+1+len(ref)-1]
+        
+    seq_alt = ''.join(seq_list)
+        
+    variant_info = {
+        'pos': pos,
+        'ref': ref,
+        'alt': alt,
+        'type': f'synthetic_{var_type.lower()}',
+        'pathogenic': False,
+    }
+        
+    return seq_alt, variant_info
+    
+def _apply_clinvar_variant(self, seq: str, variant: Dict) -> tuple:
+    """Apply ClinVar variant to sequence.
+    
+    Args:
+        seq: Reference sequence
+        variant: ClinVar variant dict with 'pos', 'ref', 'alt', 'type', 'pathogenic'
+            
+    Returns:
+        (mutated_sequence, variant_info_dict)
+    """
+    pos = variant['pos']
+    ref = variant['ref']
+    alt = variant['alt']
+    var_type = variant.get('type', 'SNV')
+        
+    if pos < 0 or pos >= len(seq):
+        return seq, None
+        
+    # Verify reference matches for the first base (anchor)
+    if seq[pos] != ref[0] if ref else False:
+        return seq, None
+        
+    # Apply mutation based on variant type
+    seq_list = list(seq)
+        
+    if var_type == 'SNV':
+        # Simple substitution
+        seq_list[pos] = alt
+    elif var_type == 'INS':
+        # Insertion: insert after the anchor base
+        seq_list[pos+1:pos+1] = list(alt)
+    elif var_type == 'DEL':
+        # Deletion: remove reference bases after anchor
+        del_len = len(ref)
+        seq_list[pos+1:pos+1+del_len] = []
+        
+    seq_alt = ''.join(seq_list)
+        
+    variant_info = {
+        'pos': pos,
+        'ref': ref,
+        'alt': alt,
+        'type': f'clinvar_{var_type.lower()}',
+        'pathogenic': variant['pathogenic'],
+    }
+        
+    return seq_alt, variant_info
+    
+def _get_file_and_row(self, idx):
+    """Find which file and row contains the given index."""
+    if idx < 0 or idx >= self.length:
+        raise IndexError(f"Index {idx} out of bounds [0, {self.length-1}]")
+            
+    # Binary search to find the right file
+    low, high = 0, len(self.file_metas) - 1
+    while low <= high:
+        mid = (low + high) // 2
+        meta = self.file_metas[mid]
+            
+        if idx < meta['start_idx']:
+            high = mid - 1
+        elif idx > meta['end_idx']:
+            low = mid + 1
+        else:
+            # Found the file
+            row_idx = idx - meta['start_idx']
+            return meta['path'], row_idx
+                
+    raise IndexError(f"Could not find index {idx} in any file")
+
+@staticmethod
+def to_tensor(data, length):
+    """Convert data to tensor with proper padding/truncation."""
+    if isinstance(data, (list, np.ndarray)):
+        data = np.asarray(data, dtype=np.float32)
+        if len(data) > length:
+            start = (len(data) - length) // 2
+            data = data[start:start + length]
+        elif len(data) < length:
+            pad = (0, length - len(data))
+            data = np.pad(data, pad, 'constant')
+        return torch.from_numpy(data)
+    return torch.zeros(length, dtype=torch.float32)
+
+def __getitem__(self, idx):
+    """Get a single item from the dataset."""
+    # Find which file and row contains this index
+    file_meta, row_idx = self._get_file_and_row(idx)
+        
+    try:
+        # Read only the specific row we need
+        df = pd.read_parquet(
+            file_meta['path'],
+            filters=[('index', '=', row_idx)],
+            columns=['seq', 'start','end', 'donor', 'acceptor', 'tss', 'polya', 'splice_variants', 'clinvar_variants','benign_variants']
+        )
+            
+        if len(df) == 0:
+            raise IndexError(f"Row {row_idx} not found in {file_meta['path']}")
+                
+        row = df.iloc[0]
+            
+        # Process sequence
+        seq = str(row['seq'])
+        if not seq:
+            raise ValueError(f"Empty sequence at index {idx}")
+                
+        # Ensure sequence is not empty after conversion
+        if not seq:
+            seq = 'N' * self.max_seq_len
+                
+        # Truncate sequence if needed (center crop)
+        if len(seq) > self.max_seq_len:
+            start = (len(seq) - self.max_seq_len) // 2
+            seq = seq[start:start + self.max_seq_len]
+                
+        # Ensure sequence is exactly max_seq_len (pad if needed)
+        if len(seq) < self.max_seq_len:
+            # Pad with Ns if sequence is too short
+            pad_left = (self.max_seq_len - len(seq)) // 2
+            pad_right = self.max_seq_len - len(seq) - pad_left
+            seq = ('N' * pad_left) + seq + ('N' * pad_right)
+                
+        # Tokenize the sequence
+        seq = self.tokenizer(
+            seq,
+            max_length=self.max_seq_len,
+            padding='max_length',
+            truncation=True
+        )
+            
+        # Convert labels to tensors
+        labels = {}
+        for label_type in ['donor', 'acceptor', 'tss', 'polya']:
+            if label_type in row and row[label_type] is not None:
+                labels[label_type] = self.to_tensor(
+                    row[label_type],
+                    self.max_seq_len
+                )
+            
+        return {
+            'input_ids': seq['input_ids'].squeeze(0),
+            'attention_mask': seq['attention_mask'].squeeze(0),
+            'labels': labels
+        }
+            
+    except Exception as e:
+        print(f"Error in __getitem__ for index {idx}: {e}")
+        # Return dummy data on error
+        seq = self.tokenizer(
+            'N' * self.max_seq_len,
+            max_length=self.max_seq_len,
+            padding='max_length',
+            truncation=True
+        )
+            
+        return {
+            'input_ids': seq['input_ids'].squeeze(0),
+            'attention_mask': seq['attention_mask'].squeeze(0),
+            'labels': {
+                'donor': torch.zeros(self.max_seq_len, dtype=torch.float32),
+                'acceptor': torch.zeros(self.max_seq_len, dtype=torch.float32),
+                'tss': torch.zeros(self.max_seq_len, dtype=torch.float32),
+                'polya': torch.zeros(self.max_seq_len, dtype=torch.float32),
             }
+        }
 
 
 # ============================================================================
@@ -818,13 +779,12 @@ class HyenaDNAEncoder(nn.Module):
         super().__init__()
         
         if device is None:
-            # Use CUDA if available, otherwise CPU (MPS will be handled by PyTorch Lightning)
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         else:
             self.device = torch.device(device)
             
-        print(f"\n🔧 Initializing HyenaDNA: {model_name}")
-        print(f"   Device: {self.device}")
+        print(f"Initializing HyenaDNA model: {model_name}")
+        print(f"Using device: {self.device}")
         
         try:
             # Import required modules
@@ -835,21 +795,13 @@ class HyenaDNAEncoder(nn.Module):
             print(f"Model config: {config.model_type}")
             
             # Load model with appropriate settings
-            # Load on CPU first, then move to target device to avoid MPS initialization issues
             self.model = AutoModel.from_pretrained(
                 model_name,
                 trust_remote_code=True,
                 torch_dtype=torch.float32,  # Use float32 for stability
-                device_map=None,  # Don't use device_map, we'll handle placement manually
-            )
+                device_map='auto' if str(self.device) != 'cpu' else None,
+            ).to(self.device)
             
-            # Explicitly move to target device
-            self.model = self.model.to(self.device)
-            
-            # Ensure all parameters are on the correct device
-            for param in self.model.parameters():
-                param.data = param.data.to(self.device)
-                
             print(f"✅ Successfully loaded model: {model_name}")
             print(f"Model device: {next(self.model.parameters()).device}")
             
@@ -871,12 +823,14 @@ class HyenaDNAEncoder(nn.Module):
         try:
             # Ensure input is on the correct device
             input_ids = input_ids.to(self.device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
             
             # Forward pass with appropriate gradient context
-            # Note: HyenaDNA doesn't accept attention_mask, only input_ids
             with torch.set_grad_enabled(not self.frozen):
                 outputs = self.model(
                     input_ids,
+                    attention_mask=attention_mask,
                     output_hidden_states=True,
                     return_dict=True
                 )
@@ -905,15 +859,15 @@ class BetaDogmaModel(nn.Module):
         super().__init__()
         self.config = config
         
-        # Let PyTorch Lightning handle device placement
-        # Initialize encoder on CPU first, then PyTorch Lightning will move it
-        print(f"Initializing BetaDogmaModel")
+        # Initialize device
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Initializing BetaDogmaModel on {self.device}")
         
-        # Initialize encoder on CPU (PyTorch Lightning will move to correct device)
+        # Initialize encoder with proper device handling
         self.encoder = HyenaDNAEncoder(
             model_name=config.model_name,
             freeze=config.freeze_encoder,
-            device='cpu'  # Always init on CPU, let Lightning handle device movement
+            device=self.device
         )
         
         # Get the actual encoder dimension from the model
@@ -927,14 +881,13 @@ class BetaDogmaModel(nn.Module):
         use_checkpointing = config.use_gradient_checkpointing
         
         # Initialize prediction heads with proper dimensions
-        # Don't specify device - let PyTorch Lightning handle it
         self.donor_head = PredictionHead(
             self.encoder_dim, 
             config.splice_hidden,
             config.splice_layers, 
             config.dropout, 
             use_checkpointing
-        )
+        ).to(self.device)
         
         self.acceptor_head = PredictionHead(
             self.encoder_dim, 
@@ -942,7 +895,7 @@ class BetaDogmaModel(nn.Module):
             config.splice_layers, 
             config.dropout, 
             use_checkpointing
-        )
+        ).to(self.device)
         
         # Splice effect prediction head (regression)
         self.splice_effect_head = PredictionHead(
@@ -951,13 +904,13 @@ class BetaDogmaModel(nn.Module):
             config.splice_layers, 
             config.dropout, 
             use_checkpointing
-        )
+        ).to(self.device)
         
-        # Initialize cross-attention layers
-        self.splice_effect_to_donor = nn.Linear(1, 1)
-        self.splice_effect_to_acceptor = nn.Linear(1, 1)
-        self.donor_to_effect = nn.Linear(1, 1)
-        self.acceptor_to_effect = nn.Linear(1, 1)
+        # Initialize cross-attention layers with proper device placement
+        self.splice_effect_to_donor = nn.Linear(1, 1).to(self.device)
+        self.splice_effect_to_acceptor = nn.Linear(1, 1).to(self.device)
+        self.donor_to_effect = nn.Linear(1, 1).to(self.device)
+        self.acceptor_to_effect = nn.Linear(1, 1).to(self.device)
         
         # Initialize coupling layers
         for layer in [self.splice_effect_to_donor, self.splice_effect_to_acceptor,
@@ -972,7 +925,7 @@ class BetaDogmaModel(nn.Module):
             config.tss_layers, 
             config.dropout, 
             use_checkpointing
-        )
+        ).to(self.device)
         
         self.polya_head = PredictionHead(
             self.encoder_dim, 
@@ -980,7 +933,7 @@ class BetaDogmaModel(nn.Module):
             config.polya_layers, 
             config.dropout, 
             use_checkpointing
-        )
+        ).to(self.device)
         
         # Initialize weights for all heads
         for head in [self.donor_head, self.acceptor_head, self.splice_effect_head, 
@@ -1009,21 +962,18 @@ class BetaDogmaModel(nn.Module):
     def forward(self, input_ids, attention_mask=None):
         """Forward pass with proper error handling and device management."""
         try:
-            # Get device from encoder parameters
-            device = next(self.encoder.parameters()).device
-            
             # Ensure inputs are on the correct device
-            input_ids = input_ids.to(device)
+            input_ids = input_ids.to(self.device)
             if attention_mask is not None:
-                attention_mask = attention_mask.to(device)
+                attention_mask = attention_mask.to(self.device)
             
             # Get sequence embeddings
             with torch.set_grad_enabled(self.training and not self.encoder.frozen):
                 embeddings = self.encoder(input_ids, attention_mask=attention_mask)
                 
                 # Ensure embeddings are on the correct device
-                if embeddings.device != device:
-                    embeddings = embeddings.to(device)
+                if embeddings.device != self.device:
+                    embeddings = embeddings.to(self.device)
             
             # Apply prediction heads with gradient checkpointing if needed
             def run_heads(emb):
@@ -1180,59 +1130,13 @@ class BetaDogmaLightning(pl.LightningModule):
         else:
             loss_splice = torch.tensor(0.0, device=self.device)
         
-        # Phase 1: Protein, CDS, NMD, Expression losses
-        loss_protein = F.cross_entropy(
-            outputs['protein'].view(-1, 21),
-            labels['protein'].view(-1),
-            ignore_index=-1
-        )
-        
-        loss_cds_start = F.binary_cross_entropy_with_logits(
-            outputs['cds_start'],
-            labels['cds_start'],
-            pos_weight=self.pos_weight.to(self.device)
-        )
-        
-        loss_cds_end = F.binary_cross_entropy_with_logits(
-            outputs['cds_end'],
-            labels['cds_end'],
-            pos_weight=self.pos_weight.to(self.device)
-        )
-        
-        loss_nmd = F.binary_cross_entropy_with_logits(
-            outputs['nmd'],
-            labels['nmd']
-        )
-        
-        loss_expression = F.mse_loss(
-            outputs['expression'],
-            labels['expression']
-        )
-        
-        # Phase 2B: Variant effect prediction loss
-        loss_variant_effect = torch.tensor(0.0, device=self.device)
-        if 'variant_effect' in labels and labels['variant_effect'].sum() > 0:
-            # Only compute loss on examples with variants
-            mask = (labels['variant_effect'] > 0).float()
-            if mask.sum() > 0:
-                loss_variant_effect = F.mse_loss(
-                    outputs.get('variant_effect', torch.zeros_like(labels['variant_effect'])) * mask,
-                    labels['variant_effect'] * mask
-                )
-        
         # Combine losses with weights
         loss = (
             self.config.w_splice_donor * loss_donor +
             self.config.w_splice_acceptor * loss_acceptor +
             self.config.w_tss * loss_tss +
             self.config.w_polya * loss_polya +
-            self.config.w_splice_effect * loss_splice +
-            self.config.w_protein * loss_protein +
-            self.config.w_cds_start * loss_cds_start +
-            self.config.w_cds_end * loss_cds_end +
-            self.config.w_nmd * loss_nmd +
-            self.config.w_expression * loss_expression +
-            0.5 * loss_variant_effect  # Phase 2B weight
+            self.config.w_splice_effect * loss_splice
         )
         
         return {
@@ -1242,12 +1146,6 @@ class BetaDogmaLightning(pl.LightningModule):
             'loss/tss': loss_tss,
             'loss/polya': loss_polya,
             'loss/splice_effect': loss_splice,
-            'loss/protein': loss_protein,
-            'loss/cds_start': loss_cds_start,
-            'loss/cds_end': loss_cds_end,
-            'loss/nmd': loss_nmd,
-            'loss/expression': loss_expression,
-            'loss/variant_effect': loss_variant_effect,
         }
     
     def training_step(self, batch, batch_idx):
@@ -1554,11 +1452,9 @@ def train(
     logger = TensorBoardLogger(save_dir=config.output_dir, name="logs")
     
     # Configure trainer with memory optimizations
-    # Use CPU on Mac due to HyenaDNA MPS incompatibility with PyTorch Lightning device movement
-    accelerator = "cpu" if torch.backends.mps.is_available() else "auto"
     trainer = pl.Trainer(
         max_epochs=config.max_epochs,
-        accelerator=accelerator,
+        accelerator="auto",
         devices=config.devices,
         precision=config.precision,
         gradient_clip_val=config.gradient_clip_val,
