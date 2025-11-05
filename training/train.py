@@ -188,13 +188,13 @@ def train(
     # Auto-detect the best accelerator
     if torch.cuda.is_available():
         accelerator = "cuda"
-        print("🚀 Using CUDA accelerator")
+        logger.info("🚀 Using CUDA accelerator")
     elif torch.backends.mps.is_available():
         accelerator = "mps"
-        print("🍎 Using MPS (Apple Silicon) accelerator")
+        logger.info("🍎 Using MPS (Apple Silicon) accelerator")
     else:
         accelerator = "cpu"
-        print("💻 Using CPU accelerator")
+        logger.info("💻 Using CPU accelerator")
     
     
     # Configure trainer with memory optimizations
