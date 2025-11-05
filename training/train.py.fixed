@@ -1,0 +1,262 @@
+    def forward(self, input_ids, attention_mask=None):
+        """Forward pass with memory optimizations for long sequences.
+        
+        Args:
+            input_ids: Input tensor of shape (batch_size, seq_len)
+            attention_mask: Optional attention mask of shape (batch_size, seq_len)
+            
+        Returns:
+            Dictionary containing model outputs for each task
+        """
+        print("\n" + "="*80)
+        print(f"=== 🚀 BETA DOGMA FORWARD PASS ===")
+        print("="*80)
+        
+        try:
+            # 1. Input validation and logging
+            print("\n[1/6] 🔍 INPUT VALIDATION")
+            if input_ids.dim() != 2:
+                raise ValueError(f"Expected input_ids to have 2 dimensions, got {input_ids.dim()}")
+                
+            print(f"Input shape: {tuple(input_ids.shape)}")
+            print(f"Input device: {input_ids.device}")
+            print(f"Input dtype: {input_ids.dtype}")
+            print(f"Input stats - min: {input_ids.min()}, max: {input_ids.max()}, mean: {input_ids.float().mean():.2f}")
+            
+            if attention_mask is not None:
+                print(f"Attention mask shape: {tuple(attention_mask.shape)}")
+                print(f"Attention mask device: {attention_mask.device}")
+                print(f"Attention mask stats - min: {attention_mask.min()}, max: {attention_mask.max()}")
+            
+            # 2. Move inputs to correct device
+            print("\n[2/6] 🚚 MOVING TO DEVICE")
+            input_device = input_ids.device
+            target_device = self.device
+            print(f"Moving tensors from {input_device} to {target_device}")
+            
+            if input_device != target_device:
+                print(f"Moving input_ids to {target_device}...")
+                input_ids = input_ids.to(target_device)
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(target_device)
+            
+            # 3. Ensure correct dtypes
+            print("\n[3/6] ✅ DATA TYPES")
+            if input_ids.dtype != torch.long:
+                print(f"Converting input_ids from {input_ids.dtype} to long")
+                input_ids = input_ids.long()
+                
+            if attention_mask is not None and attention_mask.dtype != torch.long:
+                print(f"Converting attention_mask from {attention_mask.dtype} to long")
+                attention_mask = attention_mask.long()
+            
+            # 4. Check for invalid values
+            print("\n[4/6] 🔍 INPUT VALIDATION")
+            if torch.isnan(input_ids).any() or torch.isinf(input_ids).any():
+                nan_count = torch.isnan(input_ids).sum().item()
+                inf_count = torch.isinf(input_ids).sum().item()
+                print(f"❌ ERROR: Input contains invalid values!")
+                print(f"  NaN count: {nan_count}")
+                print(f"  Inf count: {inf_count}")
+                print(f"  Input shape: {tuple(input_ids.shape)}")
+                print(f"  Input min/max: {input_ids.min()}/{input_ids.max()}")
+                raise ValueError("Input contains NaN or Inf values")
+
+            # Ensure input is long type (required for some MPS operations)
+            if input_ids.dtype != torch.long:
+                print(f"Converting input dtype from {input_ids.dtype} to long")
+                input_ids = input_ids.long()
+            
+            # 5. Run the encoder
+            print("\n[5/6] 🧬 ENCODER FORWARD")
+            print("Starting encoder forward pass...")
+            
+            # Clear any cached memory before running the encoder
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            try:
+                # Run encoder with memory optimizations
+                with torch.autocast(device_type='cpu', enabled=False):
+                    print("  Encoder input shape:", tuple(input_ids.shape))
+                    print("  Encoder input device:", input_ids.device)
+                    print("  Encoder input dtype:", input_ids.dtype)
+                    
+                    # Print memory stats if on CUDA
+                    if torch.cuda.is_available():
+                        print(f"  CUDA memory allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+                        print(f"  CUDA memory reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
+                    
+                    # Run the encoder
+                    print("  Calling encoder...")
+                    outputs = self.encoder(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask
+                    )
+                    
+                    print("✅ Encoder forward pass completed")
+                    
+                    # Verify encoder outputs
+                    if not hasattr(outputs, 'last_hidden_state'):
+                        if hasattr(outputs, 'hidden_states'):
+                            print("  Using last hidden state from hidden_states")
+                            outputs.last_hidden_state = outputs.hidden_states[-1]
+                        else:
+                            raise ValueError("No valid hidden states found in encoder outputs")
+                    
+                    print(f"  Hidden states shape: {tuple(outputs.last_hidden_state.shape)}")
+                    print(f"  Hidden states device: {outputs.last_hidden_state.device}")
+                    print(f"  Hidden states dtype: {outputs.last_hidden_state.dtype}")
+                    
+            except RuntimeError as e:
+                if 'out of memory' in str(e).lower():
+                    print("\n❌ OUT OF MEMORY IN HYENA DNA ENCODER")
+                    print(f"  Input shape: {tuple(input_ids.shape)}")
+                    print(f"  Batch size: {input_ids.size(0)}")
+                    print(f"  Sequence length: {input_ids.size(1)}")
+                    
+                    if torch.cuda.is_available():
+                        print("\n💾 GPU MEMORY USAGE:")
+                        print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+                        print(f"  Reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
+                        
+                        # Clear cache and suggest solutions
+                        print("\n🔄 Clearing CUDA cache...")
+                        torch.cuda.empty_cache()
+                    
+                    print("\n💡 SUGGESTED SOLUTIONS:")
+                    print("  1. Reduce batch size (currently 1)")
+                    print("  2. Reduce sequence length (currently 300,000)")
+                    print("  3. Enable gradient checkpointing in config")
+                    print("  4. Use a smaller model")
+                    print("  5. Use CPU instead of GPU (slower but more memory)")
+                
+                # Re-raise the error with more context
+                raise RuntimeError(f"Error in HyenaDNAEncoder forward pass: {str(e)}") from e
+
+            # Process outputs through prediction heads
+            results = {}
+            if hasattr(outputs, 'last_hidden_state'):
+                results['embeddings'] = outputs.last_hidden_state
+                hidden_state = outputs.last_hidden_state
+            else:
+                # Try to find the hidden state in other attributes
+                hidden_attrs = [attr for attr in dir(outputs) if 'hidden' in attr.lower() and not attr.startswith('_')]
+                if hidden_attrs:
+                    hidden_state = getattr(outputs, hidden_attrs[0])
+                    results['embeddings'] = hidden_state
+                    print(f"Using hidden state from attribute: {hidden_attrs[0]}")
+                else:
+                    raise ValueError("No hidden state found in encoder output")
+            
+            print("\n--- Running Prediction Heads ---")
+            
+            # Get predictions from each head with error handling
+            head_order = [
+                ('donor', self.donor_head),
+                ('acceptor', self.acceptor_head),
+                ('splice_effect', self.splice_effect_head),
+                ('tss', self.tss_head),
+                ('polya', self.polya_head),
+                ('protein', self.protein_head),
+                ('cds_start', self.cds_start_head),
+                ('cds_end', self.cds_end_head),
+                ('nmd', self.nmd_head),
+                ('expression', self.expression_head)
+            ]
+            
+            for i, (name, head) in enumerate(head_order, 1):
+                try:
+                    print(f"[{i}/{len(head_order)}] Running {name} head...")
+                    if head is None:
+                        print(f"  ⚠️  {name} head is None, skipping")
+                        continue
+                        
+                    # Print head parameters for debugging
+                    try:
+                        head_device = next(head.parameters()).device
+                        head_dtype = next(head.parameters()).dtype
+                        print(f"  {name} head device: {head_device}, dtype: {head_dtype}")
+                        
+                        # Run the head
+                        output = head(hidden_state)
+                        results[name] = output
+                        print(f"  {name} head output shape: {output.shape}")
+                        
+                        # Print output stats
+                        if isinstance(output, torch.Tensor):
+                            print(f"  {name} output stats - min: {output.min():.4f}, "
+                                  f"max: {output.max():.4f}, mean: {output.mean():.4f}")
+                            
+                            # Check for NaN/Inf in output
+                            if torch.isnan(output).any() or torch.isinf(output).any():
+                                print(f"  ⚠️  WARNING: {name} output contains NaN or Inf values!")
+                                print(f"  NaN count: {torch.isnan(output).sum().item()}")
+                                print(f"  Inf count: {torch.isinf(output).sum().item()}")
+                                
+                    except Exception as e:
+                        print(f"  ❌ Error in {name} head: {str(e)}")
+                        if hasattr(head, 'parameters'):
+                            print(f"  First parameter device: {next(head.parameters()).device}")
+                        raise
+                        
+                except Exception as e:
+                    print(f"❌ Failed to run {name} head: {str(e)}")
+                    raise
+            
+            print("\n=== Forward Pass Completed Successfully ===")
+            return results
+            
+        except RuntimeError as e:
+            if 'out of memory' in str(e):
+                print("⚠️ Out of memory in forward pass. Try reducing batch size or sequence length.")
+                print(f"Current batch size: {input_ids.size(0)}, sequence length: {input_ids.size(1)}")
+                
+                # Clear cache and try one more time
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                elif torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+                print("✅ Cleared cache, trying forward pass again...")
+                return self.forward(input_ids, attention_mask)
+                
+            print(f"RuntimeError in forward pass: {str(e)}")
+            print(f"Input shape: {input_ids.shape if input_ids is not None else 'None'}")
+            print(f"Device: {self.device}")
+            if hasattr(self, 'encoder') and hasattr(self.encoder, 'parameters'):
+                try:
+                    print(f"Encoder device: {next(self.encoder.parameters()).device}")
+                except Exception as e:
+                    print(f"Could not get encoder device: {str(e)}")
+            raise
+            
+        except Exception as e:
+            print(f"\n❌ UNHANDLED ERROR IN FORWARD PASS: {str(e)}")
+            print(f"Error type: {type(e).__name__}")
+            print("\nCURRENT TENSOR INFO:")
+            print(f"  Input shape: {tuple(input_ids.shape) if 'input_ids' in locals() else 'N/A'}")
+            print(f"  Input device: {input_ids.device if 'input_ids' in locals() else 'N/A'}")
+            print(f"  Input dtype: {input_ids.dtype if 'input_ids' in locals() else 'N/A'}")
+            
+            # Print model device info
+            print("\nMODEL INFO:")
+            print(f"  Model device: {self.device}")
+            if hasattr(self, 'encoder') and hasattr(self.encoder, 'parameters'):
+                try:
+                    param = next(self.encoder.parameters())
+                    print(f"  Encoder device: {param.device}")
+                    print(f"  Encoder dtype: {param.dtype}")
+                except Exception as pe:
+                    print(f"  Could not get encoder parameter info: {str(pe)}")
+            
+            # Print memory stats if available
+            if torch.cuda.is_available():
+                try:
+                    print("\nGPU MEMORY INFO:")
+                    print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+                    print(f"  Reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
+                except Exception as me:
+                    print(f"  Could not get GPU memory info: {str(me)}")
+            
+            # Re-raise the original error
+            raise

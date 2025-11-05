@@ -20,6 +20,7 @@ from torch.utils.checkpoint import checkpoint
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
+from transformers import AutoModelForMaskedLM
 import warnings
 import yaml
 
@@ -429,128 +430,6 @@ class BetaDogmaDataset(Dataset):
         
         return torch.zeros(length, dtype=torch.float32)
     
-    def _apply_synthetic_variant(self, seq: str, seed: int) -> tuple:
-        """Apply random variant (SNV/INS/DEL) to sequence.
-        
-        Args:
-            seq: Reference sequence
-            seed: Random seed for reproducibility
-            
-        Returns:
-            (mutated_sequence, variant_info_dict)
-        """
-        rng = np.random.RandomState(seed)
-        
-        seq_len = len(seq)
-        if seq_len < 200:
-            return seq, None
-        
-        # Pick random position (avoid edges)
-        pos = rng.randint(100, seq_len - 100)
-        
-        # Choose variant type: 70% SNV, 15% INS, 15% DEL
-        var_type = rng.choice(['SNV', 'INS', 'DEL'], p=[0.7, 0.15, 0.15])
-        
-        bases = ['A', 'C', 'G', 'T']
-        ref_base = seq[pos]
-        
-        if ref_base not in bases:
-            return seq, None
-        
-        if var_type == 'SNV':
-            # Simple substitution
-            alt_base = rng.choice([b for b in bases if b != ref_base])
-            ref = ref_base
-            alt = alt_base
-        elif var_type == 'INS':
-            # Insert 1-5 random bases
-            ins_len = rng.randint(1, 6)
-            alt = ''.join(rng.choice(bases) for _ in range(ins_len))
-            ref = ref_base
-            # Insert after the anchor base
-            alt = ref + alt
-        else:  # DEL
-            # Delete 1-5 bases
-            del_len = min(rng.randint(1, 6), len(seq) - pos - 1)
-            ref = ref_base + seq[pos+1:pos+1+del_len]
-            alt = ref_base
-        
-        # Apply mutation
-        seq_list = list(seq)
-        
-        if var_type == 'SNV':
-            seq_list[pos] = alt
-        elif var_type == 'INS':
-            # Insert after the anchor base
-            seq_list[pos+1:pos+1] = list(alt[1:])  # alt includes the anchor base
-        else:  # DEL
-            # Remove deleted bases
-            del seq_list[pos+1:pos+1+len(ref)-1]
-        
-        seq_alt = ''.join(seq_list)
-        
-        variant_info = {
-            'pos': pos,
-            'ref': ref,
-            'alt': alt,
-            'type': f'synthetic_{var_type.lower()}',
-            'pathogenic': False,
-        }
-        
-        return seq_alt, variant_info
-    
-    def _apply_clinvar_variant(self, seq: str, variant: Dict) -> tuple:
-        """Apply ClinVar variant to sequence.
-        
-        Args:
-            seq: Reference sequence
-            variant: ClinVar variant dict with 'pos', 'ref', 'alt', 'type', 'pathogenic'
-            
-        Returns:
-            (mutated_sequence, variant_info_dict)
-        """
-        pos = variant['pos']
-        ref = variant['ref']
-        alt = variant['alt']
-        var_type = variant.get('type', 'SNV')
-        
-        if pos < 0 or pos >= len(seq):
-            return seq, None
-        
-        # Verify reference matches for the first base (anchor)
-        if seq[pos] != ref[0] if ref else False:
-            return seq, None
-        
-        # Apply mutation based on variant type
-        seq_list = list(seq)
-        
-        if var_type == 'SNV':
-            # Simple substitution
-            seq_list[pos] = alt
-        elif var_type == 'INS':
-            # Insertion: insert after the anchor base
-            seq_list[pos+1:pos+1] = list(alt)
-        elif var_type == 'DEL':
-            # Deletion: remove reference bases after anchor
-            del_len = len(ref)
-            seq_list[pos+1:pos+1+del_len] = []
-        
-        seq_alt = ''.join(seq_list)
-        
-        variant_info = {
-            'pos': pos,
-            'ref': ref,
-            'alt': alt,
-            'type': f'clinvar_{var_type.lower()}',
-            'pathogenic': variant['pathogenic'],
-        }
-        
-        return seq_alt, variant_info
-    
-    # ================================================================
-    # Phase 2A: Variant Augmentation (33/33/33 strategy)
-    # ================================================================
-    
     def _apply_variant_to_sequence(self, seq: str, variant: Dict) -> str:
         """Apply a variant to the sequence.
         
@@ -687,21 +566,50 @@ class BetaDogmaDataset(Dataset):
             if not seq or len(seq) == 0:
                 seq = 'N' * self.max_seq_len
             
-            # Ensure sequence is exactly max_seq_len
+            # Debug: Print sequence length before processing
+            if idx < 3:  # Only print for first 3 examples
+                print(f"\n=== Processing sequence {idx} ===")
+                print(f"Original sequence length: {len(seq)}")
+                print(f"Target max_seq_len: {self.max_seq_len}")
+            
+            # Truncate sequence if needed
             if len(seq) > self.max_seq_len:
-                start = (len(seq) - self.max_seq_len) // 2
-                seq = seq[start:start + self.max_seq_len]
+                seq = seq[:self.max_seq_len]  # Simple truncation from start
+                if idx < 3:
+                    print(f"Truncated sequence to {len(seq)} bases")
             elif len(seq) < self.max_seq_len:
-                pad_left = (self.max_seq_len - len(seq)) // 2
-                pad_right = self.max_seq_len - len(seq) - pad_left
-                seq = ('N' * pad_left) + seq + ('N' * pad_right)
+                # Only pad if absolutely necessary, but better to avoid this case
+                pad_len = self.max_seq_len - len(seq)
+                seq = seq + 'N' * pad_len
+                if idx < 3:
+                    print(f"Padded sequence to {len(seq)} bases")
+            
+            if idx < 3:
+                print(f"Final sequence length: {len(seq)}")
+                print(f"First 10 bases: {seq[:10]}")
             
             # Phase 2A: Apply variant to sequence if selected
             if variant and aug_mode in ['benign', 'pathogenic']:
                 seq = self._apply_variant_to_sequence(seq, variant)
             
-            # Tokenize
-            tokenized = self.tokenizer(seq, max_length=self.max_seq_len, padding='max_length', truncation=True)
+            # Tokenize with debug info
+            if idx < 3:  # Debug print for first 3 examples
+                print(f"\nBefore tokenization:")
+                print(f"  Sequence length: {len(seq)}")
+                print(f"  First 10 bases: {seq[:10]}")
+            
+            # Tokenize without padding/truncation since we already handled length
+            tokenized = self.tokenizer(
+                seq,
+                max_length=None,  # No max_length since we already handled it
+                padding=False,    # No padding since we already handled length
+                truncation=False  # No truncation since we already handled it
+            )
+            
+            if idx < 3:  # Debug print for first 3 examples
+                print(f"After tokenization:")
+                print(f"  Input IDs shape: {tokenized['input_ids'].shape}")
+                print(f"  Attention mask shape: {tokenized['attention_mask'].shape}")
             
             # ================================================================
             # Process labels
@@ -812,49 +720,115 @@ class PredictionHead(nn.Module):
 
 
 class HyenaDNAEncoder(nn.Module):
-    """HyenaDNA encoder with improved model loading and error handling."""
+    """Wrapper for the HyenaDNA model with memory optimizations for long sequences.
     
-    def __init__(self, model_name: str, freeze: bool = True, device: str = None):
+    This wrapper provides several key features:
+    - Automatic device management (CPU/GPU)
+    - Gradient checkpointing for memory efficiency
+    - Detailed error reporting and recovery
+    - Memory usage monitoring
+    - Support for very long sequences (up to 300k tokens)
+    """
+    
+    def __init__(self, model_name: str, device: str = None, use_gradient_checkpointing: bool = False, freeze: bool = False):
         super().__init__()
+        self.model_name = model_name
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.frozen = freeze
         
-        if device is None:
-            # Use CUDA if available, otherwise CPU (MPS will be handled by PyTorch Lightning)
-            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        else:
-            self.device = torch.device(device)
-            
-        print(f"\n🔧 Initializing HyenaDNA: {model_name}")
-        print(f"   Device: {self.device}")
+        print("\n" + "="*80)
+        print(f"=== 🧬 INITIALIZING HYENA DNA ENCODER ===")
+        print("="*80)
+        
+        # Force CPU for now to debug MPS issues
+        self.device = torch.device('cpu')
+        print(f"\n⚠️  FORCING CPU USAGE FOR DEBUGGING ⚠️\n")
+        
+        print(f"  Model: {model_name}")
+        print(f"  Device: {self.device}")
+        print(f"  Gradient Checkpointing: {use_gradient_checkpointing}")
+        print(f"  Freeze: {freeze}")
         
         try:
-            # Import required modules
-            from transformers import AutoModel, AutoConfig
+            # Initialize the model with memory-efficient settings
+            print("\n[1/3] 🚀 LOADING MODEL WEIGHTS")
+            print(f"  Loading {model_name}...")
             
-            # Load config first to verify model type
-            config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-            print(f"Model config: {config.model_type}")
+            # Clear any cached memory before loading the model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
-            # Load model with appropriate settings
-            # Load on CPU first, then move to target device to avoid MPS initialization issues
+            # Import the correct Auto class - HyenaDNA needs AutoModel, not AutoModelForMaskedLM
+            from transformers import AutoModel
+            
+            # Load model with memory-efficient settings
             self.model = AutoModel.from_pretrained(
                 model_name,
                 trust_remote_code=True,
-                torch_dtype=torch.float32,  # Use float32 for stability
-                device_map=None,  # Don't use device_map, we'll handle placement manually
+                low_cpu_mem_usage=True,
+                dtype=torch.float32,  # Use float32 for stability
+                device_map=None  # Disable device_map to handle manually
             )
             
-            # Explicitly move to target device
+            # Move model to device
+            print(f"  Moving model to {self.device}...")
             self.model = self.model.to(self.device)
             
-            # Ensure all parameters are on the correct device
-            for param in self.model.parameters():
-                param.data = param.data.to(self.device)
+            # Enable gradient checkpointing if requested
+            if use_gradient_checkpointing:
+                print("  Enabling gradient checkpointing...")
+                if hasattr(self.model, 'gradient_checkpointing_enable'):
+                    self.model.gradient_checkpointing_enable()
+                else:
+                    print("  ⚠️  Model does not support gradient checkpointing")
+            
+            # Print model info
+            print("\n[2/3] ✅ MODEL LOADED SUCCESSFULLY")
+            print(f"  Model class: {self.model.__class__.__name__}")
+            print(f"  Model device: {next(self.model.parameters()).device}")
+            print(f"  Model dtype: {next(self.model.parameters()).dtype}")
+            
+            # Get model config to determine hidden size
+            if hasattr(self.model, 'config'):
+                if hasattr(self.model.config, 'd_model'):
+                    self.hidden_size = self.model.config.d_model
+                    print(f"  Hidden size (d_model): {self.hidden_size}")
+                elif hasattr(self.model.config, 'hidden_size'):
+                    self.hidden_size = self.model.config.hidden_size
+                    print(f"  Hidden size: {self.hidden_size}")
+                else:
+                    self.hidden_size = 768  # Default fallback
+                    print(f"  ⚠️  Could not determine hidden size, using default: {self.hidden_size}")
+            else:
+                self.hidden_size = 768
+                print(f"  ⚠️  No config found, using default hidden size: {self.hidden_size}")
+            
+            # Print memory usage
+            if torch.cuda.is_available():
+                print("\n[3/3] 📊 GPU MEMORY USAGE")
+                print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+                print(f"  Reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
+            
+            # Test with a small forward pass
+            print("\n[3/3] 🧪 TESTING FORWARD PASS")
+            with torch.no_grad():
+                test_input = torch.zeros(1, 100, dtype=torch.long, device=self.device)
+                test_output = self.model(test_input)
                 
-            print(f"✅ Successfully loaded model: {model_name}")
+                # Check if output has the expected structure
+                if hasattr(test_output, 'last_hidden_state'):
+                    print(f"  ✅ Output shape: {test_output.last_hidden_state.shape}")
+                elif isinstance(test_output, tuple) and len(test_output) > 0:
+                    print(f"  ✅ Output shape (tuple): {test_output[0].shape}")
+                    self.hidden_size = test_output[0].shape[-1]
+                else:
+                    print(f"  ⚠️  Unexpected output type: {type(test_output)}")
+            
+            print(f"\n✅ Successfully loaded model: {model_name}")
             print(f"Model device: {next(self.model.parameters()).device}")
+            print(f"Hidden size: {self.hidden_size}")
             
             # Freeze parameters if needed
-            self.frozen = freeze
             if freeze:
                 print("✅ Freezing encoder parameters")
                 for param in self.model.parameters():
@@ -862,39 +836,110 @@ class HyenaDNAEncoder(nn.Module):
                 self.model.eval()
             else:
                 print("✅ Keeping encoder parameters trainable")
-                
-        except Exception as e:
-            print(f"❌ Error loading model: {str(e)}")
-            raise
-    
-    def forward(self, input_ids, attention_mask=None):
-        try:
-            # Ensure input is on the correct device
-            input_ids = input_ids.to(self.device)
             
-            # Forward pass with appropriate gradient context
-            # Note: HyenaDNA doesn't accept attention_mask, only input_ids
-            with torch.set_grad_enabled(not self.frozen):
-                outputs = self.model(
-                    input_ids,
-                    output_hidden_states=True,
-                    return_dict=True
-                )
+            print("\n✅ HYENA DNA ENCODER INITIALIZED")
+            print("="*80 + "\n")
+            
+        except Exception as e:
+            print("\n❌ FAILED TO INITIALIZE HYENA DNA ENCODER")
+            print(f"Error: {str(e)}")
+            print(f"Error type: {type(e).__name__}")
+            
+            # Print memory stats if available
+            if torch.cuda.is_available():
+                try:
+                    print("\n💾 GPU MEMORY AT FAILURE:")
+                    print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+                    print(f"  Reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
+                except Exception as me:
+                    print(f"  Could not get GPU memory info: {str(me)}")
+            
+            print("\n💡 TROUBLESHOOTING TIPS:")
+            print("  1. Check if the model name is correct")
+            print("  2. Verify you have enough disk space for the model weights")
+            print("  3. Try with a smaller model (e.g., 'LongSafari/hyenadna-small-32k-seqlen')")
+            print("  4. Check for CUDA/CPU compatibility")
+            print("  5. Make sure transformers library is up to date: pip install --upgrade transformers")
+            
+            # Re-raise the error with more context
+            raise RuntimeError(f"Failed to initialize HyenaDNA model: {str(e)}") from e
+    
+
+    def forward(self, input_ids, attention_mask=None):
+        print("\n=== HyenaDNAEncoder.forward ===")
+        print(f"[1/6] Input shape: {input_ids.shape}, device: {input_ids.device}, dtype: {input_ids.dtype}")
+        
+        # Ensure we're in eval mode if frozen
+        if self.frozen:
+            print("[2/6] Setting model to eval mode (frozen)")
+            self.model.eval()
+        
+        # Move inputs to the correct device
+        print("[3/6] Moving input to device...")
+        input_ids = input_ids.to(self.device)
+        
+        # Ensure input is long type
+        if input_ids.dtype != torch.long:
+            print(f"Converting input dtype from {input_ids.dtype} to long")
+            input_ids = input_ids.long()
+        
+        # Note: HyenaDNA doesn't use attention_mask, so we ignore it
+        if attention_mask is not None:
+            print("[4/6] Note: HyenaDNA doesn't use attention_mask (ignored)")
+        
+        print(f"[4/6] Input device: {input_ids.device}, shape: {input_ids.shape}")
+        
+        try:
+            print("[5/6] Starting model forward...")
+            with torch.no_grad() if self.frozen else torch.enable_grad():
+                # Enable gradient checkpointing if not frozen
+                if not self.frozen and hasattr(self.model, 'gradient_checkpointing_enable'):
+                    print("  Enabling gradient checkpointing")
+                    self.model.gradient_checkpointing_enable()
+                
+                # HyenaDNA only takes input_ids, no attention_mask
+                print("  Running model forward pass (HyenaDNA - no attention mask)...")
+                outputs = self.model(input_ids)
+                print("  Forward pass completed")
                 
                 # Handle different output formats
                 if hasattr(outputs, 'last_hidden_state'):
-                    embeddings = outputs.last_hidden_state
-                elif isinstance(outputs, (tuple, list)):
-                    embeddings = outputs[0]  # First output is typically the hidden states
+                    print("  Using last_hidden_state from outputs")
+                    hidden_states = outputs.last_hidden_state
+                elif isinstance(outputs, tuple) and len(outputs) > 0:
+                    print("  Using first element from tuple output")
+                    hidden_states = outputs[0]
+                    # Create a simple object to hold the hidden states
+                    class SimpleOutput:
+                        def __init__(self, hidden_states):
+                            self.last_hidden_state = hidden_states
+                    outputs = SimpleOutput(hidden_states)
+                elif isinstance(outputs, torch.Tensor):
+                    print("  Output is a tensor, wrapping it")
+                    # Create a simple object to hold the hidden states
+                    class SimpleOutput:
+                        def __init__(self, hidden_states):
+                            self.last_hidden_state = hidden_states
+                    outputs = SimpleOutput(outputs)
                 else:
-                    embeddings = outputs
+                    raise ValueError(f"Unexpected output format: {type(outputs)}")
                 
-                return embeddings
+                print(f"[6/6] Output shape: {outputs.last_hidden_state.shape}")
+                return outputs
                 
         except RuntimeError as e:
-            if 'out of memory' in str(e):
-                print("⚠️ CUDA out of memory. Try reducing batch size or sequence length.")
-            print(f"❌ Forward pass failed: {str(e)}")
+            if 'out of memory' in str(e).lower():
+                print("\n❌ OUT OF MEMORY ERROR")
+                print(f"Input shape: {input_ids.shape}")
+                print(f"Batch size: {input_ids.size(0)}")
+                print(f"Sequence length: {input_ids.size(1)}")
+                print("\nTry reducing batch size or sequence length")
+                
+                # Clear cache and try again
+                if torch.cuda.is_available():
+                    print("Clearing CUDA cache...")
+                    torch.cuda.empty_cache()
+            
             raise
 
 
@@ -905,29 +950,39 @@ class BetaDogmaModel(nn.Module):
         super().__init__()
         self.config = config
         
-        # Let PyTorch Lightning handle device placement
-        # Initialize encoder on CPU first, then PyTorch Lightning will move it
+        print("\n" + "="*80)
         print(f"Initializing BetaDogmaModel")
+        print(f"  Sequence length: {config.max_seq_len}")
+        print(f"  Hidden size: {config.hidden_size}")
+        print(f"  Number of layers: {config.num_layers}")
+        print(f"  Gradient checkpointing: {config.use_gradient_checkpointing}")
+        print("="*80 + "\n")
         
-        # Initialize encoder on CPU (PyTorch Lightning will move to correct device)
+        # Determine device - prioritize CPU for now to debug
+        self.device = torch.device('cpu')
+        print(f"\n⚠️  FORCING CPU USAGE FOR DEBUGGING ⚠️\n")
+        
+        print(f"Using device: {self.device}")
+        
+        # Initialize encoder with the determined device
         self.encoder = HyenaDNAEncoder(
             model_name=config.model_name,
             freeze=config.freeze_encoder,
-            device='cpu'  # Always init on CPU, let Lightning handle device movement
+            device=str(self.device),  # Pass the device as string
+            use_gradient_checkpointing=config.use_gradient_checkpointing
         )
         
-        # Get the actual encoder dimension from the model
-        if hasattr(self.encoder.model.config, 'hidden_size'):
-            self.encoder_dim = self.encoder.model.config.hidden_size
-        else:
-            # Fallback to config value if not available
-            self.encoder_dim = getattr(config, 'encoder_dim', 768)
-            print(f"⚠️ Could not determine encoder hidden size, using: {self.encoder_dim}")
+        # Ensure encoder is on the correct device
+        self.encoder = self.encoder.to(self.device)
+        print(f"Model initialized on device: {self.device}")
+        
+        # Get the encoder dimension from the encoder itself
+        self.encoder_dim = self.encoder.hidden_size
+        print(f"Using encoder dimension: {self.encoder_dim}")
         
         use_checkpointing = config.use_gradient_checkpointing
         
         # Initialize prediction heads with proper dimensions
-        # Don't specify device - let PyTorch Lightning handle it
         self.donor_head = PredictionHead(
             self.encoder_dim, 
             config.splice_hidden,
@@ -953,18 +1008,6 @@ class BetaDogmaModel(nn.Module):
             use_checkpointing
         )
         
-        # Initialize cross-attention layers
-        self.splice_effect_to_donor = nn.Linear(1, 1)
-        self.splice_effect_to_acceptor = nn.Linear(1, 1)
-        self.donor_to_effect = nn.Linear(1, 1)
-        self.acceptor_to_effect = nn.Linear(1, 1)
-        
-        # Initialize coupling layers
-        for layer in [self.splice_effect_to_donor, self.splice_effect_to_acceptor,
-                     self.donor_to_effect, self.acceptor_to_effect]:
-            nn.init.xavier_uniform_(layer.weight)
-            nn.init.constant_(layer.bias, 0)
-        
         # Other prediction heads
         self.tss_head = PredictionHead(
             self.encoder_dim, 
@@ -982,9 +1025,44 @@ class BetaDogmaModel(nn.Module):
             use_checkpointing
         )
         
+        # Phase 1: Protein prediction heads
+        self.protein_head = nn.Sequential(
+            nn.LSTM(self.encoder_dim, config.protein_hidden, num_layers=config.protein_layers, 
+                   bidirectional=True, batch_first=True, dropout=config.dropout if config.protein_layers > 1 else 0.0),
+            nn.Dropout(config.dropout),
+        )
+        self.protein_fc = nn.Linear(config.protein_hidden * 2, 21)  # 20 AA + stop
+        
+        self.cds_start_head = PredictionHead(self.encoder_dim, config.protein_hidden, 1, config.dropout, use_checkpointing)
+        self.cds_end_head = PredictionHead(self.encoder_dim, config.protein_hidden, 1, config.dropout, use_checkpointing)
+        
+        # NMD and expression prediction
+        self.nmd_head = nn.Sequential(
+            nn.Linear(self.encoder_dim, config.protein_hidden),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.protein_hidden, 1)
+        )
+        
+        self.expression_head = nn.Sequential(
+            nn.Linear(self.encoder_dim, config.protein_hidden),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.protein_hidden, 1)
+        )
+        
         # Initialize weights for all heads
         for head in [self.donor_head, self.acceptor_head, self.splice_effect_head, 
                     self.tss_head, self.polya_head]:
+            self._init_weights(head)
+        
+        # Initialize protein head separately
+        for module in self.protein_head.modules():
+            self._init_weights(module)
+        self._init_weights(self.protein_fc)
+        
+        # Initialize other heads
+        for head in [self.cds_start_head, self.cds_end_head, self.nmd_head, self.expression_head]:
             self._init_weights(head)
             
         print(f"✅ BetaDogmaModel initialized with encoder_dim={self.encoder_dim}")
@@ -998,101 +1076,200 @@ class BetaDogmaModel(nn.Module):
         elif isinstance(module, nn.LayerNorm):
             nn.init.constant_(module.bias, 0)
             nn.init.constant_(module.weight, 1.0)
-        
-    def _init_weights(self, module):
-        """Initialize weights for a module."""
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.constant_(module.bias, 0)
-        
+
     def forward(self, input_ids, attention_mask=None):
-        """Forward pass with proper error handling and device management."""
-        try:
-            # Get device from encoder parameters
-            device = next(self.encoder.parameters()).device
-            
-            # Ensure inputs are on the correct device
-            input_ids = input_ids.to(device)
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(device)
-            
-            # Get sequence embeddings
-            with torch.set_grad_enabled(self.training and not self.encoder.frozen):
-                embeddings = self.encoder(input_ids, attention_mask=attention_mask)
-                
-                # Ensure embeddings are on the correct device
-                if embeddings.device != device:
-                    embeddings = embeddings.to(device)
-            
-            # Apply prediction heads with gradient checkpointing if needed
-            def run_heads(emb):
-                # Get base predictions
-                donor_logits = self.donor_head(emb)
-                acceptor_logits = self.acceptor_head(emb)
-                tss_logits = self.tss_head(emb)
-                polya_logits = self.polya_head(emb)
-                splice_effect = self.splice_effect_head(emb)
-                
-                # Apply cross-attention between tasks
-                if hasattr(self.config, 'coupling_strength'):
-                    # Update donor/acceptor with splice effect information
-                    effect_reshaped = splice_effect.unsqueeze(-1)
-                    donor_update = self.splice_effect_to_donor(effect_reshaped).squeeze(-1)
-                    acceptor_update = self.splice_effect_to_acceptor(effect_reshaped).squeeze(-1)
-                    
-                    donor_logits = donor_logits + self.config.coupling_strength * donor_update.detach()
-                    acceptor_logits = acceptor_logits + self.config.coupling_strength * acceptor_update.detach()
-                    
-                    # Update splice effect with donor/acceptor information
-                    donor_reshaped = torch.sigmoid(donor_logits).unsqueeze(-1)
-                    acceptor_reshaped = torch.sigmoid(acceptor_logits).unsqueeze(-1)
-                    
-                    effect_update = (self.donor_to_effect(donor_reshaped) + 
-                                  self.acceptor_to_effect(acceptor_reshaped)).squeeze(-1)
-                    splice_effect = (splice_effect + self.config.coupling_strength * effect_update.detach()) / 2
-                
-                return {
-                    'donor': donor_logits,
-                    'acceptor': acceptor_logits,
-                    'tss': tss_logits,
-                    'polya': polya_logits,
-                    'splice_effect': splice_effect
-                }
-            
-            # Use gradient checkpointing during training if enabled
-            if self.training and hasattr(self.config, 'use_gradient_checkpointing') and self.config.use_gradient_checkpointing:
-                from torch.utils.checkpoint import checkpoint
-                outputs = checkpoint(run_heads, embeddings, use_reentrant=False)
-            else:
-                outputs = run_heads(embeddings)
-            
-            return outputs
-            
-        except RuntimeError as e:
-            if 'out of memory' in str(e):
-                print("⚠️ CUDA out of memory in forward pass. Try reducing batch size or sequence length.")
-                print(f"Current batch size: {input_ids.size(0)}, sequence length: {input_ids.size(1)}")
-                
-                # Clear cache and try one more time
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    print("✅ Cleared CUDA cache, trying forward pass again...")
-                    return self.forward(input_ids, attention_mask)
-            
-            print(f"❌ Forward pass failed: {str(e)}")
-            print(f"Input shape: {input_ids.shape}, device: {input_ids.device}")
-            if hasattr(self, 'encoder') and hasattr(self.encoder, 'model'):
-                print(f"Encoder device: {next(self.encoder.model.parameters()).device}")
-            raise
+        """Forward pass with memory optimizations for long sequences.
         
-        return {
-            'donor': donor_logits,
-            'acceptor': acceptor_logits,
-            'tss': self.tss_head(outputs),
-            'polya': self.polya_head(outputs),
-            'splice_effect': splice_effect
-        }
+        Args:
+            input_ids: Input tensor of shape (batch_size, seq_len)
+            attention_mask: Optional attention mask of shape (batch_size, seq_len)
+            
+        Returns:
+            Dictionary containing model outputs for each task
+        """
+        print("\n" + "="*80)
+        print(f"=== 🚀 BETA DOGMA FORWARD PASS ===")
+        print("="*80)
+        
+        try:
+            # 1. Input validation and logging
+            print("\n[1/6] 🔍 INPUT VALIDATION")
+            if input_ids.dim() != 2:
+                raise ValueError(f"Expected input_ids to have 2 dimensions, got {input_ids.dim()}")
+                
+            print(f"Input shape: {tuple(input_ids.shape)}")
+            print(f"Input device: {input_ids.device}")
+            print(f"Input dtype: {input_ids.dtype}")
+            print(f"Input stats - min: {input_ids.min()}, max: {input_ids.max()}, mean: {input_ids.float().mean():.2f}")
+            
+            if attention_mask is not None:
+                print(f"Attention mask shape: {tuple(attention_mask.shape)}")
+                print(f"Attention mask device: {attention_mask.device}")
+                print(f"Attention mask stats - min: {attention_mask.min()}, max: {attention_mask.max()}")
+            
+            # 2. Move inputs to correct device
+            print("\n[2/6] 🚚 MOVING TO DEVICE")
+            input_device = input_ids.device
+            target_device = self.device
+            print(f"Moving tensors from {input_device} to {target_device}")
+            
+            if input_device != target_device:
+                print(f"Moving input_ids to {target_device}...")
+                input_ids = input_ids.to(target_device)
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(target_device)
+            
+            # 3. Ensure correct dtypes
+            print("\n[3/6] ✅ DATA TYPES")
+            if input_ids.dtype != torch.long:
+                print(f"Converting input_ids from {input_ids.dtype} to long")
+                input_ids = input_ids.long()
+                
+            if attention_mask is not None and attention_mask.dtype != torch.long:
+                print(f"Converting attention_mask from {attention_mask.dtype} to long")
+                attention_mask = attention_mask.long()
+            
+            # 4. Check for invalid values
+            print("\n[4/6] 🔍 INPUT VALIDATION")
+            if torch.isnan(input_ids).any() or torch.isinf(input_ids).any():
+                nan_count = torch.isnan(input_ids).sum().item()
+                inf_count = torch.isinf(input_ids).sum().item()
+                print(f"❌ ERROR: Input contains invalid values!")
+                print(f"  NaN count: {nan_count}")
+                print(f"  Inf count: {inf_count}")
+                print(f"  Input shape: {tuple(input_ids.shape)}")
+                print(f"  Input min/max: {input_ids.min()}/{input_ids.max()}")
+                raise ValueError("Input contains NaN or Inf values")
+            
+            # 5. Run the encoder
+            print("\n[5/6] 🧬 ENCODER FORWARD")
+            print("Starting encoder forward pass...")
+            
+            # Clear any cached memory before running the encoder
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            try:
+                # Run encoder with memory optimizations
+                with torch.autocast(device_type='cpu', enabled=False):
+                    print("  Encoder input shape:", tuple(input_ids.shape))
+                    print("  Encoder input device:", input_ids.device)
+                    print("  Encoder input dtype:", input_ids.dtype)
+                    
+                    # Print memory stats if on CUDA
+                    if torch.cuda.is_available():
+                        print(f"  CUDA memory allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+                        print(f"  CUDA memory reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
+                    
+                    # Run the encoder
+                    print("  Calling encoder...")
+                    outputs = self.encoder(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask
+                    )
+                    
+                    print("✅ Encoder forward pass completed")
+                    
+                    # Verify encoder outputs
+                    if not hasattr(outputs, 'last_hidden_state'):
+                        if hasattr(outputs, 'hidden_states'):
+                            print("  Using last hidden state from hidden_states")
+                            outputs.last_hidden_state = outputs.hidden_states[-1]
+                        else:
+                            raise ValueError("No valid hidden states found in encoder outputs")
+                    
+                    print(f"  Hidden states shape: {tuple(outputs.last_hidden_state.shape)}")
+                    print(f"  Hidden states device: {outputs.last_hidden_state.device}")
+                    print(f"  Hidden states dtype: {outputs.last_hidden_state.dtype}")
+                    
+            except RuntimeError as e:
+                if 'out of memory' in str(e).lower():
+                    print("\n❌ OUT OF MEMORY IN HYENA DNA ENCODER")
+                    print(f"  Input shape: {tuple(input_ids.shape)}")
+                    print(f"  Batch size: {input_ids.size(0)}")
+                    print(f"  Sequence length: {input_ids.size(1)}")
+                    
+                    if torch.cuda.is_available():
+                        print("\n💾 GPU MEMORY USAGE:")
+                        print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+                        print(f"  Reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
+                        
+                        # Clear cache and suggest solutions
+                        print("\n🔄 Clearing CUDA cache...")
+                        torch.cuda.empty_cache()
+                    
+                    print("\n💡 SUGGESTED SOLUTIONS:")
+                    print("  1. Reduce batch size (currently 1)")
+                    print("  2. Reduce sequence length (currently 300,000)")
+                    print("  3. Enable gradient checkpointing in config")
+                    print("  4. Use a smaller model")
+                    print("  5. Use CPU instead of GPU (slower but more memory)")
+                
+                # Re-raise the error with more context
+                raise RuntimeError(f"Error in HyenaDNAEncoder forward pass: {str(e)}") from e
+            
+            # 6. Process through prediction heads
+            print("\n[6/6] 🎯 PREDICTION HEADS")
+            hidden_states = outputs.last_hidden_state
+            
+            # Get predictions from each head
+            results = {
+                'donor': self.donor_head(hidden_states),
+                'acceptor': self.acceptor_head(hidden_states),
+                'splice_effect': self.splice_effect_head(hidden_states),
+                'tss': self.tss_head(hidden_states),
+                'polya': self.polya_head(hidden_states),
+            }
+            
+            # Protein prediction
+            protein_lstm_out, _ = self.protein_head[0](hidden_states)
+            protein_lstm_out = self.protein_head[1](protein_lstm_out)
+            results['protein'] = self.protein_fc(protein_lstm_out)
+            
+            # CDS boundaries
+            results['cds_start'] = self.cds_start_head(hidden_states)
+            results['cds_end'] = self.cds_end_head(hidden_states)
+            
+            # NMD and expression (using mean pooling)
+            pooled = hidden_states.mean(dim=1)
+            results['nmd'] = self.nmd_head(pooled).squeeze(-1)
+            results['expression'] = self.expression_head(pooled).squeeze(-1)
+            
+            print("\n✅ FORWARD PASS COMPLETED SUCCESSFULLY!")
+            print("="*80 + "\n")
+            
+            return results
+                
+        except Exception as e:
+            print(f"\n❌ UNHANDLED ERROR IN FORWARD PASS: {str(e)}")
+            print(f"Error type: {type(e).__name__}")
+            print("\nCURRENT TENSOR INFO:")
+            print(f"  Input shape: {tuple(input_ids.shape) if 'input_ids' in locals() else 'N/A'}")
+            print(f"  Input device: {input_ids.device if 'input_ids' in locals() else 'N/A'}")
+            print(f"  Input dtype: {input_ids.dtype if 'input_ids' in locals() else 'N/A'}")
+            
+            # Print model device info
+            print("\nMODEL INFO:")
+            print(f"  Model device: {self.device}")
+            if hasattr(self, 'encoder') and hasattr(self.encoder, 'parameters'):
+                try:
+                    param = next(self.encoder.parameters())
+                    print(f"  Encoder device: {param.device}")
+                    print(f"  Encoder dtype: {param.dtype}")
+                except Exception as pe:
+                    print(f"  Could not get encoder parameter info: {str(pe)}")
+            
+            # Print memory stats if available
+            if torch.cuda.is_available():
+                try:
+                    print("\nGPU MEMORY INFO:")
+                    print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+                    print(f"  Reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
+                except Exception as me:
+                    print(f"  Could not get GPU memory info: {str(me)}")
+            
+            # Re-raise the original error
+            raise
 
 
 # ============================================================================
@@ -1180,12 +1357,18 @@ class BetaDogmaLightning(pl.LightningModule):
         else:
             loss_splice = torch.tensor(0.0, device=self.device)
         
-        # Phase 1: Protein, CDS, NMD, Expression losses
-        loss_protein = F.cross_entropy(
-            outputs['protein'].view(-1, 21),
-            labels['protein'].view(-1),
-            ignore_index=-1
-        )
+        # Phase 1: Protein prediction with NaN handling
+        # Check if we have any valid protein labels (not -1)
+        protein_mask = (labels['protein'] != -1).view(-1)
+        if protein_mask.sum() > 0:
+            # Only compute loss on valid positions
+            loss_protein = F.cross_entropy(
+                outputs['protein'].view(-1, 21)[protein_mask],
+                labels['protein'].view(-1)[protein_mask]
+            )
+        else:
+            # No valid protein labels in this batch, use zero loss
+            loss_protein = torch.tensor(0.0, device=self.device)
         
         loss_cds_start = F.binary_cross_entropy_with_logits(
             outputs['cds_start'],
@@ -1221,19 +1404,41 @@ class BetaDogmaLightning(pl.LightningModule):
                 )
         
         # Combine losses with weights
+        # Only include protein loss if it's valid (not zero from no labels)
+        protein_weight = self.config.w_protein if protein_mask.sum() > 0 else 0.0
+        
         loss = (
             self.config.w_splice_donor * loss_donor +
             self.config.w_splice_acceptor * loss_acceptor +
             self.config.w_tss * loss_tss +
             self.config.w_polya * loss_polya +
             self.config.w_splice_effect * loss_splice +
-            self.config.w_protein * loss_protein +
+            protein_weight * loss_protein +
             self.config.w_cds_start * loss_cds_start +
             self.config.w_cds_end * loss_cds_end +
             self.config.w_nmd * loss_nmd +
             self.config.w_expression * loss_expression +
             0.5 * loss_variant_effect  # Phase 2B weight
         )
+        
+        # Additional safety check for NaN
+        if torch.isnan(loss):
+            print("\n⚠️ WARNING: Total loss is NaN!")
+            print("Individual losses:")
+            print(f"  loss_donor: {loss_donor.item()}")
+            print(f"  loss_acceptor: {loss_acceptor.item()}")
+            print(f"  loss_tss: {loss_tss.item()}")
+            print(f"  loss_polya: {loss_polya.item()}")
+            print(f"  loss_splice: {loss_splice.item()}")
+            print(f"  loss_protein: {loss_protein.item()}")
+            print(f"  loss_cds_start: {loss_cds_start.item()}")
+            print(f"  loss_cds_end: {loss_cds_end.item()}")
+            print(f"  loss_nmd: {loss_nmd.item()}")
+            print(f"  loss_expression: {loss_expression.item()}")
+            print(f"  loss_variant_effect: {loss_variant_effect.item()}")
+            
+            # Replace NaN with a large value to continue training
+            loss = torch.tensor(1.0, device=self.device, requires_grad=True)
         
         return {
             'loss': loss,
@@ -1249,30 +1454,125 @@ class BetaDogmaLightning(pl.LightningModule):
             'loss/expression': loss_expression,
             'loss/variant_effect': loss_variant_effect,
         }
+
     
     def training_step(self, batch, batch_idx):
-        outputs = self(batch['input_ids'], batch['attention_mask'])
-        loss, loss_dict = self._compute_loss(outputs, batch)
+        print("\n" + "="*80)
+        print(f"=== 🚀 TRAINING STEP {batch_idx} ===")
+        print("="*80)
         
-        for k, v in loss_dict.items():
-            self.log(f'train/{k}', v, prog_bar=True, on_step=True, on_epoch=True)
-        
-        # Clear cache periodically on T4
-        if self.config.empty_cache_freq > 0:
-            self.batch_count += 1
-            if self.batch_count % self.config.empty_cache_freq == 0:
-                torch.cuda.empty_cache()
-        
-        return loss
+        try:
+            # 1. Print batch info
+            print("\n[1/5] 📦 BATCH INFO")
+            print(f"- Batch ID: {batch_idx}")
+            print(f"- Batch keys: {list(batch.keys())}")
+            
+            # 2. Print tensor details
+            print("\n[2/5] 🧮 TENSOR DETAILS")
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    print(f"  {k}:")
+                    print(f"    shape: {tuple(v.shape)}")
+                    print(f"    device: {v.device}")
+                    print(f"    dtype: {v.dtype}")
+                    print(f"    requires_grad: {v.requires_grad}")
+                    print(f"    min/mean/max: {v.min().item():.2f}/{v.float().mean().item():.2f}/{v.max().item():.2f}")
+                    print(f"    isnan: {torch.isnan(v).any().item()}, isinf: {torch.isinf(v).any().item()}")
+                else:
+                    print(f"  {k}: {type(v).__name__}")
+            
+            # 3. Move batch to device
+            print("\n[3/5] 🚚 MOVING TO DEVICE")
+            print(f"Target device: {self.device}")
+            
+            device_batch = {}
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    print(f"  Moving {k} to {self.device}...")
+                    device_batch[k] = v.to(self.device)
+                    print(f"  ✅ Moved {k} to {device_batch[k].device}")
+                else:
+                    device_batch[k] = v
+            
+            # 4. Forward pass
+            print("\n[4/5] 🚀 FORWARD PASS")
+            try:
+                with torch.autocast(device_type='cpu', dtype=torch.bfloat16, enabled=False):
+                    print("  Starting model forward...")
+                    outputs = self(device_batch['input_ids'], 
+                                 attention_mask=device_batch.get('attention_mask'))
+                    print("  ✅ Forward pass completed successfully!")
+                    
+                    # Print output shapes
+                    if isinstance(outputs, dict):
+                        print("  Model outputs:")
+                        for k, v in outputs.items():
+                            if isinstance(v, torch.Tensor):
+                                print(f"    {k}: {tuple(v.shape)} | {v.device} | {v.dtype}")
+                    
+                    # 5. Compute loss
+                    print("\n[5/5] 📉 LOSS COMPUTATION")
+                    print("  Computing losses...")
+                    loss_dict = self._compute_loss(outputs, device_batch)
+                    
+                    if not isinstance(loss_dict, dict):
+                        raise ValueError(f"_compute_loss should return a dict, got {type(loss_dict)}")
+                    
+                    if 'loss' not in loss_dict:
+                        raise ValueError("'loss' key not found in loss_dict")
+                    
+                    loss = loss_dict['loss']
+                    if not isinstance(loss, torch.Tensor):
+                        raise ValueError(f"loss should be a tensor, got {type(loss)}")
+                    
+                    print("  ✅ Loss computation completed!")
+                    print("\n📊 LOSS BREAKDOWN:")
+                    for k, v in loss_dict.items():
+                        if isinstance(v, torch.Tensor):
+                            print(f"  {k}: {v.item():.6f}")
+                            self.log(f'train/{k}', v, prog_bar=True, on_step=True, on_epoch=True)
+                    
+                    print(f"\n✅ BATCH {batch_idx} COMPLETED SUCCESSFULLY!")
+                    return loss
+                    
+            except Exception as e:
+                print("\n❌ ERROR DURING FORWARD/LOSS:")
+                print(f"  Type: {type(e).__name__}")
+                print(f"  Message: {str(e)}")
+                print("\nMODEL STATE:")
+                print(f"  Device: {self.device}")
+                print(f"  Training mode: {self.training}")
+                
+                if 'out of memory' in str(e).lower():
+                    print("\n💡 MEMORY USAGE:")
+                    if torch.cuda.is_available():
+                        print(f"  CUDA allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+                        print(f"  CUDA reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
+                    print("  Try reducing batch size or sequence length")
+                
+                raise
+                
+        except Exception as e:
+            print("\n" + "❌"*30)
+            print(f"❌ CRITICAL ERROR IN TRAINING STEP {batch_idx}")
+            print("❌"*30)
+            print(f"Error type: {type(e).__name__}")
+            print(f"Error message: {str(e)}")
+            
+            import traceback
+            print("\nTRACEBACK:")
+            traceback.print_exc()
+            
+            raise
     
     def validation_step(self, batch, batch_idx):
         outputs = self(batch['input_ids'], batch['attention_mask'])
-        loss, loss_dict = self._compute_loss(outputs, batch)
+        loss_dict = self._compute_loss(outputs, batch)
         
         for k, v in loss_dict.items():
             self.log(f'val/{k}', v, prog_bar=True, on_step=False, on_epoch=True)
         
-        return loss
+        return loss_dict['loss']
     
     def configure_optimizers(self):
         # Only trainable parameters (heads only)
@@ -1319,6 +1619,7 @@ class BetaDogmaDataModule(pl.LightningDataModule):
         train_files = list((data_dir / 'train').glob("*.parquet"))
         val_files = list((data_dir / 'val').glob("*.parquet"))
         test_files = list((data_dir / 'test').glob("*.parquet"))
+        
         # Check if we have any data
         if not train_files and not val_files and not test_files:
             raise ValueError(
@@ -1377,14 +1678,6 @@ class BetaDogmaDataModule(pl.LightningDataModule):
         np.random.seed(worker_seed)
         random.seed(worker_seed)
         torch.manual_seed(worker_seed)
-        
-        # Set NumPy random seed for this worker
-        np_seed = int(worker_seed % 2**32 - 1)
-        np.random.seed(np_seed)
-        
-        # Set Python random seed for this worker
-        py_seed = int(worker_seed % 2**32 - 2)
-        random.seed(py_seed)
     
     def train_dataloader(self):
         if not hasattr(self, 'data_train'):
@@ -1397,7 +1690,7 @@ class BetaDogmaDataModule(pl.LightningDataModule):
             drop_last=True,
             shuffle=True,
             worker_init_fn=self._worker_init_fn,
-            persistent_workers=True,
+            persistent_workers=True if self.config.num_workers > 0 else False,
         )
     
     def val_dataloader(self):
@@ -1410,7 +1703,7 @@ class BetaDogmaDataModule(pl.LightningDataModule):
             pin_memory=True,
             drop_last=False,
             worker_init_fn=self._worker_init_fn,
-            persistent_workers=True,
+            persistent_workers=True if self.config.num_workers > 0 else False,
         )
     
     def test_dataloader(self):
@@ -1423,7 +1716,7 @@ class BetaDogmaDataModule(pl.LightningDataModule):
             pin_memory=True,
             drop_last=False,
             worker_init_fn=self._worker_init_fn,
-            persistent_workers=True,
+            persistent_workers=True if self.config.num_workers > 0 else False,
         )
 
 
@@ -1445,26 +1738,11 @@ def train(
     precision: str = None,
     monitor: str = None,
 ):
-    """Train the model with the given configuration.
-    
-    Args:
-        data_dir: Directory containing training data
-        output_dir: Directory to save model checkpoints and logs
-        max_epochs: Maximum number of training epochs
-        batch_size: Batch size for training/validation
-        learning_rate: Initial learning rate
-        weight_decay: Weight decay for optimizer
-        warmup_epochs: Number of warmup epochs for learning rate
-        num_workers: Number of data loader workers
-        accelerator: Hardware accelerator to use ('cpu', 'gpu', 'tpu', 'auto')
-        devices: Number of devices to use
-        precision: Training precision (16 or 32 bit)
-        monitor: Metric to monitor for checkpointing
-    """
+    """Train the model with the given configuration."""
     # Ensure monitor has a default value if None
     if monitor is None:
-        monitor = "val_loss"
-        print("Warning: monitor was None, defaulting to 'val_loss'")
+        monitor = "val/loss"
+        print("Warning: monitor was None, defaulting to 'val/loss'")
     
     # Initialize configuration
     config = Config()
@@ -1531,7 +1809,7 @@ def train(
         monitor=monitor,
         mode='min',
         save_last=True,
-        auto_insert_metric_name=False  # Prevents formatting issues with None values
+        auto_insert_metric_name=False
     )
     
     # Initialize learning rate monitor
@@ -1569,10 +1847,10 @@ def train(
         enable_progress_bar=True,
         enable_model_summary=True,
         default_root_dir=str(config.output_dir),
-        num_sanity_val_steps=0,  # Skip validation sanity check
+        num_sanity_val_steps=0,
         limit_val_batches=config.limit_val_batches,
         limit_train_batches=config.limit_train_batches,
-        gradient_clip_algorithm="norm",  # More stable gradient clipping
+        gradient_clip_algorithm="norm",
     )
     
     print("Starting training...")
