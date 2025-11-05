@@ -16,38 +16,64 @@ data:
   gtex_sample_min: 50
   use_multiprocessing: false
   data_dir: "data/processed"
+  cache_dir: "data/cache"
 
 model:
-  name: "LongSafari/hyenadna-medium-450k-seqlen-hf"  # or another HyenaDNA model name
-  hidden_size: 768                     # Hidden size for the model
-  num_layers: 24                       # Number of transformer layers
-  max_seq_len: 10000                   # Maximum sequence length for model input
-  use_gradient_checkpointing: true     # Whether to use gradient checkpointing
-  freeze_encoder: true                 # Whether to freeze the encoder weights
-
-output:
-  output_dir: "output"
-  checkpoint_dir: "output/checkpoints"
-  log_dir: "output/logs"
+  name: "LongSafari/hyenadna-medium-450k-seqlen-hf"
+  hidden_size: 256
+  num_layers: 4
+  max_seq_len: 300000  # Start conservative for MPS (was 300000)
+  
+  # Smaller prediction heads for MPS memory efficiency
+  splice_hidden: 64   # Was 128
+  tss_hidden: 32      # Was 64
+  polya_hidden: 32    # Was 64
+  protein_hidden: 64  # Was 256
+  
+  # Memory optimization - Aggressive for MPS
+  use_gradient_checkpointing: true
+  encoder_chunk_size: 300000  # Match max_seq_len
+  prediction_chunk_size: 300000  # Smaller chunks (25k instead of 50k)
+  chunk_overlap: 1000  # 1kb overlap
+  auto_chunk: true  # Automatically decide chunking strategy
 
 training:
-  train_chromosomes: ["chr1"]  # Only use chr1 for testing
-  val_chromosomes: ["chr20"]   # Only use chr20 for validation
-  test_chromosomes: ["chrX"]   # Only use chrX for testing
-  batch_size: 1                   # Minimal batch size
-  accumulate_grad_batches: 1      # No gradient accumulation
-  learning_rate: 5.0e-5
+  # Data loading
+  batch_size: 1  # Keep at 1 for very long sequences
+  num_workers: 4
+  limit_val_batches: 10
+  limit_train_batches: 180
+  
+  # Optimization
+  learning_rate: 1.0e-4
   weight_decay: 0.01
-  max_epochs: 1                   # Only 1 epoch for testing
-  precision: "32"                 # Use full precision for stability
+  max_epochs: 10
   gradient_clip_val: 1.0
-  limit_train_batches: 0.01       # Only use 1% of training data
-  limit_val_batches: 0.01         # Only use 1% of validation data
-  num_workers: 1                  # Single worker for debugging
-  devices: 1                      # Single device
-  save_top_k: 0                   # Don't save checkpoints during testing
-  monitor: "val/loss"
+  accumulate_grad_batches: 32  # Large accumulation for MPS (was 8)
+  
+  # Performance and precision
+  precision: "16-mixed"  # Use full precision on MPS (mixed precision can be buggy)
+  devices: 1  # MPS only supports 1 device
+  compile_model: false  # Set to true for torch.compile speedup (disable for debugging)
+  
+  # Logging
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  verbose_batches: false  # Set to true to see detailed batch info during training
+  
+  # Checkpointing
+  save_top_k: 3
+  monitor: "val/loss/total"
   mode: "min"
   patience: 5
-  max_seq_len: 10000              # Reduced sequence length for testing
-  empty_cache_freq: 10            # Clear cache every 10 batches
+  
+  # Encoder
+  freeze_encoder: true  # Freeze HyenaDNA encoder weights
+
+output:
+  output_dir: "outputs"
+  log_dir: "logs"
+  checkpoint_dir: "checkpoints"
+
+# GPU Configuration (auto-detected)
+gpu:
+  empty_cache_freq: 1  # Clear cache every N batches
