@@ -23,7 +23,7 @@ data/junctions/
 data/reference/
 data/variants/
 data/processed/
-output/
+outputs/
 train/runs
 poetry.lock
 ./poetry.lock

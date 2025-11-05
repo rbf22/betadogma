@@ -4,6 +4,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import logging
+from torchmetrics import AUROC
 
 from config import Config
 from model.model import BetaDogmaModel
@@ -28,6 +29,15 @@ class BetaDogmaLightning(pl.LightningModule):
         
         # Add loss function for splice effect (regression)
         self.splice_effect_loss = nn.MSELoss()
+        
+        # Add AUROC metrics for binary classification tasks
+        self.auroc_donor = AUROC(task='binary')
+        self.auroc_acceptor = AUROC(task='binary')
+        self.auroc_tss = AUROC(task='binary')
+        self.auroc_polya = AUROC(task='binary')
+        self.auroc_cds_start = AUROC(task='binary')
+        self.auroc_cds_end = AUROC(task='binary')
+        self.auroc_nmd = AUROC(task='binary')
         
         self.batch_count = 0
     
@@ -226,6 +236,33 @@ class BetaDogmaLightning(pl.LightningModule):
                 if isinstance(v, torch.Tensor):
                     self.log(f'train/{k}', v, prog_bar=True, on_step=True, on_epoch=True)
             
+            # Compute and log AUROC metrics
+            try:
+                labels = batch['labels']
+                self.auroc_donor.update(torch.sigmoid(outputs['donor']).detach(), labels['donor'].detach().long())
+                self.log('train/auroc/donor', self.auroc_donor, on_step=False, on_epoch=True)
+                self.auroc_acceptor.update(torch.sigmoid(outputs['acceptor']).detach(), labels['acceptor'].detach().long())
+                self.log('train/auroc/acceptor', self.auroc_acceptor, on_step=False, on_epoch=True)
+                self.auroc_tss.update(torch.sigmoid(outputs['tss']).detach(), labels['tss'].detach().long())
+                self.log('train/auroc/tss', self.auroc_tss, on_step=False, on_epoch=True)
+                self.auroc_polya.update(torch.sigmoid(outputs['polya']).detach(), labels['polya'].detach().long())
+                self.log('train/auroc/polya', self.auroc_polya, on_step=False, on_epoch=True)
+                self.auroc_cds_start.update(torch.sigmoid(outputs['cds_start']).detach(), labels['cds_start'].detach().long())
+                self.log('train/auroc/cds_start', self.auroc_cds_start, on_step=False, on_epoch=True)
+                self.auroc_cds_end.update(torch.sigmoid(outputs['cds_end']).detach(), labels['cds_end'].detach().long())
+                self.log('train/auroc/cds_end', self.auroc_cds_end, on_step=False, on_epoch=True)
+                self.auroc_nmd.update(torch.sigmoid(outputs['nmd']).detach(), labels['nmd'].detach().long())
+                self.log('train/auroc/nmd', self.auroc_nmd, on_step=False, on_epoch=True)
+            except Exception as e:
+                logger.debug(f"Could not compute AUROC metrics: {e}")
+            
+            # Log learning rate
+            try:
+                current_lr = self.trainer.optimizers[0].param_groups[0]['lr']
+                self.log('train/learning_rate', current_lr, on_step=True, on_epoch=False)
+            except Exception as e:
+                logger.debug(f"Could not log learning rate: {e}")
+            
             return loss
                     
         except Exception as e:
@@ -235,11 +272,126 @@ class BetaDogmaLightning(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         outputs = self(batch['input_ids'], batch['attention_mask'])
         loss_dict = self._compute_loss(outputs, batch)
+        labels = batch['labels']
         
         for k, v in loss_dict.items():
             self.log(f'val/{k}', v, prog_bar=True, on_step=False, on_epoch=True)
         
+        # Compute and log validation AUROC metrics
+        try:
+            self.auroc_donor.update(torch.sigmoid(outputs['donor']).detach(), labels['donor'].detach().long())
+            self.log('val/auroc/donor', self.auroc_donor, on_step=False, on_epoch=True)
+            self.auroc_acceptor.update(torch.sigmoid(outputs['acceptor']).detach(), labels['acceptor'].detach().long())
+            self.log('val/auroc/acceptor', self.auroc_acceptor, on_step=False, on_epoch=True)
+            self.auroc_tss.update(torch.sigmoid(outputs['tss']).detach(), labels['tss'].detach().long())
+            self.log('val/auroc/tss', self.auroc_tss, on_step=False, on_epoch=True)
+            self.auroc_polya.update(torch.sigmoid(outputs['polya']).detach(), labels['polya'].detach().long())
+            self.log('val/auroc/polya', self.auroc_polya, on_step=False, on_epoch=True)
+            self.auroc_cds_start.update(torch.sigmoid(outputs['cds_start']).detach(), labels['cds_start'].detach().long())
+            self.log('val/auroc/cds_start', self.auroc_cds_start, on_step=False, on_epoch=True)
+            self.auroc_cds_end.update(torch.sigmoid(outputs['cds_end']).detach(), labels['cds_end'].detach().long())
+            self.log('val/auroc/cds_end', self.auroc_cds_end, on_step=False, on_epoch=True)
+            self.auroc_nmd.update(torch.sigmoid(outputs['nmd']).detach(), labels['nmd'].detach().long())
+            self.log('val/auroc/nmd', self.auroc_nmd, on_step=False, on_epoch=True)
+        except Exception as e:
+            logger.debug(f"Could not compute validation AUROC metrics: {e}")
+        
         return loss_dict['loss']
+    
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """Log memory usage, histograms, and clean up after each batch."""
+        try:
+            # Log memory usage EVERY batch
+            if torch.backends.mps.is_available():
+                try:
+                    mps_allocated = torch.mps.current_allocated_memory() / (1024**3)
+                    self.log('system/mps_memory_gb', mps_allocated, on_step=True, on_epoch=False)
+                    if mps_allocated > 20.0:
+                        logger.warning(f"MPS memory high: {mps_allocated:.2f} GB / 27.20 GB")
+                except Exception as e:
+                    logger.debug(f"Could not log MPS memory: {e}")
+            
+            if torch.cuda.is_available():
+                try:
+                    cuda_allocated = torch.cuda.memory_allocated() / (1024**3)
+                    cuda_reserved = torch.cuda.memory_reserved() / (1024**3)
+                    self.log('system/cuda_memory_allocated_gb', cuda_allocated, on_step=True, on_epoch=False)
+                    self.log('system/cuda_memory_reserved_gb', cuda_reserved, on_step=True, on_epoch=False)
+                except Exception as e:
+                    logger.debug(f"Could not log CUDA memory: {e}")
+            
+            # Log prediction, weight, and gradient histograms every 100 batches
+            if batch_idx % 100 == 0 and self.logger:
+                try:
+                    if isinstance(outputs, dict):
+                        for name, pred in outputs.items():
+                            if isinstance(pred, torch.Tensor) and pred.numel() > 0:
+                                try:
+                                    self.logger.experiment.add_histogram(f'predictions/{name}', pred.detach().cpu(), self.global_step)
+                                except Exception as e:
+                                    logger.debug(f"Could not log histogram for {name}: {e}")
+                    
+                    for name, param in self.named_parameters():
+                        if param.requires_grad and param.numel() > 0:
+                            try:
+                                self.logger.experiment.add_histogram(f'weights/{name}', param.detach().cpu(), self.global_step)
+                                if param.grad is not None and param.grad.numel() > 0:
+                                    self.logger.experiment.add_histogram(f'gradients/{name}', param.grad.detach().cpu(), self.global_step)
+                            except Exception as e:
+                                logger.debug(f"Could not log histogram for {name}: {e}")
+                except Exception as e:
+                    logger.debug(f"Could not log histograms: {e}")
+            
+            # Flush TensorBoard after every batch
+            if self.logger and hasattr(self.logger, 'experiment'):
+                try:
+                    self.logger.experiment.flush()
+                except Exception as e:
+                    logger.debug(f"Could not flush TensorBoard: {e}")
+        finally:
+            try:
+                del batch, outputs
+                if torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if batch_idx % 10 == 0:
+                    import gc
+                    gc.collect()
+            except Exception as e:
+                logger.debug(f"Could not clean up memory: {e}")
+    
+    def on_train_epoch_end(self):
+        """Log epoch-level summaries and flush TensorBoard."""
+        try:
+            metrics = self.trainer.callback_metrics
+            self.log('epoch', float(self.current_epoch), on_epoch=True)
+            logger.info(f"\n{'='*80}")
+            logger.info(f"EPOCH {self.current_epoch} SUMMARY")
+            logger.info(f"{'='*80}")
+            for key, value in metrics.items():
+                if isinstance(value, torch.Tensor):
+                    logger.info(f"  {key}: {value.item():.6f}")
+                elif isinstance(value, (int, float)):
+                    logger.info(f"  {key}: {value:.6f}")
+            logger.info(f"{'='*80}\n")
+            if self.logger and hasattr(self.logger, 'experiment'):
+                try:
+                    self.logger.experiment.flush()
+                except Exception as e:
+                    logger.debug(f"Could not flush TensorBoard: {e}")
+        except Exception as e:
+            logger.debug(f"Could not log epoch summary: {e}")
+        finally:
+            try:
+                if torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+            except Exception as e:
+                logger.debug(f"Could not clean up at epoch end: {e}")
     
     def configure_optimizers(self):
         """Configure optimizer with memory-efficient settings."""
@@ -289,3 +441,4 @@ class BetaDogmaLightning(pl.LightningModule):
                 'interval': 'epoch',
             }
         }
+
