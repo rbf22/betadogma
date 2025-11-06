@@ -1,2 +1,0 @@
-training/lightning_module.py:377: error: Statement is unreachable  [unreachable]
-Found 1 error in 1 file (checked 1 source file)

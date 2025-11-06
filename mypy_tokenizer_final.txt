@@ -1,3 +1,0 @@
-training/tokenizer.py:35: error: Item "Tensor" of "list[int] | Tensor" has no attribute "extend"  [union-attr]
-training/tokenizer.py:36: error: Item "Tensor" of "list[int] | Tensor" has no attribute "extend"  [union-attr]
-Found 2 errors in 1 file (checked 1 source file)

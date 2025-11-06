@@ -1,5 +1,0 @@
-training/config.py:79: error: No overload variant of "int" matches argument type "object"  [call-overload]
-training/config.py:79: note: Possible overload variants:
-training/config.py:79: note:     def int(str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc = ..., /) -> int
-training/config.py:79: note:     def int(str | bytes | bytearray, /, base: SupportsIndex) -> int
-Found 1 error in 1 file (checked 1 source file)

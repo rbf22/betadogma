@@ -1,2 +1,0 @@
-training/lightning_module.py:331: error: Expected an indented block after 'try' statement on line 330  [syntax]
-Found 1 error in 1 file (errors prevented further checking)
