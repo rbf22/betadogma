@@ -1,0 +1,3 @@
+training/lightning_module.py:376: error: Unused "type: ignore" comment  [unused-ignore]
+training/lightning_module.py:377: error: Statement is unreachable  [unreachable]
+Found 2 errors in 1 file (checked 1 source file)

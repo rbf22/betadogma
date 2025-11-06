@@ -1,0 +1,4 @@
+training/lightning_module.py:46: error: Returning Any from function declared to return "dict[str, Tensor]"  [no-any-return]
+training/lightning_module.py:376: error: Statement is unreachable  [unreachable]
+training/lightning_module.py:397: error: Return type "dict[str, Any]" of "configure_optimizers" incompatible with return type "Optimizer | Sequence[Optimizer] | tuple[Sequence[Optimizer], Sequence[LRScheduler | ReduceLROnPlateau | LRSchedulerConfig]] | OptimizerConfig | OptimizerLRSchedulerConfig | Sequence[OptimizerConfig] | Sequence[OptimizerLRSchedulerConfig] | None" in supertype "pytorch_lightning.core.module.LightningModule"  [override]
+Found 3 errors in 1 file (checked 1 source file)

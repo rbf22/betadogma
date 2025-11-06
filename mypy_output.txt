@@ -1,0 +1,6 @@
+splicevar/convert_splicevardb_to_vcf.py:13: error: Library stubs not installed for "pandas"  [import-untyped]
+splicevar/convert_splicevardb_to_vcf.py:13: note: Hint: "python3 -m pip install pandas-stubs"
+splicevar/convert_splicevardb_to_vcf.py:13: note: (or run "mypy --install-types" to install all missing stub packages)
+splicevar/convert_splicevardb_to_vcf.py:13: note: See https://mypy.readthedocs.io/en/stable/running_mypy.html#missing-imports
+splicevar/convert_splicevardb_to_vcf.py:66: error: Incompatible return value type (got "tuple[int, str]", expected "tuple[int, int]")  [return-value]
+Found 2 errors in 1 file (checked 1 source file)

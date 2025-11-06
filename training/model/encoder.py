@@ -1,5 +1,5 @@
 import logging
-from typing import Optional
+from typing import Optional, cast
 
 import torch
 import torch.nn as nn
@@ -115,14 +115,14 @@ class CaduceusEncoder(nn.Module):
         if isinstance(outputs, torch.Tensor):
             return outputs
         if hasattr(outputs, "last_hidden_state"):
-            return outputs.last_hidden_state
+            return cast(torch.Tensor, outputs.last_hidden_state)
         if isinstance(outputs, tuple) and outputs:
             candidate = outputs[0]
             if isinstance(candidate, torch.Tensor):
                 return candidate
         raise ValueError(f"Unexpected output type from Caduceus model: {type(outputs)}")
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+    def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> SimpleNamespace:
         if self.frozen:
             self.model.eval()
 

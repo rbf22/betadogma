@@ -1,0 +1,5 @@
+training/tokenizer.py:35: error: Unsupported operand types for + ("Tensor" and "list[int]")  [operator]
+training/tokenizer.py:35: note: Left operand is of type "list[int] | Tensor"
+training/tokenizer.py:36: error: Unsupported operand types for + ("Tensor" and "list[int]")  [operator]
+training/tokenizer.py:36: note: Left operand is of type "list[int] | Tensor"
+Found 2 errors in 1 file (checked 1 source file)
