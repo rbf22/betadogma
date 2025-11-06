@@ -10,19 +10,19 @@ data:
   transcript_fasta: "data/processed/annotation/gencode_v26/gencode.v26.transcripts.fa.gz"
   max_clinvar_variants: 10000000
   max_benign_variants: 10000000
-  window_size: 300000
-  step_size: 150000
-  batch_size: 100
+  window_size: 130000
+  step_size: 65000
+  batch_size: 200
   gtex_sample_min: 50
   use_multiprocessing: false
   data_dir: "data/processed"
   cache_dir: "data/cache"
 
 model:
-  name: "LongSafari/hyenadna-medium-450k-seqlen-hf"
-  hidden_size: 256
-  num_layers: 4
-  max_seq_len: 300000  # Start conservative for MPS (was 300000)
+  name: "kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16"
+  hidden_size: 512  # RCPS doubles the base d_model (256 -> 512)
+  num_layers: 16
+  max_seq_len: 131072  # Respect Caduceus-PS context window
   
   # Smaller prediction heads for MPS memory efficiency
   splice_hidden: 64   # Was 128
@@ -30,11 +30,11 @@ model:
   polya_hidden: 32    # Was 64
   protein_hidden: 64  # Was 256
   
-  # Memory optimization - Aggressive for MPS
-  use_gradient_checkpointing: true
-  encoder_chunk_size: 300000  # Match max_seq_len
-  prediction_chunk_size: 300000  # Smaller chunks (25k instead of 50k)
-  chunk_overlap: 1000  # 1kb overlap
+  # Memory optimization tuned for 131k context
+  use_gradient_checkpointing: false  # Caduceus remote code lacks checkpoint hooks
+  encoder_chunk_size: 131072
+  prediction_chunk_size: 65536
+  chunk_overlap: 2048
   auto_chunk: true  # Automatically decide chunking strategy
 
 training:

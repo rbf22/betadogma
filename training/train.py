@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 from tokenizer import CharacterTokenizer
 from dataset import BetaDogmaDataset
 from model.model import BetaDogmaModel
-from model.encoder import HyenaDNAEncoder
 from model.heads import PredictionHead
 from lightning_module import BetaDogmaLightning
 from data_module import BetaDogmaDataModule

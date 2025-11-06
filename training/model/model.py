@@ -9,7 +9,7 @@ import logging
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import Config
-from model.encoder import HyenaDNAEncoder
+from model.encoder import CaduceusEncoder
 from model.heads import PredictionHead
 
 # Setup logger
@@ -45,20 +45,18 @@ class BetaDogmaModel(nn.Module):
         logger.debug(f"Using device: {self.device}")
         
         # Initialize encoder with the determined device
-        self.encoder = HyenaDNAEncoder(
+        self.encoder = CaduceusEncoder(
             model_name=config.model_name,
             freeze=config.freeze_encoder,
             device=str(self.device),
-            use_gradient_checkpointing=config.use_gradient_checkpointing
+            use_gradient_checkpointing=config.use_gradient_checkpointing,
         )
-        
-        # Ensure encoder is on the correct device
-        self.encoder = self.encoder.to(self.device)
-        logger.debug(f"Model initialized on device: {self.device}")
-        
-        # Get the encoder dimension from the encoder itself
+
+        logger.debug("Model initialized on device: %s", self.device)
+
+        # Caduceus wrapper reports the actual representation width
         self.encoder_dim = self.encoder.hidden_size
-        logger.debug(f"Using encoder dimension: {self.encoder_dim}")
+        logger.debug("Using encoder dimension: %s", self.encoder_dim)
         
         # Dropout for hidden states
         self.hidden_dropout = nn.Dropout(config.dropout)
@@ -275,15 +273,12 @@ class BetaDogmaModel(nn.Module):
             logger.debug(f"Processing full sequence with gradient checkpointing...")
             encoder_outputs = self.encoder(
                 input_ids=input_ids,
-                attention_mask=attention_mask
+                attention_mask=attention_mask,
             )
-            
-            if hasattr(encoder_outputs, 'last_hidden_state'):
-                hidden_states = encoder_outputs.last_hidden_state
-            else:
-                hidden_states = encoder_outputs
-            
-            logger.debug(f"Encoder output shape: {tuple(hidden_states.shape)}")
+
+            hidden_states = encoder_outputs.last_hidden_state
+
+            logger.debug("Encoder output shape: %s", tuple(hidden_states.shape))
         
         # Apply dropout
         hidden_states = self.hidden_dropout(hidden_states)
